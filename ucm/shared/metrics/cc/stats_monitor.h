@@ -21,30 +21,50 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  * */
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
-#include "stats_monitor.h"
+#ifndef UNIFIEDCACHE_MONITOR_H
+#define UNIFIEDCACHE_MONITOR_H
 
-namespace py = pybind11;
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include "stats/istats.h"
+
 namespace UC::Metrics {
 
-void bind_monitor(py::module_& m)
-{
-    py::class_<StatsMonitor>(m, "StatsMonitor")
-        .def_static("get_instance", &StatsMonitor::GetInstance, py::return_value_policy::reference)
-        .def("update_stats", &StatsMonitor::UpdateStats)
-        .def("reset_all", &StatsMonitor::ResetAllStats)
-        .def("get_stats", &StatsMonitor::GetStats)
-        .def("get_stats_and_clear", &StatsMonitor::GetStatsAndClear);
-}
+class StatsMonitor {
+public:
+    static StatsMonitor& GetInstance()
+    {
+        static StatsMonitor inst;
+        return inst;
+    }
+
+    ~StatsMonitor() = default;
+
+    void CreateStats(const std::string& name);
+
+    std::unordered_map<std::string, std::vector<double>> GetStats(const std::string& name);
+
+    void ResetStats(const std::string& name);
+
+    std::unordered_map<std::string, std::vector<double>> GetStatsAndClear(const std::string& name);
+
+    void UpdateStats(const std::string& name,
+                     const std::unordered_map<std::string, double>& params);
+
+    void ResetAllStats();
+
+private:
+    std::mutex mutex_;
+    std::unordered_map<std::string, std::unique_ptr<IStats>> stats_map_;
+
+    StatsMonitor();
+    StatsMonitor(const StatsMonitor&) = delete;
+    StatsMonitor& operator=(const StatsMonitor&) = delete;
+};
 
 }  // namespace UC::Metrics
 
-PYBIND11_MODULE(ucmmonitor, module)
-{
-    module.attr("project") = UCM_PROJECT_NAME;
-    module.attr("version") = UCM_PROJECT_VERSION;
-    module.attr("commit_id") = UCM_COMMIT_ID;
-    module.attr("build_type") = UCM_BUILD_TYPE;
-    UC::Metrics::bind_monitor(module);
-}
+#endif  // UNIFIEDCACHE_MONITOR_H```

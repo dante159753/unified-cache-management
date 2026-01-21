@@ -21,23 +21,58 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  * */
-#ifndef UNIFIEDCACHE_METRICS_API_H
-#define UNIFIEDCACHE_METRICS_API_H
-#include "metrics.h"
+#ifndef UNIFIEDCACHE_CONNSTATS_H
+#define UNIFIEDCACHE_CONNSTATS_H
+
+#include <array>
+#include <cstdint>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include "istats.h"
+#include "stats_registry.h"
 
 namespace UC::Metrics {
 
-void SetUp(size_t maxVectorLen);
+enum class Key : uint8_t {
+    interval_lookup_hit_rates = 0,
+    save_requests_num,
+    save_blocks_num,
+    save_duration,
+    save_speed,
+    load_requests_num,
+    load_blocks_num,
+    load_duration,
+    load_speed,
+    COUNT
+};
 
-void CreateStats(const std::string& name, const std::string& type);
+class ConnStats : public IStats {
+public:
+    ConnStats();
+    ~ConnStats() = default;
 
-void UpdateStats(const std::string& name, double value);
+    std::string Name() const override;
+    void Reset() override;
+    void Update(const std::unordered_map<std::string, double>& params) override;
+    std::unordered_map<std::string, std::vector<double>> Data() override;
 
-void UpdateStats(const std::unordered_map<std::string, double>& values);
+private:
+    static constexpr std::size_t N = static_cast<std::size_t>(Key::COUNT);
+    std::array<std::vector<double>, N> data_;
 
-std::tuple<std::unordered_map<std::string, double>, std::unordered_map<std::string, double>,
-           std::unordered_map<std::string, std::vector<double>>>
-GetAllStatsAndClear();
+    static Key KeyFromString(const std::string& k);
+    void EmplaceBack(Key id, double value);
+};
+
+struct Registrar {
+    Registrar()
+    {
+        StatsRegistry::RegisterStats(
+            "ConnStats", []() -> std::unique_ptr<IStats> { return std::make_unique<ConnStats>(); });
+    }
+};
 
 }  // namespace UC::Metrics
-#endif
+
+#endif  // UNIFIEDCACHE_CONNSTATS_H```

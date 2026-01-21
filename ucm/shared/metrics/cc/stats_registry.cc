@@ -21,31 +21,39 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  * */
-#include "metrics_api.h"
+#include "stats_registry.h"
+
 namespace UC::Metrics {
 
-void SetUp(size_t maxVectorLen) { Metrics::SetUp(maxVectorLen); }
-
-void CreateStats(const std::string& name, const std::string& type)
+StatsRegistry& StatsRegistry::GetInstance()
 {
-    Metrics::GetInstance().CreateStats(name, type);
+    static StatsRegistry inst;
+    return inst;
 }
 
-void UpdateStats(const std::string& name, double value)
+void StatsRegistry::RegisterStats(std::string name, Creator creator)
 {
-    Metrics::GetInstance().UpdateStats(name, value);
+    auto& reg = GetInstance();
+    std::lock_guard lk(reg.mutex_);
+    reg.registry_[name] = creator;
 }
 
-void UpdateStats(const std::unordered_map<std::string, double>& values)
+std::unique_ptr<IStats> StatsRegistry::CreateStats(const std::string& name)
 {
-    Metrics::GetInstance().UpdateStats(values);
+    auto& reg = GetInstance();
+    std::lock_guard lk(reg.mutex_);
+    if (auto it = reg.registry_.find(name); it != reg.registry_.end()) return it->second();
+    return nullptr;
 }
 
-std::tuple<std::unordered_map<std::string, double>, std::unordered_map<std::string, double>,
-           std::unordered_map<std::string, std::vector<double>>>
-GetAllStatsAndClear()
+std::vector<std::string> StatsRegistry::GetRegisteredStatsNames()
 {
-    return Metrics::GetInstance().GetAllStatsAndClear();
+    auto& reg = GetInstance();
+    std::lock_guard lk(reg.mutex_);
+    std::vector<std::string> names;
+    names.reserve(reg.registry_.size());
+    for (auto& [n, _] : reg.registry_) names.push_back(n);
+    return names;
 }
 
 }  // namespace UC::Metrics

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
 import platform as pf
+import random
 import sys
 from pathlib import Path
 
+import pynvml
 import pytest
 from common.config_utils import config_utils as config_instance
 from common.db_utils import database_connection, write_to_db
@@ -156,3 +159,29 @@ def pytest_runtest_logreport(report):
         "error": str(report.longrepr) if report.failed else None,
     }
     write_to_db("test_case_info", test_result)
+
+
+def get_free_gpu(required_memory_mb):
+    pynvml.nvmlInit()
+    device_count = pynvml.nvmlDeviceGetCount()
+    device_indices = list(range(device_count))
+    random.shuffle(device_indices)
+    for i in device_indices:  # random order to reduce collisions
+        handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+        info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        if (info.free / 1024**2) >= required_memory_mb:
+            return i
+    return None
+
+
+@pytest.fixture(autouse=True)
+def setup_gpu_resource(request):
+    marker = request.node.get_closest_marker("gpu_mem")
+    if marker:
+        mem_needed = marker.args[0]
+        gpu_id = get_free_gpu(mem_needed)
+        if gpu_id is not None:
+            print(f"Allocating GPU {gpu_id} with at least {mem_needed}MB free memory")
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        else:
+            pytest.fail(f"No GPU with {mem_needed}MB free memory available")
