@@ -24,7 +24,6 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import requests
 import yaml
 
 # Import from co-located jenkins_sdk.py
@@ -62,60 +61,49 @@ def extract_jenkins_platform(platform: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def get_image_url(platform: str, filter_string: str, harbor_cfg: dict) -> str:
-    """从 Harbor 查询匹配的镜像 URL。
+def get_image_url(platform: str, package_name: str, harbor_cfg: dict) -> str:
+    """拼接完整镜像 URL，并通过 Harbor API 验证镜像是否存在。
 
     Args:
         platform: Dockerfile 后缀，同时也是 Harbor repo 名称
                   (e.g., ucm-vllm-ascend.a2-v0.17.0)
-        filter_string: 用于过滤 tag 的字符串（大小写不敏感包含匹配）
+        package_name: 镜像 tag
         harbor_cfg: Harbor 配置字典，包含 url, auth_token, project
+
+    Raises:
+        ValueError: 镜像在 Harbor 中不存在
     """
     harbor_url = harbor_cfg["url"]
     auth_token = harbor_cfg["auth_token"]
     project = harbor_cfg["project"]
-    repo = platform
+    registry_host = harbor_url.replace("https://", "").replace("http://", "")
+    full_url = f"{registry_host}/{project}/{platform}:{package_name}"
+
+    # 验证镜像 tag 是否存在
+    import requests
 
     api_url = (
-        f"{harbor_url}/api/v2.0/projects/{project}/repositories/{repo}"
-        f"/artifacts?with_tag=true&page_size=100"
+        f"{harbor_url}/api/v2.0/projects/{project}/repositories/{platform}"
+        f"/artifacts/{package_name}/tags"
     )
-
     headers = {
         "Authorization": f"Basic {auth_token}",
         "Accept": "application/json",
     }
-
-    response = requests.get(
-        api_url,
-        headers=headers,
-        verify=False,
-        timeout=(5, 10),
-    )
-    response.raise_for_status()
-
-    artifacts = response.json()
-
-    image_urls = []
-    registry_host = harbor_url.replace("https://", "").replace("http://", "")
-
-    for artifact in artifacts:
-        tags = artifact.get("tags")
-        if isinstance(tags, list):
-            for tag in tags:
-                tag_name = tag.get("name") if tag else None
-                if tag_name:
-                    tag_name = str(tag_name)
-                    if not filter_string or filter_string.lower() in tag_name.lower():
-                        full_url = f"{registry_host}/{project}/{repo}:{tag_name}"
-                        image_urls.append(full_url)
-
-    if not image_urls:
-        raise ValueError(
-            f"No matching image found for platform {platform} with filter {filter_string}"
+    try:
+        resp = requests.get(api_url, headers=headers, verify=False, timeout=(5, 10))
+        if resp.status_code == 404:
+            raise ValueError(
+                f"Image not found: {full_url}\n"
+                f"  repo '{platform}' or tag '{package_name}' does not exist in project '{project}'"
+            )
+        resp.raise_for_status()
+    except requests.ConnectionError as e:
+        print(
+            f"Warning: cannot verify image existence (connection error: {e}), proceeding anyway"
         )
 
-    return image_urls[0]
+    return full_url
 
 
 # ---------------------------------------------------------------------------
