@@ -31,21 +31,29 @@
       {
         "current": {
           "selected": false,
-          "text": "prometheus",
-          "value": "edx8memhpd9tsa"
+          "text": "",
+          "value": ""
         },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(vllm:num_requests_running, job)",
         "hide": 0,
         "includeAll": false,
-        "label": "datasource",
+        "label": "job",
         "multi": false,
-        "name": "DS_PROMETHEUS",
+        "name": "job",
         "options": [],
-        "query": "prometheus",
-        "queryValue": "",
+        "query": {
+          "query": "label_values(vllm:num_requests_running, job)",
+          "refId": "StandardVariableQuery"
+        },
         "refresh": 1,
         "regex": "",
         "skipUrlSync": false,
-        "type": "datasource"
+        "sort": 2,
+        "type": "query"
       },
       {
         "current": {
@@ -55,9 +63,9 @@
         },
         "datasource": {
           "type": "prometheus",
-          "uid": "${DS_PROMETHEUS}"
+          "uid": "prometheus"
         },
-        "definition": "label_values(model_name)",
+        "definition": "label_values(vllm:num_requests_running{job=\"$job\"}, model_name)",
         "hide": 0,
         "includeAll": false,
         "label": "model_name",
@@ -65,10 +73,10 @@
         "name": "model_name",
         "options": [],
         "query": {
-          "query": "label_values(model_name)",
+          "query": "label_values(vllm:num_requests_running{job=\"$job\"}, model_name)",
           "refId": "StandardVariableQuery"
         },
-        "refresh": 1,
+        "refresh": 2,
         "regex": "",
         "skipUrlSync": false,
         "sort": 0,
@@ -112,21 +120,23 @@
   "timezone": "",
   "weekStart": "",
   "refresh": "",
-  "title": "vLLM - UCM Pipeline Store",
-  "uid": "ucm-pipeline-store",
-  "version": 3,
+  "title": "vLLM - UCM Pipeline Store (CI)",
+  "uid": "ucm-pipeline-store-ci",
+  "version": 1,
   "id": null,
   "tags": [
     "ucm",
-    "pipeline-store"
+    "pipeline-store",
+    "ci"
   ],
-  "description": "UCM observability dashboard - pipeline-store module. Part of a set; the other UCM dashboards (tag: ucm) are linked from the header.",
+  "description": "UCM observability dashboard - pipeline-store module. Part of a set; the other UCM dashboards (tag: ucm) are linked from the header. CI variant: fixed datasource uid 'prometheus', `job` selector at the top to switch between CI environments.",
   "links": [
     {
       "type": "dashboards",
-      "title": "Other UCM dashboards",
+      "title": "Other UCM CI dashboards",
       "tags": [
-        "ucm"
+        "ucm",
+        "ci"
       ],
       "asDropdown": true,
       "includeVars": true,
@@ -139,7 +149,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "prometheus"
       },
       "description": "Cache-stage hit rate from counter ratio: hits / (hits + misses). If low, most loads are descending into the Posix tier.",
       "fieldConfig": {
@@ -225,10 +235,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:cache_lookup_hit_blocks_total{model_name=\"$model_name\"}[$__rate_interval]))\n/ clamp_min(\n  sum by (model_name${perWorker:raw}) (rate(ucm:cache_lookup_hit_blocks_total{model_name=\"$model_name\"}[$__rate_interval]))\n  + sum by (model_name${perWorker:raw}) (rate(ucm:cache_lookup_miss_blocks_total{model_name=\"$model_name\"}[$__rate_interval])),\n  1\n)",
+          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:cache_lookup_hit_blocks_total{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))\n/ clamp_min(\n  sum by (model_name${perWorker:raw}) (rate(ucm:cache_lookup_hit_blocks_total{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))\n  + sum by (model_name${perWorker:raw}) (rate(ucm:cache_lookup_miss_blocks_total{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])),\n  1\n)",
           "hide": false,
           "instant": false,
           "legendFormat": "{{worker_id}}",
@@ -242,7 +252,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "prometheus"
       },
       "description": "Fraction of load shards that missed the Cache buffer and had to descend to the backend (shard-level miss rate at load time). Equals rate(cache_load_backend_shards_total) / rate(cache_load_shards_total).",
       "fieldConfig": {
@@ -328,10 +338,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:cache_load_backend_shards_total{model_name=\"$model_name\"}[$__rate_interval]))\n/ clamp_min(\n  sum by (model_name${perWorker:raw}) (rate(ucm:cache_load_shards_total{model_name=\"$model_name\"}[$__rate_interval])), 1\n)",
+          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:cache_load_backend_shards_total{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))\n/ clamp_min(\n  sum by (model_name${perWorker:raw}) (rate(ucm:cache_load_shards_total{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])), 1\n)",
           "hide": false,
           "instant": false,
           "legendFormat": "{{worker_id}}",
@@ -345,7 +355,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "prometheus"
       },
       "description": "Average end-to-end Cache load task duration. Series: p50 / p90 / p99 / avg, per worker.",
       "fieldConfig": {
@@ -503,10 +513,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_load_duration_ms_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_load_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p50 {{worker_id}}",
           "range": true,
           "refId": "A"
@@ -514,10 +524,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.9, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_load_duration_ms_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.9, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_load_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p90 {{worker_id}}",
           "range": true,
           "refId": "B"
@@ -525,10 +535,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_load_duration_ms_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_load_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p99 {{worker_id}}",
           "range": true,
           "refId": "C"
@@ -536,10 +546,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:cache_load_duration_ms_sum{model_name=\"$model_name\"}[$__rate_interval]))\n/\nsum by (model_name${perWorker:raw}) (rate(ucm:cache_load_duration_ms_count{model_name=\"$model_name\"}[$__rate_interval]))",
+          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:cache_load_duration_ms_sum{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))\n/\nsum by (model_name${perWorker:raw}) (rate(ucm:cache_load_duration_ms_count{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))",
           "legendFormat": "avg {{worker_id}}",
           "range": true,
           "refId": "D"
@@ -551,7 +561,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "prometheus"
       },
       "description": "Average Cache load bandwidth. Series: p50 / p90 / p99 / avg, per worker. Per-task observed throughput, sampled once per Cache stage task (one task = one start_load_kv / wait_for_save batch). Aggregates shards within a task but NOT across concurrent tasks. Use the (per worker) panel below for actual per-worker throughput.",
       "fieldConfig": {
@@ -709,10 +719,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_load_bandwidth_gbps_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_load_bandwidth_gbps_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p50 {{worker_id}}",
           "range": true,
           "refId": "A"
@@ -720,10 +730,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.9, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_load_bandwidth_gbps_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.9, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_load_bandwidth_gbps_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p90 {{worker_id}}",
           "range": true,
           "refId": "B"
@@ -731,10 +741,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_load_bandwidth_gbps_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_load_bandwidth_gbps_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p99 {{worker_id}}",
           "range": true,
           "refId": "C"
@@ -742,10 +752,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:cache_load_bandwidth_gbps_sum{model_name=\"$model_name\"}[$__rate_interval]))\n/\nsum by (model_name${perWorker:raw}) (rate(ucm:cache_load_bandwidth_gbps_count{model_name=\"$model_name\"}[$__rate_interval]))",
+          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:cache_load_bandwidth_gbps_sum{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))\n/\nsum by (model_name${perWorker:raw}) (rate(ucm:cache_load_bandwidth_gbps_count{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))",
           "legendFormat": "avg {{worker_id}}",
           "range": true,
           "refId": "D"
@@ -757,7 +767,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "prometheus"
       },
       "description": "Time a Cache load task spent waiting for the backend tier to fill the buffer. Large values mean frequent Cache misses or slow backend. Series: p50 / p90 / p99 / avg, per worker.",
       "fieldConfig": {
@@ -915,10 +925,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_load_backend_wait_duration_ms_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_load_backend_wait_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p50 {{worker_id}}",
           "range": true,
           "refId": "A"
@@ -926,10 +936,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.9, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_load_backend_wait_duration_ms_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.9, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_load_backend_wait_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p90 {{worker_id}}",
           "range": true,
           "refId": "B"
@@ -937,10 +947,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_load_backend_wait_duration_ms_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_load_backend_wait_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p99 {{worker_id}}",
           "range": true,
           "refId": "C"
@@ -948,10 +958,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:cache_load_backend_wait_duration_ms_sum{model_name=\"$model_name\"}[$__rate_interval]))\n/\nsum by (model_name${perWorker:raw}) (rate(ucm:cache_load_backend_wait_duration_ms_count{model_name=\"$model_name\"}[$__rate_interval]))",
+          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:cache_load_backend_wait_duration_ms_sum{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))\n/\nsum by (model_name${perWorker:raw}) (rate(ucm:cache_load_backend_wait_duration_ms_count{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))",
           "legendFormat": "avg {{worker_id}}",
           "range": true,
           "refId": "D"
@@ -963,7 +973,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "prometheus"
       },
       "description": "Cache load host-to-device copy duration on a synchronized stream. Series: p50 / p90 / p99 / avg, per worker.",
       "fieldConfig": {
@@ -1121,10 +1131,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_h2d_duration_ms_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_h2d_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p50 {{worker_id}}",
           "range": true,
           "refId": "A"
@@ -1132,10 +1142,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.9, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_h2d_duration_ms_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.9, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_h2d_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p90 {{worker_id}}",
           "range": true,
           "refId": "B"
@@ -1143,10 +1153,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_h2d_duration_ms_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_h2d_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p99 {{worker_id}}",
           "range": true,
           "refId": "C"
@@ -1154,10 +1164,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:cache_h2d_duration_ms_sum{model_name=\"$model_name\"}[$__rate_interval]))\n/\nsum by (model_name${perWorker:raw}) (rate(ucm:cache_h2d_duration_ms_count{model_name=\"$model_name\"}[$__rate_interval]))",
+          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:cache_h2d_duration_ms_sum{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))\n/\nsum by (model_name${perWorker:raw}) (rate(ucm:cache_h2d_duration_ms_count{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))",
           "legendFormat": "avg {{worker_id}}",
           "range": true,
           "refId": "D"
@@ -1169,7 +1179,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "prometheus"
       },
       "description": "Average end-to-end Cache dump task duration. Series: p50 / p90 / p99 / avg, per worker.",
       "fieldConfig": {
@@ -1327,10 +1337,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_dump_duration_ms_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_dump_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p50 {{worker_id}}",
           "range": true,
           "refId": "A"
@@ -1338,10 +1348,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.9, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_dump_duration_ms_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.9, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_dump_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p90 {{worker_id}}",
           "range": true,
           "refId": "B"
@@ -1349,10 +1359,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_dump_duration_ms_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_dump_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p99 {{worker_id}}",
           "range": true,
           "refId": "C"
@@ -1360,10 +1370,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:cache_dump_duration_ms_sum{model_name=\"$model_name\"}[$__rate_interval]))\n/\nsum by (model_name${perWorker:raw}) (rate(ucm:cache_dump_duration_ms_count{model_name=\"$model_name\"}[$__rate_interval]))",
+          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:cache_dump_duration_ms_sum{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))\n/\nsum by (model_name${perWorker:raw}) (rate(ucm:cache_dump_duration_ms_count{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))",
           "legendFormat": "avg {{worker_id}}",
           "range": true,
           "refId": "D"
@@ -1375,7 +1385,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "prometheus"
       },
       "description": "Average Cache dump bandwidth. Series: p50 / p90 / p99 / avg, per worker. Per-task observed throughput, sampled once per Cache stage task (one task = one start_load_kv / wait_for_save batch). Aggregates shards within a task but NOT across concurrent tasks. Use the (per worker) panel below for actual per-worker throughput.",
       "fieldConfig": {
@@ -1533,10 +1543,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_dump_bandwidth_gbps_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_dump_bandwidth_gbps_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p50 {{worker_id}}",
           "range": true,
           "refId": "A"
@@ -1544,10 +1554,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.9, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_dump_bandwidth_gbps_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.9, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_dump_bandwidth_gbps_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p90 {{worker_id}}",
           "range": true,
           "refId": "B"
@@ -1555,10 +1565,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_dump_bandwidth_gbps_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_dump_bandwidth_gbps_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p99 {{worker_id}}",
           "range": true,
           "refId": "C"
@@ -1566,10 +1576,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:cache_dump_bandwidth_gbps_sum{model_name=\"$model_name\"}[$__rate_interval]))\n/\nsum by (model_name${perWorker:raw}) (rate(ucm:cache_dump_bandwidth_gbps_count{model_name=\"$model_name\"}[$__rate_interval]))",
+          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:cache_dump_bandwidth_gbps_sum{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))\n/\nsum by (model_name${perWorker:raw}) (rate(ucm:cache_dump_bandwidth_gbps_count{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))",
           "legendFormat": "avg {{worker_id}}",
           "range": true,
           "refId": "D"
@@ -1581,7 +1591,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "prometheus"
       },
       "description": "Cache dump device-to-host copy + stream sync duration. Series: p50 / p90 / p99 / avg, per worker.",
       "fieldConfig": {
@@ -1739,10 +1749,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_d2h_duration_ms_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_d2h_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p50 {{worker_id}}",
           "range": true,
           "refId": "A"
@@ -1750,10 +1760,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.9, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_d2h_duration_ms_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.9, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_d2h_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p90 {{worker_id}}",
           "range": true,
           "refId": "B"
@@ -1761,10 +1771,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_d2h_duration_ms_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le, model_name${perWorker:raw}) (rate(ucm:cache_d2h_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p99 {{worker_id}}",
           "range": true,
           "refId": "C"
@@ -1772,10 +1782,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:cache_d2h_duration_ms_sum{model_name=\"$model_name\"}[$__rate_interval]))\n/\nsum by (model_name${perWorker:raw}) (rate(ucm:cache_d2h_duration_ms_count{model_name=\"$model_name\"}[$__rate_interval]))",
+          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:cache_d2h_duration_ms_sum{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))\n/\nsum by (model_name${perWorker:raw}) (rate(ucm:cache_d2h_duration_ms_count{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))",
           "legendFormat": "avg {{worker_id}}",
           "range": true,
           "refId": "D"
@@ -1787,7 +1797,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "prometheus"
       },
       "description": "Wall-clock per-worker Cache load throughput in GB/s. Aggregates all concurrent Cache load tasks inside one worker process and includes idle gaps, so this is the real bytes/sec the worker is pulling through the Cache stage. Pair with (per task) above: high per-task with low per-worker means tasks are fast but sparse.",
       "fieldConfig": {
@@ -1868,10 +1878,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:cache_load_bytes_total{model_name=\"$model_name\"}[$__rate_interval])) / 1e9",
+          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:cache_load_bytes_total{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])) / 1e9",
           "legendFormat": "{{worker_id}}",
           "range": true,
           "refId": "A"
@@ -1883,7 +1893,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "prometheus"
       },
       "description": "Wall-clock per-worker Cache dump throughput in GB/s. Aggregates all concurrent Cache dump tasks inside one worker process and includes idle gaps, so this is the real bytes/sec the worker is pushing through the Cache stage. Pair with (per task) above: high per-task with low per-worker means tasks are fast but sparse.",
       "fieldConfig": {
@@ -1964,10 +1974,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:cache_dump_bytes_total{model_name=\"$model_name\"}[$__rate_interval])) / 1e9",
+          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:cache_dump_bytes_total{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])) / 1e9",
           "legendFormat": "{{worker_id}}",
           "range": true,
           "refId": "A"
@@ -1979,7 +1989,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "prometheus"
       },
       "description": "Posix-stage storage-to-host bandwidth (load direction). Series: p50 / p90 / p99 / avg, per worker. Per single-IO observed throughput, sampled once per shard transfer; does NOT aggregate across concurrent IO threads. Use the (per worker) panel below for actual disk throughput.",
       "fieldConfig": {
@@ -2137,10 +2147,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, model_name${perWorker:raw}) (rate(ucm:posix_s2h_bandwidth_gbps_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le, model_name${perWorker:raw}) (rate(ucm:posix_s2h_bandwidth_gbps_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p50 {{worker_id}}",
           "range": true,
           "refId": "A"
@@ -2148,10 +2158,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.9, sum by (le, model_name${perWorker:raw}) (rate(ucm:posix_s2h_bandwidth_gbps_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.9, sum by (le, model_name${perWorker:raw}) (rate(ucm:posix_s2h_bandwidth_gbps_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p90 {{worker_id}}",
           "range": true,
           "refId": "B"
@@ -2159,10 +2169,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, model_name${perWorker:raw}) (rate(ucm:posix_s2h_bandwidth_gbps_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le, model_name${perWorker:raw}) (rate(ucm:posix_s2h_bandwidth_gbps_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p99 {{worker_id}}",
           "range": true,
           "refId": "C"
@@ -2170,10 +2180,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:posix_s2h_bandwidth_gbps_sum{model_name=\"$model_name\"}[$__rate_interval]))\n/\nsum by (model_name${perWorker:raw}) (rate(ucm:posix_s2h_bandwidth_gbps_count{model_name=\"$model_name\"}[$__rate_interval]))",
+          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:posix_s2h_bandwidth_gbps_sum{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))\n/\nsum by (model_name${perWorker:raw}) (rate(ucm:posix_s2h_bandwidth_gbps_count{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))",
           "legendFormat": "avg {{worker_id}}",
           "range": true,
           "refId": "D"
@@ -2185,7 +2195,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "prometheus"
       },
       "description": "Posix-stage host-to-storage bandwidth (dump direction). Series: p50 / p90 / p99 / avg, per worker. Per single-IO observed throughput, sampled once per shard transfer; does NOT aggregate across concurrent IO threads. Use the (per worker) panel below for actual disk throughput.",
       "fieldConfig": {
@@ -2343,10 +2353,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, model_name${perWorker:raw}) (rate(ucm:posix_h2s_bandwidth_gbps_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le, model_name${perWorker:raw}) (rate(ucm:posix_h2s_bandwidth_gbps_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p50 {{worker_id}}",
           "range": true,
           "refId": "A"
@@ -2354,10 +2364,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.9, sum by (le, model_name${perWorker:raw}) (rate(ucm:posix_h2s_bandwidth_gbps_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.9, sum by (le, model_name${perWorker:raw}) (rate(ucm:posix_h2s_bandwidth_gbps_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p90 {{worker_id}}",
           "range": true,
           "refId": "B"
@@ -2365,10 +2375,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, model_name${perWorker:raw}) (rate(ucm:posix_h2s_bandwidth_gbps_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le, model_name${perWorker:raw}) (rate(ucm:posix_h2s_bandwidth_gbps_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p99 {{worker_id}}",
           "range": true,
           "refId": "C"
@@ -2376,10 +2386,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:posix_h2s_bandwidth_gbps_sum{model_name=\"$model_name\"}[$__rate_interval]))\n/\nsum by (model_name${perWorker:raw}) (rate(ucm:posix_h2s_bandwidth_gbps_count{model_name=\"$model_name\"}[$__rate_interval]))",
+          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:posix_h2s_bandwidth_gbps_sum{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))\n/\nsum by (model_name${perWorker:raw}) (rate(ucm:posix_h2s_bandwidth_gbps_count{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))",
           "legendFormat": "avg {{worker_id}}",
           "range": true,
           "refId": "D"
@@ -2391,7 +2401,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "prometheus"
       },
       "description": "Wall-clock per-worker load throughput in GB/s. Aggregates all concurrent IO threads inside one worker process and includes idle gaps, so this is the real bytes/sec the worker is pulling from posix. Pair with (per shard) above: if per-shard is high but per-worker is low, IO is fast but sparse — disk is not saturated.",
       "fieldConfig": {
@@ -2472,10 +2482,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:posix_s2h_bytes_total{model_name=\"$model_name\"}[$__rate_interval])) / 1e9",
+          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:posix_s2h_bytes_total{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])) / 1e9",
           "legendFormat": "{{worker_id}}",
           "range": true,
           "refId": "A"
@@ -2487,7 +2497,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "prometheus"
       },
       "description": "Wall-clock per-worker save throughput in GB/s. Aggregates all concurrent IO threads inside one worker process and includes idle gaps, so this is the real bytes/sec the worker is pushing to posix. Pair with (per shard) above: if per-shard is high but per-worker is low, IO is fast but sparse — disk is not saturated.",
       "fieldConfig": {
@@ -2568,10 +2578,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:posix_h2s_bytes_total{model_name=\"$model_name\"}[$__rate_interval])) / 1e9",
+          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:posix_h2s_bytes_total{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])) / 1e9",
           "legendFormat": "{{worker_id}}",
           "range": true,
           "refId": "A"
@@ -2583,7 +2593,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "prometheus"
       },
       "description": "Posix-stage S2H per-IO duration. Represents disk read latency. Series: p50 / p90 / p99 / avg, per worker.",
       "fieldConfig": {
@@ -2741,10 +2751,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, model_name${perWorker:raw}) (rate(ucm:posix_s2h_duration_ms_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le, model_name${perWorker:raw}) (rate(ucm:posix_s2h_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p50 {{worker_id}}",
           "range": true,
           "refId": "A"
@@ -2752,10 +2762,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.9, sum by (le, model_name${perWorker:raw}) (rate(ucm:posix_s2h_duration_ms_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.9, sum by (le, model_name${perWorker:raw}) (rate(ucm:posix_s2h_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p90 {{worker_id}}",
           "range": true,
           "refId": "B"
@@ -2763,10 +2773,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, model_name${perWorker:raw}) (rate(ucm:posix_s2h_duration_ms_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le, model_name${perWorker:raw}) (rate(ucm:posix_s2h_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p99 {{worker_id}}",
           "range": true,
           "refId": "C"
@@ -2774,10 +2784,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:posix_s2h_duration_ms_sum{model_name=\"$model_name\"}[$__rate_interval]))\n/\nsum by (model_name${perWorker:raw}) (rate(ucm:posix_s2h_duration_ms_count{model_name=\"$model_name\"}[$__rate_interval]))",
+          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:posix_s2h_duration_ms_sum{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))\n/\nsum by (model_name${perWorker:raw}) (rate(ucm:posix_s2h_duration_ms_count{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))",
           "legendFormat": "avg {{worker_id}}",
           "range": true,
           "refId": "D"
@@ -2789,7 +2799,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "prometheus"
       },
       "description": "Posix-stage H2S per-IO duration. Represents disk write latency. Series: p50 / p90 / p99 / avg, per worker.",
       "fieldConfig": {
@@ -2947,10 +2957,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, model_name${perWorker:raw}) (rate(ucm:posix_h2s_duration_ms_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le, model_name${perWorker:raw}) (rate(ucm:posix_h2s_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p50 {{worker_id}}",
           "range": true,
           "refId": "A"
@@ -2958,10 +2968,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.9, sum by (le, model_name${perWorker:raw}) (rate(ucm:posix_h2s_duration_ms_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.9, sum by (le, model_name${perWorker:raw}) (rate(ucm:posix_h2s_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p90 {{worker_id}}",
           "range": true,
           "refId": "B"
@@ -2969,10 +2979,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, model_name${perWorker:raw}) (rate(ucm:posix_h2s_duration_ms_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le, model_name${perWorker:raw}) (rate(ucm:posix_h2s_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "p99 {{worker_id}}",
           "range": true,
           "refId": "C"
@@ -2980,10 +2990,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:posix_h2s_duration_ms_sum{model_name=\"$model_name\"}[$__rate_interval]))\n/\nsum by (model_name${perWorker:raw}) (rate(ucm:posix_h2s_duration_ms_count{model_name=\"$model_name\"}[$__rate_interval]))",
+          "expr": "sum by (model_name${perWorker:raw}) (rate(ucm:posix_h2s_duration_ms_sum{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))\n/\nsum by (model_name${perWorker:raw}) (rate(ucm:posix_h2s_duration_ms_count{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))",
           "legendFormat": "avg {{worker_id}}",
           "range": true,
           "refId": "D"
@@ -2997,7 +3007,7 @@
       "collapsed": true,
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "prometheus"
       },
       "id": 14,
       "title": "Cache -- Distributions",
@@ -3012,7 +3022,7 @@
           "type": "heatmap",
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "id": 15,
           "title": "Cache / Load Duration",
@@ -3027,10 +3037,10 @@
             {
               "datasource": {
                 "type": "prometheus",
-                "uid": "${DS_PROMETHEUS}"
+                "uid": "prometheus"
               },
               "editorMode": "code",
-              "expr": "sum by (le) (rate(ucm:cache_load_duration_ms_bucket{model_name=\"$model_name\"}[$__rate_interval]))",
+              "expr": "sum by (le) (rate(ucm:cache_load_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))",
               "format": "heatmap",
               "legendFormat": "{{le}}",
               "range": true,
@@ -3097,7 +3107,7 @@
           "type": "heatmap",
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "id": 16,
           "title": "Cache / Load Bandwidth (per task)",
@@ -3112,10 +3122,10 @@
             {
               "datasource": {
                 "type": "prometheus",
-                "uid": "${DS_PROMETHEUS}"
+                "uid": "prometheus"
               },
               "editorMode": "code",
-              "expr": "sum by (le) (rate(ucm:cache_load_bandwidth_gbps_bucket{model_name=\"$model_name\"}[$__rate_interval]))",
+              "expr": "sum by (le) (rate(ucm:cache_load_bandwidth_gbps_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))",
               "format": "heatmap",
               "legendFormat": "{{le}}",
               "range": true,
@@ -3182,7 +3192,7 @@
           "type": "heatmap",
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "id": 17,
           "title": "Cache / Dump Duration",
@@ -3197,10 +3207,10 @@
             {
               "datasource": {
                 "type": "prometheus",
-                "uid": "${DS_PROMETHEUS}"
+                "uid": "prometheus"
               },
               "editorMode": "code",
-              "expr": "sum by (le) (rate(ucm:cache_dump_duration_ms_bucket{model_name=\"$model_name\"}[$__rate_interval]))",
+              "expr": "sum by (le) (rate(ucm:cache_dump_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))",
               "format": "heatmap",
               "legendFormat": "{{le}}",
               "range": true,
@@ -3267,7 +3277,7 @@
           "type": "heatmap",
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "id": 18,
           "title": "Cache / Dump Bandwidth (per task)",
@@ -3282,10 +3292,10 @@
             {
               "datasource": {
                 "type": "prometheus",
-                "uid": "${DS_PROMETHEUS}"
+                "uid": "prometheus"
               },
               "editorMode": "code",
-              "expr": "sum by (le) (rate(ucm:cache_dump_bandwidth_gbps_bucket{model_name=\"$model_name\"}[$__rate_interval]))",
+              "expr": "sum by (le) (rate(ucm:cache_dump_bandwidth_gbps_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))",
               "format": "heatmap",
               "legendFormat": "{{le}}",
               "range": true,
@@ -3352,7 +3362,7 @@
           "type": "heatmap",
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "id": 19,
           "title": "Cache / Load Backend Wait",
@@ -3367,10 +3377,10 @@
             {
               "datasource": {
                 "type": "prometheus",
-                "uid": "${DS_PROMETHEUS}"
+                "uid": "prometheus"
               },
               "editorMode": "code",
-              "expr": "sum by (le) (rate(ucm:cache_load_backend_wait_duration_ms_bucket{model_name=\"$model_name\"}[$__rate_interval]))",
+              "expr": "sum by (le) (rate(ucm:cache_load_backend_wait_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))",
               "format": "heatmap",
               "legendFormat": "{{le}}",
               "range": true,
@@ -3440,7 +3450,7 @@
       "collapsed": true,
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "prometheus"
       },
       "id": 20,
       "title": "Posix -- Distributions",
@@ -3455,7 +3465,7 @@
           "type": "heatmap",
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "id": 21,
           "title": "Posix / S2H Duration",
@@ -3470,10 +3480,10 @@
             {
               "datasource": {
                 "type": "prometheus",
-                "uid": "${DS_PROMETHEUS}"
+                "uid": "prometheus"
               },
               "editorMode": "code",
-              "expr": "sum by (le) (rate(ucm:posix_s2h_duration_ms_bucket{model_name=\"$model_name\"}[$__rate_interval]))",
+              "expr": "sum by (le) (rate(ucm:posix_s2h_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))",
               "format": "heatmap",
               "legendFormat": "{{le}}",
               "range": true,
@@ -3540,7 +3550,7 @@
           "type": "heatmap",
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "id": 22,
           "title": "Posix / H2S Duration",
@@ -3555,10 +3565,10 @@
             {
               "datasource": {
                 "type": "prometheus",
-                "uid": "${DS_PROMETHEUS}"
+                "uid": "prometheus"
               },
               "editorMode": "code",
-              "expr": "sum by (le) (rate(ucm:posix_h2s_duration_ms_bucket{model_name=\"$model_name\"}[$__rate_interval]))",
+              "expr": "sum by (le) (rate(ucm:posix_h2s_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))",
               "format": "heatmap",
               "legendFormat": "{{le}}",
               "range": true,
@@ -3625,7 +3635,7 @@
           "type": "heatmap",
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "id": 23,
           "title": "Posix / S2H Bandwidth (per shard)",
@@ -3640,10 +3650,10 @@
             {
               "datasource": {
                 "type": "prometheus",
-                "uid": "${DS_PROMETHEUS}"
+                "uid": "prometheus"
               },
               "editorMode": "code",
-              "expr": "sum by (le) (rate(ucm:posix_s2h_bandwidth_gbps_bucket{model_name=\"$model_name\"}[$__rate_interval]))",
+              "expr": "sum by (le) (rate(ucm:posix_s2h_bandwidth_gbps_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))",
               "format": "heatmap",
               "legendFormat": "{{le}}",
               "range": true,
@@ -3710,7 +3720,7 @@
           "type": "heatmap",
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "prometheus"
           },
           "id": 24,
           "title": "Posix / H2S Bandwidth (per shard)",
@@ -3725,10 +3735,10 @@
             {
               "datasource": {
                 "type": "prometheus",
-                "uid": "${DS_PROMETHEUS}"
+                "uid": "prometheus"
               },
               "editorMode": "code",
-              "expr": "sum by (le) (rate(ucm:posix_h2s_bandwidth_gbps_bucket{model_name=\"$model_name\"}[$__rate_interval]))",
+              "expr": "sum by (le) (rate(ucm:posix_h2s_bandwidth_gbps_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))",
               "format": "heatmap",
               "legendFormat": "{{le}}",
               "range": true,

@@ -29,14 +29,34 @@ counter:
     documentation: "Total blocks dumped by the Cache stage"
   - name: "cache_load_shards_total"
     documentation: "Total shards dispatched by Cache load (num blocks * shards_per_block)"
-  - name: "cache_load_backend_submit_shards_total"
-    documentation: "Shards that missed Cache buffer and descended to the backend on load"
+  - name: "cache_load_backend_shards_total"
+    documentation: "Shards that descended to the backend on load (true cache miss at the buffer-allocation stage; aka backend-load count)"
+
+  # -- Pipeline Cache stage: per-worker real throughput counters ------------
+  # Accumulated per completed Cache task with size = shardSize * num_shards.
+  # Use rate() / 1e9 to get actual GB/s the worker is moving through the
+  # Cache stage — aggregates across concurrent tasks and includes idle gaps,
+  # which the per-task cache_*_bandwidth_gbps histogram cannot reveal.
+  - name: "cache_load_bytes_total"
+    documentation: "Total bytes loaded through the Cache stage (per-task size summed)"
+  - name: "cache_dump_bytes_total"
+    documentation: "Total bytes dumped through the Cache stage (per-task size summed)"
 
   # -- Pipeline Posix stage: failure counters -------------------------------
   - name: "posix_load_failures_total"
     documentation: "Number of Posix stage load (S2H) IO failures"
   - name: "posix_dump_failures_total"
     documentation: "Number of Posix stage dump (H2S) IO failures"
+
+  # -- Pipeline Posix stage: real per-worker throughput counters ------------
+  # Accumulated only on successful IOs (failed bytes do not count). Use
+  # rate() / 1e9 to get actual GB/s the worker is moving across the disk,
+  # which the per-shard *_bandwidth_gbps histogram cannot reveal because
+  # it does not aggregate concurrent IO threads or account for idle gaps.
+  - name: "posix_s2h_bytes_total"
+    documentation: "Total bytes transferred from posix storage to host buffer (load path, successful IOs only)"
+  - name: "posix_h2s_bytes_total"
+    documentation: "Total bytes transferred from host buffer to posix storage (dump path, successful IOs only)"
 
   # -- Layerwise stalls -----------------------------------------------------
   - name: "layerwise_stalled_layers_total"
@@ -115,8 +135,8 @@ histogram:
   - name: "cache_d2h_duration_ms"
     documentation: "Cache dump device-to-host copy duration incl. stream sync (ms)"
     buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
-  - name: "cache_dump_backend_submit_duration_ms"
-    documentation: "Cache dump backend submit time: passing buffers to lower tier (ms)"
+  - name: "cache_dump_backend_duration_ms"
+    documentation: "Cache dump backend hand-off duration: synchronous time to pass buffers to the lower tier (ms). Does NOT include the lower tier's actual write time."
     buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500]
 
   # -- Posix stage (disk tier) ---------------------------------------------
