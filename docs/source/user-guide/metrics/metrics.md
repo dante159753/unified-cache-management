@@ -185,14 +185,24 @@ UCM exposes various metrics to monitor its performance. The following table list
 | `ucm:load_requests_num` | Histogram | Number of requests loaded per `start_load_kv` call |
 | `ucm:load_blocks_num` | Histogram | Number of blocks loaded per `start_load_kv` call |
 | `ucm:load_duration` | Histogram | Time to load KV cache from UCM (milliseconds) |
-| `ucm:load_speed` | Histogram | Speed of loading from UCM (GB/s) |
+| `ucm:load_speed` | Histogram | Speed of loading from UCM (GB/s, per `start_load_kv` call) |
+| `ucm:load_bytes_total` | Counter | Total bytes loaded through the connector; use `rate() / 1e9` for true summed GB/s across workers |
 | **Save Operation Metrics** | | |
 | `ucm:save_requests_num` | Histogram | Number of requests saved per `wait_for_save` call |
 | `ucm:save_blocks_num` | Histogram | Number of blocks saved per `wait_for_save` call |
 | `ucm:save_duration` | Histogram | Time to save to UCM (milliseconds) |
-| `ucm:save_speed` | Histogram | Speed of saving to UCM (GB/s) |
+| `ucm:save_speed` | Histogram | Speed of saving to UCM (GB/s, per `wait_for_save` call) |
+| `ucm:save_bytes_total` | Counter | Total bytes saved through the connector; use `rate() / 1e9` for true summed GB/s across workers |
 | **Lookup Hit Rate Metrics** | | |
 | `ucm:interval_lookup_hit_rates` | Histogram | Hit rate of UCM lookup requests |
+| `ucm:cache_lookup_duration_ms` | Histogram | Cache buffer lookup wall-clock time per `Lookup` / `LookupOnPrefix` call (ms) |
+| `ucm:cache_lookup_backend_duration_ms` | Histogram | Backend lookup wall-clock time when descending due to no buffer or buffer miss (ms) |
+| **Cache Stage Shard Counters** | | |
+| `ucm:cache_dump_shards_total` | Counter | Total shards dispatched by Cache dump (mirror of `cache_load_shards_total`) |
+| `ucm:cache_dump_backend_shards_total` | Counter | Shards actually pushed to backend on dump (excludes `!handle.Owner()` skips in shared-buffer scenario) |
+| **Posix Stage Task-Level Duration** | | |
+| `ucm:posix_load_task_duration_ms` | Histogram | End-to-end Posix load task duration (ms) — compare with `cache_load_duration_ms` to isolate cache-layer overhead |
+| `ucm:posix_dump_task_duration_ms` | Histogram | End-to-end Posix dump task duration (ms) — compare with `cache_dump_duration_ms` to isolate cache-layer overhead |
 
 ## Prometheus Configuration
 

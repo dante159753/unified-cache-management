@@ -31,6 +31,10 @@ counter:
     documentation: "Total shards dispatched by Cache load (num blocks * shards_per_block)"
   - name: "cache_load_backend_shards_total"
     documentation: "Shards that descended to the backend on load (true cache miss at the buffer-allocation stage; aka backend-load count)"
+  - name: "cache_dump_shards_total"
+    documentation: "Total shards dispatched by Cache dump (mirror of cache_load_shards_total)"
+  - name: "cache_dump_backend_shards_total"
+    documentation: "Shards actually pushed to backend on dump (excludes !handle.Owner() skips in shared-buffer scenario)"
 
   # -- Pipeline Cache stage: per-worker real throughput counters ------------
   # Accumulated per completed Cache task with size = shardSize * num_shards.
@@ -57,6 +61,16 @@ counter:
     documentation: "Total bytes transferred from posix storage to host buffer (load path, successful IOs only)"
   - name: "posix_h2s_bytes_total"
     documentation: "Total bytes transferred from host buffer to posix storage (dump path, successful IOs only)"
+
+  # -- Connector layer: per-worker real throughput counters ----------------
+  # The legacy load_speed / save_speed histograms sample per-call speed
+  # (a statistical distribution), so an aggregated quantile across workers
+  # is still ~per-call speed, not a sum. Use rate(*_bytes_total) / 1e9 to
+  # get the actual GB/s the whole vLLM service is moving through UCM.
+  - name: "load_bytes_total"
+    documentation: "Total bytes loaded through the UCM connector (summed across all start_load_kv calls)"
+  - name: "save_bytes_total"
+    documentation: "Total bytes saved through the UCM connector (summed across all wait_for_save calls)"
 
   # -- Layerwise stalls -----------------------------------------------------
   - name: "layerwise_stalled_layers_total"
@@ -105,6 +119,12 @@ histogram:
   # These answer: "which tier in the Cache|Posix|Ds3fs stack is the bottleneck?"
   #
   # -- Cache stage (in-memory buffer on top of the stack) -------------------
+  - name: "cache_lookup_duration_ms"
+    documentation: "Cache buffer lookup wall-clock time per `Lookup` / `LookupOnPrefix` call (ms)"
+    buckets: [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100]
+  - name: "cache_lookup_backend_duration_ms"
+    documentation: "Backend lookup wall-clock time when descending due to no buffer or buffer miss (ms)"
+    buckets: [0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
   - name: "cache_load_duration_ms"
     documentation: "End-to-end Cache stage load task duration (ms)"
     buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000]
@@ -132,8 +152,11 @@ histogram:
   - name: "cache_h2d_duration_ms"
     documentation: "Cache load host-to-device copy duration on a sync'd stream (ms)"
     buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
+  - name: "cache_dump_mkbuf_duration_ms"
+    documentation: "Cache dump mk_buf phase: prerequisite wait + buffer allocation/reuse + D2H async submit before stream sync (ms)"
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
   - name: "cache_d2h_duration_ms"
-    documentation: "Cache dump device-to-host copy duration incl. stream sync (ms)"
+    documentation: "Cache dump D2H stream sync phase after mk_buf; excludes buffer allocation and async submit (ms)"
     buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
   - name: "cache_dump_backend_duration_ms"
     documentation: "Cache dump backend hand-off duration: synchronous time to pass buffers to the lower tier (ms). Does NOT include the lower tier's actual write time."
@@ -145,6 +168,12 @@ histogram:
     buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000]
   - name: "posix_h2s_duration_ms"
     documentation: "Posix stage H2S (host-to-storage) duration for one shard's IO (ms)"
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000]
+  - name: "posix_load_task_duration_ms"
+    documentation: "End-to-end Posix load task duration (ms): submit to last shard finished, task-level (compare with cache_load_duration_ms)"
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000]
+  - name: "posix_dump_task_duration_ms"
+    documentation: "End-to-end Posix dump task duration (ms): submit to last shard finished, task-level (compare with cache_dump_duration_ms)"
     buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000]
   # Bucket layout: typical Posix throughput sits in 1-12 GB/s, so this range
   # is sampled densely (0.5 GB/s steps for 1-4, 1 GB/s steps for 5-12) so
