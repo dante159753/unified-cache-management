@@ -488,10 +488,6 @@ Status TransBuffer::Setup(const Config& config)
 TransBuffer::Handle TransBuffer::Get(const Detail::BlockId& blockId, size_t shardIdx,
                                      bool allowReserved)
 {
-    auto tp = NowTime::Now();
-    auto recordGetDuration = [&]() {
-        UC::Metrics::UpdateStats("cache_buffer_get_duration_ms", (NowTime::Now() - tp) * 1e3);
-    };
     auto iBucket = Hash(blockId, shardIdx);
     bool owner = false;
     strategy_->BucketLock(iBucket);
@@ -501,14 +497,12 @@ TransBuffer::Handle TransBuffer::Get(const Detail::BlockId& blockId, size_t shar
             MarkNotReady(iNode);
         }
         strategy_->BucketUnlock(iBucket);
-        recordGetDuration();
         return Handle{this, iNode, owner};
     }
     double allocSpinMs = 0.0;
     iNode = Alloc(blockId, shardIdx, iBucket, allowReserved, &allocSpinMs);
     strategy_->BucketUnlock(iBucket);
     UC::Metrics::UpdateStats("cache_buffer_alloc_spin_duration_ms", allocSpinMs);
-    recordGetDuration();
     return Handle(this, iNode, true);
 }
 
