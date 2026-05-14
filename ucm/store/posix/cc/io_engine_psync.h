@@ -25,7 +25,6 @@
 #define UNIFIEDCACHE_POSIX_STORE_CC_IO_ENGINE_PSYNC_H
 
 #include "logger/logger.h"
-#include "metrics_api.h"
 #include "template/task_wrapper.h"
 #include "trans_queue.h"
 
@@ -51,15 +50,11 @@ protected:
         const auto num = t->desc.size();
         const auto size = shardSize_ * num;
         const auto tp = w->startTp;
-        const auto isDump = (t->type == TransTask::Type::DUMP);
         UC_DEBUG("Posix task({},{},{},{}) dispatching.", id, brief, num, size);
-        w->SetEpilog([id, brief = std::move(brief), num, size, tp, isDump] {
+        w->SetEpilog([id, brief = std::move(brief), num, size, tp] {
             auto cost = NowTime::Now() - tp;
             UC_DEBUG("Posix task({},{},{},{}) finished, cost {:.3f}ms.", id, brief, num, size,
                      cost * 1e3);
-            UC::Metrics::UpdateStats(
-                isDump ? "posix_dump_task_duration_ms" : "posix_load_task_duration_ms",
-                cost * 1e3);
         });
         queue_.Push(t, w);
     }

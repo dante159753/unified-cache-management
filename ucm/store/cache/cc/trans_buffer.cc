@@ -27,9 +27,7 @@
 #include <thread>
 #include <unistd.h>
 #include "logger/logger.h"
-#include "metrics_api.h"
 #include "posix_shm.h"
-#include "time/now_time.h"
 #include "trans/buffer.h"
 #include "trans/device.h"
 
@@ -549,16 +547,11 @@ size_t TransBuffer::FindAt(size_t iBucket, const Detail::BlockId& blockId, size_
 size_t TransBuffer::Alloc(const Detail::BlockId& blockId, size_t shardIdx, size_t iBucket,
                           bool allowReserved)
 {
-    auto spinStart = 0.0;
-    auto markRetry = [&]() {
-        if (spinStart == 0.0) { spinStart = NowTime::Now(); }
-    };
     for (;;) {
         auto iNode = strategy_->FetchNode(allowReserved);
         auto meta = strategy_->MetaAt(iNode);
         strategy_->NodeLock(iNode);
         if (meta->reference > 0) {
-            markRetry();
             strategy_->NodeUnlock(iNode);
             continue;
         }
@@ -566,7 +559,6 @@ size_t TransBuffer::Alloc(const Detail::BlockId& blockId, size_t shardIdx, size_
         if (oldBucket != iBucket) {
             if (oldBucket != invalidIndex) {
                 if (!strategy_->BucketTryLock(oldBucket)) {
-                    markRetry();
                     strategy_->NodeUnlock(iNode);
                     continue;
                 }
@@ -580,8 +572,6 @@ size_t TransBuffer::Alloc(const Detail::BlockId& blockId, size_t shardIdx, size_
         meta->shard = shardIdx;
         meta->ready = false;
         strategy_->NodeUnlock(iNode);
-        auto spinMs = spinStart == 0.0 ? 0.0 : (NowTime::Now() - spinStart) * 1e3;
-        UC::Metrics::UpdateStats("cache_buffer_alloc_spin_duration_ms", spinMs);
         return iNode;
     }
 }
