@@ -863,7 +863,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 )
                 self._failure_req_ids.add(request_id)
 
-        mid_tp = time.perf_counter()
+        wait_end = time.perf_counter()
 
         next_layer_id = current_layer_id + 1
         has_next = next_layer_id in self.layer_ids
@@ -873,7 +873,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 next_layer_id, next_local_row, metadata
             )
 
-        blocking_ms = (mid_tp - wait_start) * 1000
+        blocking_ms = (wait_end - wait_start) * 1000
         stats = {
             "layerwise_wait_blocking_ms": blocking_ms,
             "layerwise_wait_tasks_count": float(n_tasks),
@@ -884,9 +884,9 @@ class UCMLayerWiseConnector(UCMDirectConnector):
             ) * 1000
         if has_next:
             submit_end = time.perf_counter()
-            stats["layerwise_next_layer_submit_ms"] = (submit_end - mid_tp) * 1000
+            stats["layerwise_next_layer_submit_ms"] = (submit_end - wait_end) * 1000
         ucmmetrics.update_stats(stats)
-        self._layerwise_prev_wait_end = mid_tp
+        self._layerwise_prev_wait_end = wait_end
 
     def save_kv_layer(
         self,

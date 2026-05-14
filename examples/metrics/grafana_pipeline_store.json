@@ -672,7 +672,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "Stacked average Cache load phase duration. Segments map to detail panels: queue wait -> Cache Load Queue Wait Duration; dispatch -> Cache Load Dispatch Duration; H2D -> Cache H2D Duration. Backend wait is no longer sampled separately to keep metrics overhead low. Quantiles are intentionally not stacked because p50/p90/p99 are not additive. Uses a fixed 40s rate window so sparse phase updates do not alternate across adjacent time buckets.",
+      "description": "Stacked average Cache load task duration. Uses task-level queue wait and dispatch metrics; WaitBackendTask + H2D is calculated as cache_load_duration_ms avg minus queue wait avg minus dispatch avg. Final-shard sample metrics are shown in detail panels and are intentionally not stacked here. Uses a fixed 40s rate window for stability.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -777,8 +777,8 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum by (${perWorker:raw}) (rate(ucm:cache_h2d_duration_ms_sum{model_name=\"$model_name\"}[40s]))\n/\nsum by (${perWorker:raw}) (rate(ucm:cache_h2d_duration_ms_count{model_name=\"$model_name\"}[40s]))",
-          "legendFormat": "H2D {{worker_id}}",
+          "expr": "clamp_min(\n  (\n    sum by (${perWorker:raw}) (rate(ucm:cache_load_duration_ms_sum{model_name=\"$model_name\"}[40s]))\n    /\n    sum by (${perWorker:raw}) (rate(ucm:cache_load_duration_ms_count{model_name=\"$model_name\"}[40s]))\n  )\n  -\n  (\n    sum by (${perWorker:raw}) (rate(ucm:cache_load_queue_wait_duration_ms_sum{model_name=\"$model_name\"}[40s]))\n    /\n    sum by (${perWorker:raw}) (rate(ucm:cache_load_queue_wait_duration_ms_count{model_name=\"$model_name\"}[40s]))\n  )\n  -\n  (\n    sum by (${perWorker:raw}) (rate(ucm:cache_load_dispatch_duration_ms_sum{model_name=\"$model_name\"}[40s]))\n    /\n    sum by (${perWorker:raw}) (rate(ucm:cache_load_dispatch_duration_ms_count{model_name=\"$model_name\"}[40s]))\n  ),\n  0\n)",
+          "legendFormat": "WaitBackendTask + H2D {{worker_id}}",
           "range": true,
           "refId": "C"
         }
@@ -791,7 +791,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "Stacked average Cache dump phase duration. Segments map to detail panels: queue wait -> Cache Dump Queue Wait Duration; mkbuf -> Cache Dump MkBuf Duration; D2H -> Cache Dump D2H Duration; backend submit -> Cache Dump Backend Submit Duration. Backend submit is the synchronous backend_->Dump submit, not lower-tier disk write completion. Quantiles are intentionally not stacked because p50/p90/p99 are not additive. Uses a fixed 40s rate window so sparse phase updates do not alternate across adjacent time buckets.",
+      "description": "Stacked average Cache dump task duration. Queue wait, mkbuf, D2H, and backend submit are task-level phase metrics; Other / epilog is calculated as cache_dump_duration_ms avg minus those phase averages. Uses a fixed 40s rate window for stability.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -911,6 +911,17 @@
           "legendFormat": "backend submit {{worker_id}}",
           "range": true,
           "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "clamp_min(\n  (\n    sum by (${perWorker:raw}) (rate(ucm:cache_dump_duration_ms_sum{model_name=\"$model_name\"}[40s]))\n    /\n    sum by (${perWorker:raw}) (rate(ucm:cache_dump_duration_ms_count{model_name=\"$model_name\"}[40s]))\n  )\n  -\n  (\n    sum by (${perWorker:raw}) (rate(ucm:cache_dump_queue_wait_duration_ms_sum{model_name=\"$model_name\"}[40s]))\n    /\n    sum by (${perWorker:raw}) (rate(ucm:cache_dump_queue_wait_duration_ms_count{model_name=\"$model_name\"}[40s]))\n  )\n  -\n  (\n    sum by (${perWorker:raw}) (rate(ucm:cache_dump_mkbuf_duration_ms_sum{model_name=\"$model_name\"}[40s]))\n    /\n    sum by (${perWorker:raw}) (rate(ucm:cache_dump_mkbuf_duration_ms_count{model_name=\"$model_name\"}[40s]))\n  )\n  -\n  (\n    sum by (${perWorker:raw}) (rate(ucm:cache_d2h_duration_ms_sum{model_name=\"$model_name\"}[40s]))\n    /\n    sum by (${perWorker:raw}) (rate(ucm:cache_d2h_duration_ms_count{model_name=\"$model_name\"}[40s]))\n  )\n  -\n  (\n    sum by (${perWorker:raw}) (rate(ucm:cache_dump_backend_submit_duration_ms_sum{model_name=\"$model_name\"}[40s]))\n    /\n    sum by (${perWorker:raw}) (rate(ucm:cache_dump_backend_submit_duration_ms_count{model_name=\"$model_name\"}[40s]))\n  ),\n  0\n)",
+          "legendFormat": "Other / epilog {{worker_id}}",
+          "range": true,
+          "refId": "E"
         }
       ],
       "title": "Cache Dump Avg Breakdown",
@@ -1943,7 +1954,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "Cache load host-to-device copy duration on a synchronized stream. Series: p50 / p90 / p99 / avg, per worker.",
+      "description": "Final-shard sample for Cache load H2D submit plus stream sync after WaitBackendTaskReady. This is sampled once per Cache load task from the shard carrying the waiter; it is not a task-level duration and should not be stacked with total load, queue wait, or dispatch. Series: p50 / p90 / p99 / avg by selected view.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2103,7 +2114,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, ${perWorker:raw}) (rate(ucm:cache_h2d_duration_ms_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le, ${perWorker:raw}) (rate(ucm:cache_shard_h2d_sample_ms_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
           "legendFormat": "p50 {{worker_id}}",
           "range": true,
           "refId": "A"
@@ -2114,7 +2125,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.9, sum by (le, ${perWorker:raw}) (rate(ucm:cache_h2d_duration_ms_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.9, sum by (le, ${perWorker:raw}) (rate(ucm:cache_shard_h2d_sample_ms_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
           "legendFormat": "p90 {{worker_id}}",
           "range": true,
           "refId": "B"
@@ -2125,7 +2136,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, ${perWorker:raw}) (rate(ucm:cache_h2d_duration_ms_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le, ${perWorker:raw}) (rate(ucm:cache_shard_h2d_sample_ms_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
           "legendFormat": "p99 {{worker_id}}",
           "range": true,
           "refId": "C"
@@ -2136,13 +2147,13 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum by (${perWorker:raw}) (rate(ucm:cache_h2d_duration_ms_sum{model_name=\"$model_name\"}[$__rate_interval]))\n/\nsum by (${perWorker:raw}) (rate(ucm:cache_h2d_duration_ms_count{model_name=\"$model_name\"}[$__rate_interval]))",
+          "expr": "sum by (${perWorker:raw}) (rate(ucm:cache_shard_h2d_sample_ms_sum{model_name=\"$model_name\"}[$__rate_interval]))\n/\nsum by (${perWorker:raw}) (rate(ucm:cache_shard_h2d_sample_ms_count{model_name=\"$model_name\"}[$__rate_interval]))",
           "legendFormat": "avg {{worker_id}}",
           "range": true,
           "refId": "D"
         }
       ],
-      "title": "Cache H2D Duration",
+      "title": "Cache Load Shard H2D Sample",
       "type": "timeseries"
     },
     {
@@ -2357,6 +2368,213 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
+      "description": "Final-shard sample for Cache load WaitBackendTaskReady. For a miss this includes waiting for the backend load task; for a hit or shared buffer it captures readiness wait for that final shard. This is not a task-level duration and should not be stacked with total load, queue wait, or dispatch. Series: p50 / p90 / p99 / avg by selected view.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": 60000,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^p50.*"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "solid"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^p90.*"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    6
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^p99.*"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    4,
+                    4
+                  ]
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^avg.*"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "solid"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 5
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 73
+      },
+      "id": 48,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "maxHeight": "50%",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le, ${perWorker:raw}) (rate(ucm:cache_shard_backend_wait_ms_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{worker_id}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.9, sum by (le, ${perWorker:raw}) (rate(ucm:cache_shard_backend_wait_ms_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "legendFormat": "p90 {{worker_id}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le, ${perWorker:raw}) (rate(ucm:cache_shard_backend_wait_ms_bucket{model_name=\"$model_name\"}[$__rate_interval])))",
+          "legendFormat": "p99 {{worker_id}}",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (${perWorker:raw}) (rate(ucm:cache_shard_backend_wait_ms_sum{model_name=\"$model_name\"}[$__rate_interval]))\n/\nsum by (${perWorker:raw}) (rate(ucm:cache_shard_backend_wait_ms_count{model_name=\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "avg {{worker_id}}",
+          "range": true,
+          "refId": "D"
+        }
+      ],
+      "title": "Cache Load Shard Backend Wait Sample",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "description": "Synchronous Cache dump backend submit duration around backend_->Dump(...). This is a submit cost only and does not include lower-tier disk write completion. Series: p50 / p90 / p99 / avg by selected view.",
       "fieldConfig": {
         "defaults": {
@@ -2564,7 +2782,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "Average Cache H2D bandwidth during Cache load. Series: p50 / p90 / p99 / avg. Per-task observed host-to-device throughput, sampled once per Cache load task; aggregates shards within a task but NOT across concurrent tasks.",
+      "description": "Average Cache load bandwidth. Series: p50 / p90 / p99 / avg. Per-task observed Cache load throughput, sampled once per Cache load task as total task bytes divided by task wall-clock duration. This is not H2D-only bandwidth.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2763,7 +2981,7 @@
           "refId": "D"
         }
       ],
-      "title": "Cache H2D Bandwidth (per task)",
+      "title": "Cache Load Bandwidth (per task)",
       "type": "timeseries"
     },
     {
@@ -2771,7 +2989,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "Average Cache D2H bandwidth during Cache dump. Series: p50 / p90 / p99 / avg. Per-task observed device-to-host throughput, sampled once per Cache dump task; aggregates shards within a task but NOT across concurrent tasks.",
+      "description": "Average Cache dump bandwidth. Series: p50 / p90 / p99 / avg. Per-task observed Cache dump throughput, sampled once per Cache dump task as total task bytes divided by task wall-clock duration. This is not D2H-only bandwidth.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2970,7 +3188,7 @@
           "refId": "D"
         }
       ],
-      "title": "Cache Dump D2H Bandwidth (per task)",
+      "title": "Cache Dump Bandwidth (per task)",
       "type": "timeseries"
     },
     {
@@ -3581,7 +3799,7 @@
           },
           "id": 17,
           "title": "Cache / Dump Duration",
-          "description": "Caller-felt Cache dump duration. Watch for convergence with Posix h2s duration -- back-pressure signal (see perf doc §3.4). Cell value is request rate from rate(bucket), not raw request count; all workers aggregated.",
+          "description": "Caller-felt Cache dump duration. Watch for convergence with Posix dump task duration -- back-pressure signal (see perf doc §3.4). Cell value is request rate from rate(bucket), not raw request count; all workers aggregated.",
           "gridPos": {
             "h": 8,
             "w": 12,

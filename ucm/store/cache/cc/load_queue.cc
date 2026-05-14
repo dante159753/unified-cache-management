@@ -142,9 +142,10 @@ void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& task)
     }
     auto s = Status::OK();
     do {
+        auto tpBackendWait = task.waiter ? NowTime::Now() : 0.0;
         s = WaitBackendTaskReady(task);
         if (s.Failure()) [[unlikely]] { break; }
-        auto tpBackendReady = NowTime::Now();
+        auto tpBackendReady = task.waiter ? NowTime::Now() : 0.0;
         s = HostToDeviceScatterAsync(stream.NextStream(), task.bufferHandle.Data(),
                                      task.shard.addrs.data());
         if (s.Failure()) [[unlikely]] {
@@ -161,7 +162,10 @@ void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& task)
             UC_ERROR("Failed({}) to sync on stream for task({}).", s, task.taskHandle);
             break;
         }
-        UC::Metrics::UpdateStats("cache_h2d_duration_ms", (NowTime::Now() - tpBackendReady) * 1e3);
+        UC::Metrics::UpdateStats("cache_shard_backend_wait_ms",
+                                 (tpBackendReady - tpBackendWait) * 1e3);
+        UC::Metrics::UpdateStats("cache_shard_h2d_sample_ms",
+                                 (NowTime::Now() - tpBackendReady) * 1e3);
     } while (0);
     if (s.Failure()) [[unlikely]] { failureSet_->Insert(task.taskHandle); }
     if (task.waiter) { task.waiter->Done(); }

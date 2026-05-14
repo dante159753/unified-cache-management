@@ -43,7 +43,7 @@ flowchart TD
     C["DispatchOneTask: buffer alloc + submit miss<br/><b>cache_load_dispatch_duration_ms</b><br/>backend_submit_shards / shards = miss ratio"]
     D["Posix waiting queue<br/><b>posix_load_queue_wait_duration_ms</b>"]
     E["Posix S2H worker — read disk<br/><b>posix_load_task_duration_ms</b><br/><b>posix_s2h_bandwidth_gbps</b>"]
-    G["H2D copy + stream sync<br/><b>cache_h2d_duration_ms</b>"]
+    G["WaitBackendTask + H2D<br/><b>breakdown residual</b>"]
     H(["epilog fires<br/><b>cache_load_duration_ms</b> (total)<br/><b>cache_load_bandwidth_gbps</b>"])
     A --> B --> C --> D --> E --> G --> H
     classDef posix fill:#fff4e6,stroke:#d97706
@@ -65,6 +65,11 @@ flowchart LR
     class B,C,G cache
     class H done
 ```
+
+`cache_shard_backend_wait_ms` and `cache_shard_h2d_sample_ms` sample
+the final shard in a Cache load task. They are useful diagnostics, but
+they are not task-level durations and should not be stacked with
+`cache_load_duration_ms`, queue wait, or dispatch.
 
 ### 1.3 DUMP data flow
 
@@ -171,12 +176,13 @@ Decompose by reading these in parallel:
 | `cache_load_queue_wait_duration_ms` | < 1 ms | Load queue is saturated; too many concurrent requests |
 | `cache_load_dispatch_duration_ms` | < 1 ms | Dispatch is rarely the bottleneck; if high, suspect lock contention |
 | `posix_load_task_duration_ms` | depends on hit rate | Cache misses going to Posix — see §3.3 |
-| `cache_h2d_duration_ms` | bounded by PCIe bw | Rare; suspect device-side contention or wrong stream affinity |
+| `cache_shard_backend_wait_ms` | small | Final shard waited for backend/cache readiness |
+| `cache_shard_h2d_sample_ms` | bounded by PCIe bw | Final-shard H2D sample is slow; suspect device-side contention or wrong stream affinity |
 
 **Tunables.**
 - Wait high → `waiting_queue_depth` ↑ or reduce concurrency.
 - Posix slow → see §3.3.
-- H2D high → check `cache_stream_number` and that pinned memory is
+- H2D sample high → check `cache_stream_number` and that pinned memory is
   actually pinned (compare H2D bandwidth to PCIe spec; pinned should
   hit > 20 GB/s on PCIe Gen4 x16).
 
@@ -185,7 +191,8 @@ Decompose by reading these in parallel:
 **Symptoms.** `posix_load_task_duration_ms` dominates the load chain.
 
 **Metric signature.**
-- `posix_load_task_duration_ms` > `cache_h2d_duration_ms`
+- `posix_load_task_duration_ms` dominates the load residual
+  (`cache_load_duration_ms` minus Cache queue wait and dispatch)
 - `rate(ucm:posix_s2h_bytes_total[5m]) / 1e9` (aggregated actual GB/s)
   well below disk spec (e.g. < 1 GB/s on an NVMe rated for 3 GB/s)
 - AND/OR `posix_load_queue_wait_duration_ms` high (queue buildup)
@@ -424,7 +431,7 @@ rate(ucm:cache_load_backend_shards_total{model_name="$model_name"}[5m])
 clamp_min(rate(ucm:cache_load_shards_total{model_name="$model_name"}[5m]), 1)
 ```
 
-**P99 load duration per stage (decomposition of the load chain):**
+**P99 load diagnostics:**
 
 ```
 histogram_quantile(0.99, sum by (le) (
@@ -434,11 +441,14 @@ histogram_quantile(0.99, sum by (le) (
   rate(ucm:posix_load_task_duration_ms_bucket{model_name="$model_name"}[5m])))
 
 histogram_quantile(0.99, sum by (le) (
-  rate(ucm:cache_h2d_duration_ms_bucket{model_name="$model_name"}[5m])))
+  rate(ucm:cache_shard_backend_wait_ms_bucket{model_name="$model_name"}[5m])))
+
+histogram_quantile(0.99, sum by (le) (
+  rate(ucm:cache_shard_h2d_sample_ms_bucket{model_name="$model_name"}[5m])))
 ```
 
-Sum these for an approximation of total load p99 (they're correlated,
-so the sum overestimates — read trends, not absolute values).
+Do not sum the shard sample metrics into total load p99. Use the
+dashboard's average breakdown for additive task-level decomposition.
 
 **Average overlap loss (how much of forward time is wasted waiting on
 loads):**

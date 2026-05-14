@@ -136,8 +136,11 @@ histogram:
   - name: "cache_load_dispatch_duration_ms"
     documentation: "Cache load dispatch cost: buffer allocation + backend submission (ms)"
     buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500]
-  - name: "cache_h2d_duration_ms"
-    documentation: "Cache load host-to-device copy duration on a sync'd stream (ms)"
+  - name: "cache_shard_backend_wait_ms"
+    documentation: "Final Cache load shard sample: time spent in WaitBackendTaskReady before H2D submit (ms). This is not a task-level duration."
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
+  - name: "cache_shard_h2d_sample_ms"
+    documentation: "Final Cache load shard sample: H2D submit plus stream sync after backend wait (ms). This is not a task-level duration."
     buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
   - name: "cache_dump_mkbuf_duration_ms"
     documentation: "Cache dump mk_buf phase: prerequisite wait + buffer allocation/reuse + D2H async submit before stream sync (ms)"
@@ -173,10 +176,10 @@ histogram:
               5, 6, 7, 8, 9, 10, 11, 12,
               14, 16, 20, 24, 32]
   - name: "posix_load_queue_wait_duration_ms"
-    documentation: "Time a Posix load IO spent queued before worker pickup (ms)"
+    documentation: "Time a Posix load task spent queued before first worker pickup (ms)"
     buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500]
   - name: "posix_dump_queue_wait_duration_ms"
-    documentation: "Time a Posix dump IO spent queued before worker pickup (ms)"
+    documentation: "Time a Posix dump task spent queued before first worker pickup (ms)"
     buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500]
 
   # =========================================================================
