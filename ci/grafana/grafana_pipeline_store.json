@@ -682,7 +682,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "Stacked average Cache load phase duration. Segments map to detail panels: queue wait -> Cache Load Queue Wait Duration; dispatch -> Cache Load Dispatch Duration; backend wait -> Cache Load Backend Wait Duration; H2D -> Cache H2D Duration. Quantiles are intentionally not stacked because p50/p90/p99 are not additive. Uses a fixed 40s rate window so sparse phase updates do not alternate across adjacent time buckets.",
+      "description": "Stacked average Cache load phase duration. Segments map to detail panels: queue wait -> Cache Load Queue Wait Duration; dispatch -> Cache Load Dispatch Duration; H2D -> Cache H2D Duration. Backend wait is no longer sampled separately to keep metrics overhead low. Quantiles are intentionally not stacked because p50/p90/p99 are not additive. Uses a fixed 40s rate window so sparse phase updates do not alternate across adjacent time buckets.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -787,21 +787,10 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (${perWorker:raw}) (rate(ucm:cache_load_backend_wait_duration_ms_sum{model_name=\"$model_name\", job=\"$job\"}[40s]))\n/\nsum by (${perWorker:raw}) (rate(ucm:cache_load_backend_wait_duration_ms_count{model_name=\"$model_name\", job=\"$job\"}[40s]))",
-          "legendFormat": "backend wait {{worker_id}}",
-          "range": true,
-          "refId": "C"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
           "expr": "sum by (${perWorker:raw}) (rate(ucm:cache_h2d_duration_ms_sum{model_name=\"$model_name\", job=\"$job\"}[40s]))\n/\nsum by (${perWorker:raw}) (rate(ucm:cache_h2d_duration_ms_count{model_name=\"$model_name\", job=\"$job\"}[40s]))",
           "legendFormat": "H2D {{worker_id}}",
           "range": true,
-          "refId": "D"
+          "refId": "C"
         }
       ],
       "title": "Cache Load Avg Breakdown",
@@ -1543,213 +1532,6 @@
         }
       ],
       "title": "Cache Dump Queue Wait Duration",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "description": "Time spent in TransBuffer::Alloc retry-loop after the first failed reusable-node attempt. Zero means the first candidate node was reusable. Series: p50 / p90 / p99 / avg by selected view.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": 60000,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "ms"
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "^p50.*"
-            },
-            "properties": [
-              {
-                "id": "custom.lineStyle",
-                "value": {
-                  "fill": "solid"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "^p90.*"
-            },
-            "properties": [
-              {
-                "id": "custom.lineStyle",
-                "value": {
-                  "fill": "dash",
-                  "dash": [
-                    10,
-                    6
-                  ]
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "^p99.*"
-            },
-            "properties": [
-              {
-                "id": "custom.lineStyle",
-                "value": {
-                  "fill": "dash",
-                  "dash": [
-                    4,
-                    4
-                  ]
-                }
-              },
-              {
-                "id": "custom.lineWidth",
-                "value": 2
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "^avg.*"
-            },
-            "properties": [
-              {
-                "id": "custom.lineStyle",
-                "value": {
-                  "fill": "solid"
-                }
-              },
-              {
-                "id": "custom.lineWidth",
-                "value": 1
-              },
-              {
-                "id": "custom.fillOpacity",
-                "value": 5
-              }
-            ]
-          }
-        ]
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 24,
-        "x": 0,
-        "y": 41
-      },
-      "id": 34,
-      "options": {
-        "legend": {
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ],
-          "displayMode": "table",
-          "maxHeight": "50%",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, ${perWorker:raw}) (rate(ucm:cache_buffer_alloc_spin_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
-          "legendFormat": "p50 {{worker_id}}",
-          "range": true,
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.9, sum by (le, ${perWorker:raw}) (rate(ucm:cache_buffer_alloc_spin_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
-          "legendFormat": "p90 {{worker_id}}",
-          "range": true,
-          "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, ${perWorker:raw}) (rate(ucm:cache_buffer_alloc_spin_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
-          "legendFormat": "p99 {{worker_id}}",
-          "range": true,
-          "refId": "C"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "sum by (${perWorker:raw}) (rate(ucm:cache_buffer_alloc_spin_duration_ms_sum{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))\n/\nsum by (${perWorker:raw}) (rate(ucm:cache_buffer_alloc_spin_duration_ms_count{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))",
-          "legendFormat": "avg {{worker_id}}",
-          "range": true,
-          "refId": "D"
-        }
-      ],
-      "title": "Cache Buffer Alloc Spin Duration",
       "type": "timeseries"
     },
     {
@@ -2578,213 +2360,6 @@
         }
       ],
       "title": "Cache Dump D2H Duration",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "description": "Time a Cache load task spent waiting for the backend tier to fill the buffer. Large values mean frequent Cache misses or slow backend. Series: p50 / p90 / p99 / avg, per worker.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": 60000,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "ms"
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "^p50.*"
-            },
-            "properties": [
-              {
-                "id": "custom.lineStyle",
-                "value": {
-                  "fill": "solid"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "^p90.*"
-            },
-            "properties": [
-              {
-                "id": "custom.lineStyle",
-                "value": {
-                  "fill": "dash",
-                  "dash": [
-                    10,
-                    6
-                  ]
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "^p99.*"
-            },
-            "properties": [
-              {
-                "id": "custom.lineStyle",
-                "value": {
-                  "fill": "dash",
-                  "dash": [
-                    4,
-                    4
-                  ]
-                }
-              },
-              {
-                "id": "custom.lineWidth",
-                "value": 2
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "^avg.*"
-            },
-            "properties": [
-              {
-                "id": "custom.lineStyle",
-                "value": {
-                  "fill": "solid"
-                }
-              },
-              {
-                "id": "custom.lineWidth",
-                "value": 1
-              },
-              {
-                "id": "custom.fillOpacity",
-                "value": 5
-              }
-            ]
-          }
-        ]
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 73
-      },
-      "id": 5,
-      "options": {
-        "legend": {
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ],
-          "displayMode": "table",
-          "maxHeight": "50%",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, ${perWorker:raw}) (rate(ucm:cache_load_backend_wait_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
-          "legendFormat": "p50 {{worker_id}}",
-          "range": true,
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.9, sum by (le, ${perWorker:raw}) (rate(ucm:cache_load_backend_wait_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
-          "legendFormat": "p90 {{worker_id}}",
-          "range": true,
-          "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, ${perWorker:raw}) (rate(ucm:cache_load_backend_wait_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
-          "legendFormat": "p99 {{worker_id}}",
-          "range": true,
-          "refId": "C"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "sum by (${perWorker:raw}) (rate(ucm:cache_load_backend_wait_duration_ms_sum{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))\n/\nsum by (${perWorker:raw}) (rate(ucm:cache_load_backend_wait_duration_ms_count{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))",
-          "legendFormat": "avg {{worker_id}}",
-          "range": true,
-          "refId": "D"
-        }
-      ],
-      "title": "Cache Load Backend Wait Duration",
       "type": "timeseries"
     },
     {
@@ -4177,91 +3752,6 @@
             "overrides": []
           },
           "pluginVersion": "10.4.0"
-        },
-        {
-          "type": "heatmap",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "id": 19,
-          "title": "Cache / Load Backend Wait",
-          "description": "Time waiting for Posix to fill the buffer on a Cache miss. Spread and shift here drives total load latency. Cell value is request rate from rate(bucket), not raw request count; all workers aggregated.",
-          "gridPos": {
-            "h": 8,
-            "w": 24,
-            "x": 0,
-            "y": 106
-          },
-          "targets": [
-            {
-              "datasource": {
-                "type": "prometheus",
-                "uid": "prometheus"
-              },
-              "editorMode": "code",
-              "expr": "sum by (le) (rate(ucm:cache_load_backend_wait_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))",
-              "format": "heatmap",
-              "legendFormat": "{{le}}",
-              "range": true,
-              "refId": "A"
-            }
-          ],
-          "options": {
-            "calculate": false,
-            "yAxis": {
-              "axisPlacement": "left",
-              "unit": "ms",
-              "decimals": 0,
-              "reverse": false
-            },
-            "rowsFrame": {
-              "layout": "auto",
-              "value": "Request rate"
-            },
-            "color": {
-              "mode": "scheme",
-              "scheme": "Spectral",
-              "fill": "dark-orange",
-              "exponent": 0.5,
-              "steps": 64,
-              "reverse": false
-            },
-            "cellGap": 1,
-            "cellValues": {
-              "unit": "suffix: req/s"
-            },
-            "filterValues": {
-              "le": 1e-9
-            },
-            "tooltip": {
-              "show": true,
-              "yHistogram": true,
-              "mode": "single"
-            },
-            "legend": {
-              "show": true
-            },
-            "exemplars": {
-              "color": "rgba(255,0,255,0.7)"
-            }
-          },
-          "fieldConfig": {
-            "defaults": {
-              "custom": {
-                "scaleDistribution": {
-                  "type": "linear"
-                },
-                "hideFrom": {
-                  "legend": false,
-                  "tooltip": false,
-                  "viz": false
-                }
-              }
-            },
-            "overrides": []
-          },
-          "pluginVersion": "10.4.0"
         }
       ]
     },
@@ -4697,7 +4187,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "Stacked average Posix load phase duration. Segments map to detail panels: queue wait -> Posix Load Queue Wait Duration; S2H -> Posix S2H Duration. This is a bottleneck scan, not an exact per-task trace, because Posix S2H is sampled per IO shard while task duration is sampled per task. Uses a fixed 40s rate window so sparse phase updates do not alternate across adjacent time buckets.",
+      "description": "Stacked average Posix load task duration. queue wait is task queueing before the first worker pickup; task after queue is approximated as task total minus queue wait. Uses task-level metrics only.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -4791,8 +4281,8 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (${perWorker:raw}) (rate(ucm:posix_s2h_duration_ms_sum{model_name=\"$model_name\", job=\"$job\"}[40s]))\n/\nsum by (${perWorker:raw}) (rate(ucm:posix_s2h_duration_ms_count{model_name=\"$model_name\", job=\"$job\"}[40s]))",
-          "legendFormat": "S2H {{worker_id}}",
+          "expr": "clamp_min(\n  (\n    sum by (${perWorker:raw}) (rate(ucm:posix_load_task_duration_ms_sum{model_name=\"$model_name\", job=\"$job\"}[40s]))\n    /\n    sum by (${perWorker:raw}) (rate(ucm:posix_load_task_duration_ms_count{model_name=\"$model_name\", job=\"$job\"}[40s]))\n  )\n  -\n  (\n    sum by (${perWorker:raw}) (rate(ucm:posix_load_queue_wait_duration_ms_sum{model_name=\"$model_name\", job=\"$job\"}[40s]))\n    /\n    sum by (${perWorker:raw}) (rate(ucm:posix_load_queue_wait_duration_ms_count{model_name=\"$model_name\", job=\"$job\"}[40s]))\n  ),\n  0\n)",
+          "legendFormat": "task after queue {{worker_id}}",
           "range": true,
           "refId": "B"
         }
@@ -4805,7 +4295,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "Stacked average Posix dump phase duration. Segments map to detail panels: queue wait -> Posix Dump Queue Wait Duration; H2S -> Posix H2S Duration. This is a bottleneck scan, not an exact per-task trace, because Posix H2S is sampled per IO shard while task duration is sampled per task. Uses a fixed 40s rate window so sparse phase updates do not alternate across adjacent time buckets.",
+      "description": "Stacked average Posix dump task duration. queue wait is task queueing before the first worker pickup; task after queue is approximated as task total minus queue wait. Uses task-level metrics only.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -4899,8 +4389,8 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (${perWorker:raw}) (rate(ucm:posix_h2s_duration_ms_sum{model_name=\"$model_name\", job=\"$job\"}[40s]))\n/\nsum by (${perWorker:raw}) (rate(ucm:posix_h2s_duration_ms_count{model_name=\"$model_name\", job=\"$job\"}[40s]))",
-          "legendFormat": "H2S {{worker_id}}",
+          "expr": "clamp_min(\n  (\n    sum by (${perWorker:raw}) (rate(ucm:posix_dump_task_duration_ms_sum{model_name=\"$model_name\", job=\"$job\"}[40s]))\n    /\n    sum by (${perWorker:raw}) (rate(ucm:posix_dump_task_duration_ms_count{model_name=\"$model_name\", job=\"$job\"}[40s]))\n  )\n  -\n  (\n    sum by (${perWorker:raw}) (rate(ucm:posix_dump_queue_wait_duration_ms_sum{model_name=\"$model_name\", job=\"$job\"}[40s]))\n    /\n    sum by (${perWorker:raw}) (rate(ucm:posix_dump_queue_wait_duration_ms_count{model_name=\"$model_name\", job=\"$job\"}[40s]))\n  ),\n  0\n)",
+          "legendFormat": "task after queue {{worker_id}}",
           "range": true,
           "refId": "B"
         }
@@ -4913,7 +4403,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "Wall-clock per-worker load throughput in GB/s. Aggregates all concurrent IO threads inside one worker process and includes idle gaps, so this is the real bytes/sec the worker is pulling from posix. Pair with (per shard) above: if per-shard is high but per-worker is low, IO is fast but sparse — disk is not saturated.",
+      "description": "Wall-clock per-worker load throughput in GB/s. Aggregates concurrent Posix load tasks inside one worker process and includes idle gaps, so this is the real bytes/sec the worker is pulling from posix. Pair with the per-task panel below: if per-task is high but per-worker is low, tasks are fast but sparse and disk is not saturated.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -5010,7 +4500,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "Wall-clock per-worker dump throughput in GB/s. Aggregates all concurrent IO threads inside one worker process and includes idle gaps, so this is the real bytes/sec the worker is pushing to posix. Pair with (per shard) above: if per-shard is high but per-worker is low, IO is fast but sparse — disk is not saturated.",
+      "description": "Wall-clock per-worker dump throughput in GB/s. Aggregates concurrent Posix dump tasks inside one worker process and includes idle gaps, so this is the real bytes/sec the worker is pushing to posix. Pair with the per-task panel below: if per-task is high but per-worker is low, tasks are fast but sparse and disk is not saturated.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -5521,421 +5011,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "Posix-stage S2H per-IO duration. Represents disk read latency. Series: p50 / p90 / p99 / avg, per worker.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": 60000,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "ms"
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "^p50.*"
-            },
-            "properties": [
-              {
-                "id": "custom.lineStyle",
-                "value": {
-                  "fill": "solid"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "^p90.*"
-            },
-            "properties": [
-              {
-                "id": "custom.lineStyle",
-                "value": {
-                  "fill": "dash",
-                  "dash": [
-                    10,
-                    6
-                  ]
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "^p99.*"
-            },
-            "properties": [
-              {
-                "id": "custom.lineStyle",
-                "value": {
-                  "fill": "dash",
-                  "dash": [
-                    4,
-                    4
-                  ]
-                }
-              },
-              {
-                "id": "custom.lineWidth",
-                "value": 2
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "^avg.*"
-            },
-            "properties": [
-              {
-                "id": "custom.lineStyle",
-                "value": {
-                  "fill": "solid"
-                }
-              },
-              {
-                "id": "custom.lineWidth",
-                "value": 1
-              },
-              {
-                "id": "custom.fillOpacity",
-                "value": 5
-              }
-            ]
-          }
-        ]
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 147
-      },
-      "id": 12,
-      "options": {
-        "legend": {
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ],
-          "displayMode": "table",
-          "maxHeight": "50%",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, ${perWorker:raw}) (rate(ucm:posix_s2h_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
-          "legendFormat": "p50 {{worker_id}}",
-          "range": true,
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.9, sum by (le, ${perWorker:raw}) (rate(ucm:posix_s2h_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
-          "legendFormat": "p90 {{worker_id}}",
-          "range": true,
-          "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, ${perWorker:raw}) (rate(ucm:posix_s2h_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
-          "legendFormat": "p99 {{worker_id}}",
-          "range": true,
-          "refId": "C"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "sum by (${perWorker:raw}) (rate(ucm:posix_s2h_duration_ms_sum{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))\n/\nsum by (${perWorker:raw}) (rate(ucm:posix_s2h_duration_ms_count{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))",
-          "legendFormat": "avg {{worker_id}}",
-          "range": true,
-          "refId": "D"
-        }
-      ],
-      "title": "Posix S2H Duration",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "description": "Posix-stage H2S per-IO duration. Represents disk write latency. Series: p50 / p90 / p99 / avg, per worker.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": 60000,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "ms"
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "^p50.*"
-            },
-            "properties": [
-              {
-                "id": "custom.lineStyle",
-                "value": {
-                  "fill": "solid"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "^p90.*"
-            },
-            "properties": [
-              {
-                "id": "custom.lineStyle",
-                "value": {
-                  "fill": "dash",
-                  "dash": [
-                    10,
-                    6
-                  ]
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "^p99.*"
-            },
-            "properties": [
-              {
-                "id": "custom.lineStyle",
-                "value": {
-                  "fill": "dash",
-                  "dash": [
-                    4,
-                    4
-                  ]
-                }
-              },
-              {
-                "id": "custom.lineWidth",
-                "value": 2
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "^avg.*"
-            },
-            "properties": [
-              {
-                "id": "custom.lineStyle",
-                "value": {
-                  "fill": "solid"
-                }
-              },
-              {
-                "id": "custom.lineWidth",
-                "value": 1
-              },
-              {
-                "id": "custom.fillOpacity",
-                "value": 5
-              }
-            ]
-          }
-        ]
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 147
-      },
-      "id": 13,
-      "options": {
-        "legend": {
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ],
-          "displayMode": "table",
-          "maxHeight": "50%",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, ${perWorker:raw}) (rate(ucm:posix_h2s_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
-          "legendFormat": "p50 {{worker_id}}",
-          "range": true,
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.9, sum by (le, ${perWorker:raw}) (rate(ucm:posix_h2s_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
-          "legendFormat": "p90 {{worker_id}}",
-          "range": true,
-          "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, ${perWorker:raw}) (rate(ucm:posix_h2s_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval])))",
-          "legendFormat": "p99 {{worker_id}}",
-          "range": true,
-          "refId": "C"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "sum by (${perWorker:raw}) (rate(ucm:posix_h2s_duration_ms_sum{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))\n/\nsum by (${perWorker:raw}) (rate(ucm:posix_h2s_duration_ms_count{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))",
-          "legendFormat": "avg {{worker_id}}",
-          "range": true,
-          "refId": "D"
-        }
-      ],
-      "title": "Posix H2S Duration",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "description": "Posix-stage storage-to-host bandwidth (load direction). Series: p50 / p90 / p99 / avg, per worker. Per single-IO observed throughput, sampled once per shard transfer; does NOT aggregate across concurrent IO threads. Use the (per worker) panel below for actual disk throughput.",
+      "description": "Posix-stage storage-to-host bandwidth (load direction). Series: p50 / p90 / p99 / avg by selected view. Task-level observed throughput: total task bytes divided by task wall-clock duration.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -6069,7 +5145,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 155
+        "y": 147
       },
       "id": 10,
       "options": {
@@ -6134,7 +5210,7 @@
           "refId": "D"
         }
       ],
-      "title": "Posix S2H Bandwidth (per shard)",
+      "title": "Posix S2H Bandwidth (per task)",
       "type": "timeseries"
     },
     {
@@ -6142,7 +5218,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "Posix-stage host-to-storage bandwidth (dump direction). Series: p50 / p90 / p99 / avg, per worker. Per single-IO observed throughput, sampled once per shard transfer; does NOT aggregate across concurrent IO threads. Use the (per worker) panel below for actual disk throughput.",
+      "description": "Posix-stage host-to-storage bandwidth (dump direction). Series: p50 / p90 / p99 / avg by selected view. Task-level observed throughput: total task bytes divided by task wall-clock duration.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -6276,7 +5352,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 155
+        "y": 147
       },
       "id": 11,
       "options": {
@@ -6341,7 +5417,7 @@
           "refId": "D"
         }
       ],
-      "title": "Posix H2S Bandwidth (per shard)",
+      "title": "Posix H2S Bandwidth (per task)",
       "type": "timeseries"
     },
     {
@@ -6357,7 +5433,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 163
+        "y": 155
       },
       "panels": [
         {
@@ -6367,13 +5443,13 @@
             "uid": "prometheus"
           },
           "id": 21,
-          "title": "Posix / S2H Duration",
-          "description": "Per-IO storage read latency distribution. Bimodal often = OS page cache hits vs cold reads. Cell value is request rate from rate(bucket), not raw request count; all workers aggregated.",
+          "title": "Posix / Load Task Duration",
+          "description": "End-to-end Posix load task duration distribution. Cell value is request rate from rate(bucket), not raw request count; all workers aggregated.",
           "gridPos": {
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 164
+            "y": 156
           },
           "targets": [
             {
@@ -6382,7 +5458,7 @@
                 "uid": "prometheus"
               },
               "editorMode": "code",
-              "expr": "sum by (le) (rate(ucm:posix_s2h_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))",
+              "expr": "sum by (le) (rate(ucm:posix_load_task_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))",
               "format": "heatmap",
               "legendFormat": "{{le}}",
               "range": true,
@@ -6452,13 +5528,13 @@
             "uid": "prometheus"
           },
           "id": 22,
-          "title": "Posix / H2S Duration",
-          "description": "Per-IO storage write latency distribution. Cell value is request rate from rate(bucket), not raw request count; all workers aggregated.",
+          "title": "Posix / Dump Task Duration",
+          "description": "End-to-end Posix dump task duration distribution. Cell value is request rate from rate(bucket), not raw request count; all workers aggregated.",
           "gridPos": {
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 164
+            "y": 156
           },
           "targets": [
             {
@@ -6467,7 +5543,7 @@
                 "uid": "prometheus"
               },
               "editorMode": "code",
-              "expr": "sum by (le) (rate(ucm:posix_h2s_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))",
+              "expr": "sum by (le) (rate(ucm:posix_dump_task_duration_ms_bucket{model_name=\"$model_name\", job=\"$job\"}[$__rate_interval]))",
               "format": "heatmap",
               "legendFormat": "{{le}}",
               "range": true,
@@ -6537,13 +5613,13 @@
             "uid": "prometheus"
           },
           "id": 23,
-          "title": "Posix / S2H Bandwidth (per shard)",
-          "description": "Storage read bandwidth distribution. Buckets are dense in 1-12 GB/s to resolve the typical operating range. Cell value is request rate from rate(bucket), not raw request count; all workers aggregated. Per single-IO observed throughput, sampled once per shard transfer; does NOT aggregate across concurrent IO threads. Use the (per worker) panel below for actual disk throughput.",
+          "title": "Posix / S2H Bandwidth (per task)",
+          "description": "Task-level Posix read bandwidth distribution. Cell value is request rate from rate(bucket), not raw request count; all workers aggregated.",
           "gridPos": {
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 172
+            "y": 164
           },
           "targets": [
             {
@@ -6622,13 +5698,13 @@
             "uid": "prometheus"
           },
           "id": 24,
-          "title": "Posix / H2S Bandwidth (per shard)",
-          "description": "Storage write bandwidth distribution. Buckets dense in 1-12 GB/s. Cell value is request rate from rate(bucket), not raw request count; all workers aggregated. Per single-IO observed throughput, sampled once per shard transfer; does NOT aggregate across concurrent IO threads. Use the (per worker) panel below for actual disk throughput.",
+          "title": "Posix / H2S Bandwidth (per task)",
+          "description": "Task-level Posix write bandwidth distribution. Cell value is request rate from rate(bucket), not raw request count; all workers aggregated.",
           "gridPos": {
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 172
+            "y": 164
           },
           "targets": [
             {

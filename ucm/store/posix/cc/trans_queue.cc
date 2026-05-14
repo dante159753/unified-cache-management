@@ -101,19 +101,8 @@ void TransQueue::LoadWorker(IoUnit& ios)
         ios.waiter->Done();
         return;
     }
-    auto tp = NowTime::Now();
     auto s = S2H(ios);
-    auto cost = NowTime::Now() - tp;
-    auto ioBytes = ios.shard.addrs.size() * ioSize_;
-    auto bwGbps = cost > 0 ? static_cast<double>(ioBytes) / cost / 1e9 : 0.0;
-    UC::Metrics::UpdateStats("posix_s2h_duration_ms", cost * 1e3);
-    UC::Metrics::UpdateStats("posix_s2h_bandwidth_gbps", bwGbps);
-    if (s.Failure()) [[unlikely]] {
-        failureSet_->Insert(ios.owner);
-        UC::Metrics::UpdateStats("posix_load_failures_total", 1.0);
-    } else {
-        UC::Metrics::UpdateStats("posix_s2h_bytes_total", static_cast<double>(ioBytes));
-    }
+    if (s.Failure()) [[unlikely]] { failureSet_->Insert(ios.owner); }
     ios.waiter->Done();
 }
 
@@ -128,22 +117,11 @@ void TransQueue::DumpWorker(IoUnit& ios)
         ios.waiter->Done();
         return;
     }
-    auto tp = NowTime::Now();
     auto s = H2S(ios);
-    auto cost = NowTime::Now() - tp;
-    auto ioBytes = ios.shard.addrs.size() * ioSize_;
-    auto bwGbps = cost > 0 ? static_cast<double>(ioBytes) / cost / 1e9 : 0.0;
-    UC::Metrics::UpdateStats("posix_h2s_duration_ms", cost * 1e3);
-    UC::Metrics::UpdateStats("posix_h2s_bandwidth_gbps", bwGbps);
     if (ios.shard.index + 1 == nShardPerBlock_) {
         layout_->CommitFile(ios.shard.owner, s.Success());
     }
-    if (s.Failure()) [[unlikely]] {
-        failureSet_->Insert(ios.owner);
-        UC::Metrics::UpdateStats("posix_dump_failures_total", 1.0);
-    } else {
-        UC::Metrics::UpdateStats("posix_h2s_bytes_total", static_cast<double>(ioBytes));
-    }
+    if (s.Failure()) [[unlikely]] { failureSet_->Insert(ios.owner); }
     ios.waiter->Done();
 }
 

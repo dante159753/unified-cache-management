@@ -141,7 +141,6 @@ void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& task)
         return;
     }
     auto s = Status::OK();
-    auto tpBegin = NowTime::Now();
     do {
         s = WaitBackendTaskReady(task);
         if (s.Failure()) [[unlikely]] { break; }
@@ -154,8 +153,6 @@ void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& task)
         }
         if (!task.waiter) {
             holder_.push_back(std::move(task));
-            UC::Metrics::UpdateStats("cache_load_backend_wait_duration_ms",
-                                     (tpBackendReady - tpBegin) * 1e3);
             return;
         }
         s = stream.Synchronize();
@@ -164,10 +161,7 @@ void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& task)
             UC_ERROR("Failed({}) to sync on stream for task({}).", s, task.taskHandle);
             break;
         }
-        auto tpEnd = NowTime::Now();
-        UC::Metrics::UpdateStats("cache_load_backend_wait_duration_ms",
-                                 (tpBackendReady - tpBegin) * 1e3);
-        UC::Metrics::UpdateStats("cache_h2d_duration_ms", (tpEnd - tpBackendReady) * 1e3);
+        UC::Metrics::UpdateStats("cache_h2d_duration_ms", (NowTime::Now() - tpBackendReady) * 1e3);
     } while (0);
     if (s.Failure()) [[unlikely]] { failureSet_->Insert(task.taskHandle); }
     if (task.waiter) { task.waiter->Done(); }

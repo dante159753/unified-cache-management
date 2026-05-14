@@ -444,14 +444,13 @@ class UCMDirectConnector(KVConnectorBase_V1):
             f"hit hbm: {hbm_hit_block_num * self.cp_world_size}, "
             f"hit external: {external_hit_blocks * self.cp_world_size}"
         )
-        if self.metrics_config:
-            ucmmetrics.update_stats(
-                {
-                    "interval_lookup_hit_rates": external_hit_blocks
-                    * self.cp_world_size
-                    / len(ucm_block_ids)
-                },
-            )
+        ucmmetrics.update_stats(
+            {
+                "interval_lookup_hit_rates": external_hit_blocks
+                * self.cp_world_size
+                / len(ucm_block_ids)
+            },
+        )
 
         total_hit_block_num = hbm_hit_block_num + external_hit_blocks
 
@@ -641,7 +640,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
         load_speed = (
             load_bytes / (load_end_time - load_start_time) / 1024 / 1024
         )  # GB/s
-        if self.metrics_config and is_load:
+        if is_load:
             ucmmetrics.update_stats(
                 {
                     "load_requests_num": num_loaded_request,
@@ -730,16 +729,15 @@ class UCMDirectConnector(KVConnectorBase_V1):
             save_speed = (
                 save_bytes / (save_end_time - save_start_time) / 1024 / 1024
             )  # GB/s
-            if self.metrics_config:
-                ucmmetrics.update_stats(
-                    {
-                        "save_requests_num": num_saved_request,
-                        "save_blocks_num": num_saved_block,
-                        "save_duration": save_end_time - save_start_time,
-                        "save_speed": save_speed,
-                        "save_bytes_total": save_bytes,
-                    },
-                )
+            ucmmetrics.update_stats(
+                {
+                    "save_requests_num": num_saved_request,
+                    "save_blocks_num": num_saved_block,
+                    "save_duration": save_end_time - save_start_time,
+                    "save_speed": save_speed,
+                    "save_bytes_total": save_bytes,
+                },
+            )
 
     def clear_connector_metadata(self) -> None:
         super().clear_connector_metadata()
@@ -776,10 +774,6 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         self.dump_total_ptrs: np.ndarray | None = None
         self.request_data: list[tuple[str, list, np.ndarray]] = []
         self._failure_req_ids: set[str] = set()
-        # End time of the previous wait_for_layer_load. Used to estimate
-        # the forward-pass duration between consecutive layer waits, which
-        # combined with layerwise_wait_blocking_ms tells us how well the
-        # load/forward overlap is working.
         self._layerwise_prev_wait_end: Optional[float] = None
         logger.info("Init UCMLayerWiseConnector.")
 
@@ -812,8 +806,6 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         self.request_data.clear()
         self._failure_req_ids.clear()
         self.need_load = False
-        # New batch: reset the inter-wait interval tracker so we don't
-        # measure an interval that spans two different batches.
         self._layerwise_prev_wait_end = None
 
         for request_id, request in metadata.request_meta.items():
@@ -834,17 +826,16 @@ class UCMLayerWiseConnector(UCMDirectConnector):
             first_submit_start = time.perf_counter()
             self._submit_request_load_tasks_for_layer(self.first_layer_id, 0, metadata)
             first_submit_end = time.perf_counter()
-            if self.metrics_config:
-                n_reqs = len(self.request_data) - len(self._failure_req_ids)
-                ucmmetrics.update_stats(
-                    {
-                        "layerwise_first_layer_submit_ms": (
-                            first_submit_end - first_submit_start
-                        )
-                        * 1000,
-                        "layerwise_first_layer_requests": float(n_reqs),
-                    }
-                )
+            n_reqs = len(self.request_data) - len(self._failure_req_ids)
+            ucmmetrics.update_stats(
+                {
+                    "layerwise_first_layer_submit_ms": (
+                        first_submit_end - first_submit_start
+                    )
+                    * 1000,
+                    "layerwise_first_layer_requests": float(n_reqs),
+                }
+            )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self._connector_metadata:
@@ -855,18 +846,6 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         current_layer_id = self.layer_name_to_id[layer_name]
 
         wait_start = time.perf_counter()
-        # Distance since the previous wait exited reflects forward + save_submit
-        # time; comparing it against wait_blocking tells us whether the
-        # pipeline is load-bound or forward-bound.
-        if self.metrics_config and self._layerwise_prev_wait_end is not None:
-            ucmmetrics.update_stats(
-                {
-                    "layerwise_inter_wait_interval_ms": (
-                        wait_start - self._layerwise_prev_wait_end
-                    )
-                    * 1000,
-                }
-            )
 
         # Pop before wait so MTP / rollback paths that revisit the same layer_name
         # do not call store.wait() again on already-completed handles.
@@ -884,41 +863,30 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 )
                 self._failure_req_ids.add(request_id)
 
-        wait_end = time.perf_counter()
-        self._layerwise_prev_wait_end = wait_end
-
-        if self.metrics_config:
-            blocking_ms = (wait_end - wait_start) * 1000
-            # Key metric: near 0 means overlap is perfect; large values mean
-            # loads are the bottleneck.
-            ucmmetrics.update_stats(
-                {
-                    "layerwise_wait_blocking_ms": blocking_ms,
-                    "layerwise_wait_tasks_count": float(n_tasks),
-                }
-            )
-            if n_tasks > 0 and blocking_ms > 1.0:
-                # Only count "meaningful" stalls to avoid noise from no-load
-                # layers and tiny scheduler jitter.
-                ucmmetrics.update_stats({"layerwise_stalled_layers_total": 1.0})
+        mid_tp = time.perf_counter()
 
         next_layer_id = current_layer_id + 1
-        if next_layer_id not in self.layer_ids:
-            return
-        next_local_row = next_layer_id - self.first_layer_id
-
-        submit_start = time.perf_counter()
-        self._submit_request_load_tasks_for_layer(
-            next_layer_id, next_local_row, metadata
-        )
-        submit_end = time.perf_counter()
-        if self.metrics_config:
-            ucmmetrics.update_stats(
-                {
-                    "layerwise_next_layer_submit_ms": (submit_end - submit_start)
-                    * 1000,
-                }
+        has_next = next_layer_id in self.layer_ids
+        if has_next:
+            next_local_row = next_layer_id - self.first_layer_id
+            self._submit_request_load_tasks_for_layer(
+                next_layer_id, next_local_row, metadata
             )
+
+        blocking_ms = (mid_tp - wait_start) * 1000
+        stats = {
+            "layerwise_wait_blocking_ms": blocking_ms,
+            "layerwise_wait_tasks_count": float(n_tasks),
+        }
+        if self._layerwise_prev_wait_end is not None:
+            stats["layerwise_inter_wait_interval_ms"] = (
+                wait_start - self._layerwise_prev_wait_end
+            ) * 1000
+        if has_next:
+            submit_end = time.perf_counter()
+            stats["layerwise_next_layer_submit_ms"] = (submit_end - mid_tp) * 1000
+        ucmmetrics.update_stats(stats)
+        self._layerwise_prev_wait_end = mid_tp
 
     def save_kv_layer(
         self,
@@ -965,8 +933,8 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 self.dump_tasks[layer_name] = task
             except Exception as e:
                 logger.error(f"submit dump task failed. {type(e).__name__}: {e}")
-        submit_end = time.perf_counter()
-        if self.metrics_config and self.is_save:
+        if self.is_save:
+            submit_end = time.perf_counter()
             ucmmetrics.update_stats(
                 {"layerwise_save_submit_ms": (submit_end - submit_start) * 1000}
             )
@@ -977,27 +945,15 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         total_start = time.perf_counter()
         try:
             for layer_name in self.kv_caches:
-                if layer_name in self.dump_tasks:
-                    per_layer_start = time.perf_counter()
-                    self.store.wait(self.dump_tasks[layer_name])
-                    per_layer_end = time.perf_counter()
-                    if self.metrics_config:
-                        ucmmetrics.update_stats(
-                            {
-                                "layerwise_save_per_layer_wait_ms": (
-                                    per_layer_end - per_layer_start
-                                )
-                                * 1000,
-                            }
-                        )
+                if layer_name not in self.dump_tasks:
+                    continue
+                self.store.wait(self.dump_tasks[layer_name])
         except Exception as e:
             logger.error(f"wait for dump kv cache failed. {type(e).__name__}: {e}")
         total_end = time.perf_counter()
-        if self.metrics_config:
-            # Unoverlappable tail at end of forward pass — pure overhead.
-            ucmmetrics.update_stats(
-                {"layerwise_save_tail_total_ms": (total_end - total_start) * 1000}
-            )
+        ucmmetrics.update_stats(
+            {"layerwise_save_tail_total_ms": (total_end - total_start) * 1000}
+        )
         self.dump_tasks.clear()
         self.is_save = False
         self.dump_total_ptrs = None

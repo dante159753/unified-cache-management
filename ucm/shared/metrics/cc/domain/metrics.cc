@@ -54,14 +54,15 @@ void Metrics::CreateStats(const std::string& name, const std::string& type)
 
 void Metrics::UpdateStats(const std::string& name, double value)
 {
+    if (!isInited_.load(std::memory_order_acquire)) { return; }
+    auto it = statsType_.find(name);
+    if (it == statsType_.end()) { return; }
+
     if (!isRegisteredThread_) {
         std::unique_lock<std::shared_mutex> lock(mutex_);
         buffers_.push_back({threadBuffer_});
         isRegisteredThread_ = true;
     }
-
-    auto it = statsType_.find(name);
-    if (it == statsType_.end()) { return; }
 
     int writeIdx_ = threadBuffer_->writeIdx_.load(std::memory_order_acquire);
     std::shared_lock<std::shared_mutex> lock(threadBuffer_->innerBufs_[writeIdx_].bufferMutex_);
@@ -82,7 +83,41 @@ void Metrics::UpdateStats(const std::string& name, double value)
 
 void Metrics::UpdateStats(const std::unordered_map<std::string, double>& values)
 {
-    for (const auto& pair : values) { UpdateStats(pair.first, pair.second); }
+    if (!isInited_.load(std::memory_order_acquire) || values.empty()) { return; }
+
+    bool hasKnownStats = false;
+    for (const auto& pair : values) {
+        if (statsType_.find(pair.first) != statsType_.end()) {
+            hasKnownStats = true;
+            break;
+        }
+    }
+    if (!hasKnownStats) { return; }
+
+    if (!isRegisteredThread_) {
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        buffers_.push_back({threadBuffer_});
+        isRegisteredThread_ = true;
+    }
+
+    int writeIdx_ = threadBuffer_->writeIdx_.load(std::memory_order_acquire);
+    std::shared_lock<std::shared_mutex> lock(threadBuffer_->innerBufs_[writeIdx_].bufferMutex_);
+    auto& writeBuf = threadBuffer_->GetWriteBuffer(writeIdx_);
+
+    for (const auto& pair : values) {
+        auto it = statsType_.find(pair.first);
+        if (it == statsType_.end()) { continue; }
+        switch (it->second) {
+            case MetricType::COUNTER: writeBuf.counterStats_[pair.first] += pair.second; break;
+            case MetricType::GAUGE: writeBuf.gaugeStats_[pair.first] = pair.second; break;
+            case MetricType::HISTOGRAM:
+                if (writeBuf.histogramStats_[pair.first].size() < maxVectorLen_) {
+                    writeBuf.histogramStats_[pair.first].push_back(pair.second);
+                }
+                break;
+            default: break;
+        }
+    }
 }
 
 std::tuple<std::unordered_map<std::string, double>, std::unordered_map<std::string, double>,

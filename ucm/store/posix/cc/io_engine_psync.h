@@ -55,11 +55,18 @@ protected:
         UC_DEBUG("Posix task({},{},{},{}) dispatching.", id, brief, num, size);
         w->SetEpilog([id, brief = std::move(brief), num, size, tp, isDump] {
             auto cost = NowTime::Now() - tp;
+            auto costMs = cost * 1e3;
+            auto bwGbps = cost > 0 ? static_cast<double>(size) / cost / 1e9 : 0.0;
             UC_DEBUG("Posix task({},{},{},{}) finished, cost {:.3f}ms.", id, brief, num, size,
-                     cost * 1e3);
+                     costMs);
             UC::Metrics::UpdateStats(
                 isDump ? "posix_dump_task_duration_ms" : "posix_load_task_duration_ms",
-                cost * 1e3);
+                costMs);
+            UC::Metrics::UpdateStats(
+                isDump ? "posix_h2s_bandwidth_gbps" : "posix_s2h_bandwidth_gbps", bwGbps);
+            UC::Metrics::UpdateStats(
+                isDump ? "posix_h2s_bytes_total" : "posix_s2h_bytes_total",
+                static_cast<double>(size));
         });
         queue_.Push(t, w);
     }

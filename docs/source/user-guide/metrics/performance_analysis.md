@@ -42,15 +42,14 @@ flowchart TD
     B["Cache waiting queue<br/><b>cache_load_queue_wait_duration_ms</b>"]
     C["DispatchOneTask: buffer alloc + submit miss<br/><b>cache_load_dispatch_duration_ms</b><br/>backend_submit_shards / shards = miss ratio"]
     D["Posix waiting queue<br/><b>posix_load_queue_wait_duration_ms</b>"]
-    E["Posix S2H worker — read disk<br/><b>posix_s2h_duration_ms</b><br/><b>posix_s2h_bandwidth_gbps</b>"]
-    F["WaitBackendTaskReady<br/><b>cache_load_backend_wait_duration_ms</b><br/>≈ posix wait + posix s2h"]
+    E["Posix S2H worker — read disk<br/><b>posix_load_task_duration_ms</b><br/><b>posix_s2h_bandwidth_gbps</b>"]
     G["H2D copy + stream sync<br/><b>cache_h2d_duration_ms</b>"]
     H(["epilog fires<br/><b>cache_load_duration_ms</b> (total)<br/><b>cache_load_bandwidth_gbps</b>"])
-    A --> B --> C --> D --> E --> F --> G --> H
+    A --> B --> C --> D --> E --> G --> H
     classDef posix fill:#fff4e6,stroke:#d97706
     classDef cache fill:#e6f4ff,stroke:#2563eb
     classDef done fill:#dcfce7,stroke:#16a34a
-    class B,C,F,G cache
+    class B,C,G cache
     class D,E posix
     class H done
 ```
@@ -66,10 +65,6 @@ flowchart LR
     class B,C,G cache
     class H done
 ```
-
-So `cache_load_backend_wait_duration_ms` near zero means
-either every load hit Cache, or the buffer happened to already be
-filled by a concurrent prefetch.
 
 ### 1.3 DUMP data flow
 
@@ -87,7 +82,7 @@ flowchart TD
     E["backend_->Dump submit (sync)<br/><b>cache_dump_backend_submit_duration_ms</b>"]
     H(["epilog fires — caller unblocks<br/><b>cache_dump_duration_ms</b> (caller-felt)<br/><b>cache_dump_bandwidth_gbps</b>"])
     F["BackendDumpStage thread (async)"]
-    G["Posix H2S worker — write disk<br/><b>posix_h2s_duration_ms</b><br/><b>posix_h2s_bandwidth_gbps</b>"]
+    G["Posix H2S worker — write disk<br/><b>posix_dump_task_duration_ms</b><br/><b>posix_h2s_bandwidth_gbps</b>"]
     A --> B --> C --> D --> E --> H
     E -. "enqueue (non-blocking)" .-> F --> G
     classDef cache fill:#e6f4ff,stroke:#2563eb
@@ -104,7 +99,7 @@ when the Cache buffer absorbs bursts and converge when the buffer
 saturates — see §3.4.
 
 The implication: **`cache_dump_duration_ms` is what the user
-felt; `posix_h2s_duration_ms` is what the disk did.** They
+felt; `posix_dump_task_duration_ms` is what the disk did.** They
 can diverge by orders of magnitude when the Cache buffer is large
 enough to absorb bursts. If they begin to track each other closely it
 means the Cache buffer is full and back-pressure has propagated up to
@@ -122,12 +117,12 @@ first one that's red usually points to the actual bottleneck.
 | 1 | `ucm:cache_lookup_hit_rate` (gauge) | Is the cache helping at all? |
 | 2 | `ucm:layerwise_wait_blocking_ms` (layerwise only) | Is the load/forward overlap working? |
 | 3 | `ucm:cache_load_duration_ms` (avg or p99) | How slow are loads end-to-end? |
-| 4 | `ucm:cache_load_backend_wait_duration_ms` | If load is slow: is it Posix's fault? |
+| 4 | `ucm:posix_load_task_duration_ms` | If load is slow: is it Posix's fault? |
 | 5a | `rate(ucm:posix_s2h_bytes_total[5m]) / 1e9` (aggregated) | If Posix is slow: is the disk actually saturated? |
-| 5b | `ucm:posix_s2h_bandwidth_gbps` (per shard) | If 5a is low: is each IO fast but the worker has gaps, or is each IO itself slow? |
+| 5b | `ucm:posix_s2h_bandwidth_gbps` (per task) | If 5a is low: is each IO fast but the worker has gaps, or is each IO itself slow? |
 | 6 | `ucm:posix_load_queue_wait_duration_ms` | Or is it queueing on the worker pool? |
 | 7 | `ucm:layerwise_save_tail_total_ms` | Is dump tail eating budget? |
-| 8 | `ucm:cache_dump_duration_ms` vs `ucm:posix_h2s_duration_ms` | Is the dump back-pressuring the caller? |
+| 8 | `ucm:cache_dump_duration_ms` vs `ucm:posix_dump_task_duration_ms` | Is the dump back-pressuring the caller? |
 
 The rest are secondary signals used to confirm a hypothesis.
 
@@ -154,8 +149,8 @@ Recompute load is high.
 1. Cache buffer is too small — blocks evicted before reuse.
 2. Workload diversity is too high — every prompt has unique prefixes.
 3. Dumps aren't reaching Posix in time, so subsequent loads can't find
-   the data — check `posix_dump_failures_total` and the gap
-   between `cache_dump_duration_ms` and `posix_h2s_duration_ms`.
+   the data — check error logs and the gap between
+   `cache_dump_duration_ms` and `posix_dump_task_duration_ms`.
 
 **Tunables.**
 - `cache_buffer_capacity_gb` ↑ (Cache config) — biggest win usually.
@@ -175,23 +170,22 @@ Decompose by reading these in parallel:
 |------------------|--------|------------|
 | `cache_load_queue_wait_duration_ms` | < 1 ms | Load queue is saturated; too many concurrent requests |
 | `cache_load_dispatch_duration_ms` | < 1 ms | Dispatch is rarely the bottleneck; if high, suspect lock contention |
-| `cache_load_backend_wait_duration_ms` | depends on hit rate | Cache misses going to Posix — see §3.3 |
+| `posix_load_task_duration_ms` | depends on hit rate | Cache misses going to Posix — see §3.3 |
 | `cache_h2d_duration_ms` | bounded by PCIe bw | Rare; suspect device-side contention or wrong stream affinity |
 
 **Tunables.**
 - Wait high → `waiting_queue_depth` ↑ or reduce concurrency.
-- Backend wait high → see §3.3.
+- Posix slow → see §3.3.
 - H2D high → check `cache_stream_number` and that pinned memory is
   actually pinned (compare H2D bandwidth to PCIe spec; pinned should
   hit > 20 GB/s on PCIe Gen4 x16).
 
 ### 3.3 Cache misses are slow because Posix is slow
 
-**Symptoms.** `cache_load_backend_wait_duration_ms` dominates the load
-chain.
+**Symptoms.** `posix_load_task_duration_ms` dominates the load chain.
 
 **Metric signature.**
-- `cache_load_backend_wait_duration_ms` > `cache_h2d_duration_ms`
+- `posix_load_task_duration_ms` > `cache_h2d_duration_ms`
 - `rate(ucm:posix_s2h_bytes_total[5m]) / 1e9` (aggregated actual GB/s)
   well below disk spec (e.g. < 1 GB/s on an NVMe rated for 3 GB/s)
 - AND/OR `posix_load_queue_wait_duration_ms` high (queue buildup)
@@ -200,19 +194,18 @@ chain.
 
 | If … | Then root cause | Fix |
 |------|-----------------|-----|
-| Aggregated BW low, per-shard BW also low | Per-IO latency is bad — small IOs, no `O_DIRECT`, slow filesystem | Try `io_direct: true`, larger `tensor_size` / `shard_size` |
-| Aggregated BW low, per-shard BW high, wait low | IO is fast per call but workers are mostly idle — upstream is not feeding them | Re-check §3.2 components; usually Cache D2H / H2D is the actual bottleneck |
-| Aggregated BW low, per-shard BW high, wait high | Workers can't drain fast enough (queue saturated, parallel IOs not enough) | `posix_data_trans_concurrency` ↑ |
+| Aggregated BW low, per-task BW also low | Individual Posix tasks are slow — small IOs, no `O_DIRECT`, slow filesystem | Try `io_direct: true`, larger `tensor_size` / `shard_size` |
+| Aggregated BW low, per-task BW high, wait low | Tasks are fast but workers are mostly idle — upstream is not feeding them | Re-check §3.2 components; usually Cache D2H / H2D is the actual bottleneck |
+| Aggregated BW low, per-task BW high, wait high | Workers can't drain fast enough (queue saturated, parallel IOs not enough) | `posix_data_trans_concurrency` ↑ |
 | Aggregated BW near disk spec, wait high | Burst arrival exceeds steady disk throughput | Add Cache capacity to absorb bursts; throttle inbound rate |
 | Aggregated BW near disk spec, wait low | Posix is fine; the issue is upstream | Re-check §3.2 components |
 
-> **What's the difference between (per shard) and (aggregated)?**
+> **What's the difference between (per task) and (aggregated)?**
 >
-> - **(per shard)** = `posix_*_bandwidth_gbps` histogram. Each sample is
->   the throughput of one shard IO call (bytes / wall_time_of_that_call /
->   1e9). Reflects **single-IO response speed** and **long-tail latency**.
->   Multi-thread parallelism does **not** aggregate — 8 threads each at
->   1 GB/s still show as 1 GB/s, not 8.
+> - **(per task)** = `posix_*_bandwidth_gbps` histogram. Each sample is
+>   one Posix task's throughput (`total_bytes_in_task / task_wall_time /
+>   1e9`). It is useful for task-level latency/throughput tails, but it
+>   does not aggregate concurrent tasks.
 > - **(aggregated)** = `rate(posix_*_bytes_total[interval]) / 1e9`.
 >   Reflects **actual GB/s the service is pushing through posix**.
 >   Multi-thread IO aggregates naturally; idle gaps between IOs are
@@ -221,7 +214,7 @@ chain.
 >
 > Diagnostic mapping:
 > - "Is the disk saturated / where is the bottleneck?" → **(aggregated)**
-> - "Are there slow individual IOs / a long tail?" → **(per shard)** p99 / distribution
+> - "Are there slow Posix tasks / a long tail?" → **(per task)** p99 / distribution
 
 The same dichotomy applies to the **Cache** stage bandwidth panels,
 with the per-event grain being a task instead of a single IO:
@@ -271,7 +264,7 @@ expected.
 
 **Metric signature.** Two conditions together:
 - `ucm:cache_dump_duration_ms` (caller-felt) starts climbing
-  toward `ucm:posix_h2s_duration_ms` (disk-felt). When the
+  toward `ucm:posix_dump_task_duration_ms` (disk-felt). When the
   Cache buffer is healthy these diverge sharply; when the buffer is
   saturated they converge.
 - `ucm:posix_h2s_bandwidth_gbps` ≪ Cache dump rate
@@ -302,17 +295,13 @@ between waits:
 | ≈ `cache_load_duration_ms` | small | **Pipeline degenerated to serial.** Forward is too fast to hide load. Likely you're decode-bound (one token per layer is fast, loads can't keep up) or Cache miss rate just spiked. |
 | Large, growing | Stable | Backlog forming — submission is faster than completion. Check `next_layer_submit_ms` (should be < 1 ms; if not, store.load_data itself is slow). |
 
-**`stalled_layers_total` rate** is a coarser version of the same
-signal — easy to alert on. If you see a non-zero rate sustained, dig
-into `wait_blocking_ms` distribution.
-
 ### 3.6 Layerwise mode: TTFT regression
 
 **Symptoms.** First token is slower with layerwise than without.
 
 **Metric signature.**
 - `layerwise_first_layer_submit_ms` is high (rare; usually fast)
-- OR `cache_load_backend_wait_duration_ms` is high during
+- OR `posix_load_task_duration_ms` is high during
   the first batch (cold cache, first-layer load goes all the way to
   disk before forward can start)
 
@@ -335,9 +324,6 @@ can't account for. Throughput just below expected.
 
 **Metric signature.**
 - `layerwise_save_tail_total_ms` consistently > 0 (e.g. 5-50 ms)
-- `layerwise_save_per_layer_wait_ms` skewed: most layers near 0,
-  last few non-zero — i.e. dump is keeping up until the end, then
-  the last few layer-dumps haven't finished
 
 **Why.** Saves are submitted layer-by-layer during forward, but
 `wait_for_save` at the end blocks for **all** of them. The tail is
@@ -445,7 +431,7 @@ histogram_quantile(0.99, sum by (le) (
   rate(ucm:cache_load_queue_wait_duration_ms_bucket{model_name="$model_name"}[5m])))
 
 histogram_quantile(0.99, sum by (le) (
-  rate(ucm:cache_load_backend_wait_duration_ms_bucket{model_name="$model_name"}[5m])))
+  rate(ucm:posix_load_task_duration_ms_bucket{model_name="$model_name"}[5m])))
 
 histogram_quantile(0.99, sum by (le) (
   rate(ucm:cache_h2d_duration_ms_bucket{model_name="$model_name"}[5m])))
@@ -478,9 +464,9 @@ rate(ucm:cache_dump_duration_ms_count{model_name="$model_name"}[5m])
 vs.
 
 ```
-rate(ucm:posix_h2s_duration_ms_sum{model_name="$model_name"}[5m])
+rate(ucm:posix_dump_task_duration_ms_sum{model_name="$model_name"}[5m])
 /
-rate(ucm:posix_h2s_duration_ms_count{model_name="$model_name"}[5m])
+rate(ucm:posix_dump_task_duration_ms_count{model_name="$model_name"}[5m])
 ```
 
 The first should be much smaller than the second. When they converge,
@@ -491,9 +477,9 @@ back-pressure has reached the caller (see §3.4).
 ```
 # average wait + IO per IO unit
 (rate(ucm:posix_load_queue_wait_duration_ms_sum{model_name="$model_name"}[5m])
- + rate(ucm:posix_s2h_duration_ms_sum{model_name="$model_name"}[5m]))
+ + rate(ucm:posix_load_task_duration_ms_sum{model_name="$model_name"}[5m]))
 /
-rate(ucm:posix_s2h_duration_ms_count{model_name="$model_name"}[5m])
+rate(ucm:posix_load_task_duration_ms_count{model_name="$model_name"}[5m])
 ```
 
 If wait dominates IO, increase `posix_data_trans_concurrency`.
