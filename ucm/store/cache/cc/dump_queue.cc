@@ -44,6 +44,7 @@ Status DumpQueue::Setup(const Config& config, TaskIdSet* failureSet, TransBuffer
     tensorSizes_ = config.tensorSizes;
     streamNumber_ = config.streamNumber;
     dumpD2hPipelineDepth_ = config.dumpD2hPipelineDepth;
+    useGdr_ = config.useGdr;
     cpuAffinityCores_ = config.cpuAffinityCores;
     waiting_.Setup(config.waitingQueueDepth);
     syncing_.Setup(config.runningQueueDepth);
@@ -51,7 +52,7 @@ Status DumpQueue::Setup(const Config& config, TaskIdSet* failureSet, TransBuffer
     freeD2hPipelineTokens_.Setup(dumpD2hPipelineDepth_ + 1);
     for (size_t i = 0; i < dumpD2hPipelineDepth_; ++i) {
         CopyStream stream;
-        auto s = stream.Setup(deviceId_, streamNumber_);
+        auto s = stream.Setup(deviceId_, streamNumber_, useGdr_);
         if (s.Failure()) [[unlikely]] { return s; }
         freeD2hPipelineTokens_.Push(std::move(stream));
     }

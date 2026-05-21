@@ -66,6 +66,7 @@ private:
     std::vector<size_t> tensorSizes_{};
     size_t streamNumber_{1};
     size_t dumpD2hPipelineDepth_{1};
+    bool useGdr_{false};
     std::vector<ssize_t> cpuAffinityCores_{};
     SpscRingQueue<TaskPair> waiting_;
     SpscRingQueue<D2hSyncCtx> syncing_;
