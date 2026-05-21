@@ -23,6 +23,7 @@
  * */
 #include "dump_queue.h"
 #include "logger/logger.h"
+#include "metrics_api.h"
 #include "thread/cpu_affinity.h"
 
 namespace UC::CacheStore {
@@ -87,6 +88,7 @@ void DumpQueue::DispatchOneTask(TaskPair&& pair)
     auto& waiter = pair.second;
     auto wait = NowTime::Now() - waiter->startTp;
     UC_DEBUG("Cache task({}) start running, wait {:.3f}ms.", task->id, wait * 1e3);
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dump_queue_wait_duration_ms"), wait * 1e3);
     if (failureSet_->Contains(task->id)) {
         waiter->Done();
         return;
@@ -147,6 +149,10 @@ Status DumpQueue::SubmitD2H(CopyStream& stream, TaskPtr task, WaiterPtr waiter,
         submitted.bufferHandles.push_back(std::move(handle));
     }
     submitted.d2hSubmittedTp = NowTime::Now();
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dump_shards_total"),
+                             static_cast<double>(nShard));
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dump_backend_shards_total"),
+                             static_cast<double>(submitted.backendTaskDesc.size()));
     return Status::OK();
 }
 
@@ -195,6 +201,12 @@ Status DumpQueue::SyncAndDumpOneTask(D2hSyncCtx&& ctx)
              (ctx.d2hSubmittedTp - ctx.startTp) * 1e3,
              (tpSyncStream - ctx.d2hSubmittedTp) * 1e3,
              (tpEnd - tpSyncStream) * 1e3);
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dump_mkbuf_duration_ms"),
+                             (ctx.d2hSubmittedTp - ctx.startTp) * 1e3);
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_d2h_duration_ms"),
+                             (tpSyncStream - ctx.d2hSubmittedTp) * 1e3);
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dump_backend_submit_duration_ms"),
+                             (tpEnd - tpSyncStream) * 1e3);
     return Status::OK();
 }
 
