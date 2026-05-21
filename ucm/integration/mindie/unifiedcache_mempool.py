@@ -137,6 +137,7 @@ class PipelineStoreConfig(BaseModel):
 
     cache_buffer_capacity_gb: Optional[int] = None
     cache_stream_number: Optional[int] = None
+    cache_dump_d2h_pipeline_depth: Optional[int] = None
     share_buffer_enable: bool = False
     waiting_queue_depth: Optional[int] = None
     running_queue_depth: Optional[int] = None

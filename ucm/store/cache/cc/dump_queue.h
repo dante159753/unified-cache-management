@@ -24,7 +24,7 @@
 #ifndef UNIFIEDCACHE_CACHE_STORE_CC_DUMP_QUEUE_H
 #define UNIFIEDCACHE_CACHE_STORE_CC_DUMP_QUEUE_H
 
-#include <future>
+#include <atomic>
 #include <thread>
 #include "copy_stream.h"
 #include "template/hashset.h"
@@ -41,25 +41,38 @@ class DumpQueue {
     using WaiterPtr = std::shared_ptr<Latch>;
     using TaskPair = std::pair<TaskPtr, WaiterPtr>;
     using TaskIdSet = HashSet<Detail::TaskHandle>;
-    struct DumpCtx {
+    struct BackendWaitCtx {
         Detail::TaskHandle taskHandle;
         Detail::TaskHandle backendTaskHandle;
         std::vector<TransBuffer::Handle> bufferHandles;
     };
+    struct D2hSyncCtx {
+        Detail::TaskHandle taskHandle{0};
+        Detail::TaskDesc backendTaskDesc;
+        std::vector<TransBuffer::Handle> bufferHandles;
+        WaiterPtr waiter;
+        CopyStream stream;
+        Status status{Status::OK()};
+        double startTp{0};
+        double d2hSubmittedTp{0};
+    };
 
 private:
     alignas(64) std::atomic_bool stop_{false};
-    Detail::TaskHandle finishedBackendTaskHandle_{0};
     TaskIdSet* failureSet_{nullptr};
     TransBuffer* buffer_{nullptr};
     StoreV1* backend_{nullptr};
     int32_t deviceId_{-1};
     std::vector<size_t> tensorSizes_{};
     size_t streamNumber_{1};
+    size_t dumpD2hPipelineDepth_{1};
     std::vector<ssize_t> cpuAffinityCores_{};
     SpscRingQueue<TaskPair> waiting_;
-    SpscRingQueue<DumpCtx> dumping_;
+    SpscRingQueue<D2hSyncCtx> syncing_;
+    SpscRingQueue<BackendWaitCtx> dumping_;
+    SpscRingQueue<CopyStream> freeD2hPipelineTokens_;
     std::thread dispatcher_;
+    std::thread syncer_;
     std::thread dumper_;
 
 public:
@@ -68,9 +81,13 @@ public:
     void Submit(TaskPtr task, WaiterPtr waiter);
 
 private:
-    void DispatchStage(std::promise<Status>& started);
-    void DispatchOneTask(CopyStream& stream, TaskPair&& pair);
-    Status DumpOneTask(CopyStream& stream, TaskPtr task);
+    void DispatchStage();
+    void DispatchOneTask(TaskPair&& pair);
+    bool AcquireD2hPipelineToken(CopyStream& stream);
+    Status SubmitD2H(CopyStream& stream, TaskPtr task, WaiterPtr waiter, D2hSyncCtx& submitted);
+    void SyncStage();
+    void SyncOneTask(D2hSyncCtx&& ctx);
+    Status SyncAndDumpOneTask(D2hSyncCtx&& ctx);
     Status DeviceToHostGatherAsync(std::shared_ptr<Trans::Stream> stream, void** device,
                                    void* host);
     void BackendDumpStage();

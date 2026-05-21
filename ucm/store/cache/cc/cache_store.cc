@@ -129,6 +129,7 @@ private:
         config.GetNumber("running_queue_depth", param.runningQueueDepth);
         config.GetNumber("timeout_ms", param.timeoutMs);
         config.GetNumber("cache_stream_number", param.streamNumber);
+        config.GetNumber("cache_dump_d2h_pipeline_depth", param.dumpD2hPipelineDepth);
         config.GetNumber("cache_load_exclusive_buffer_number", param.loadExclusiveBufferNumber);
         return param;
     }
@@ -173,6 +174,10 @@ private:
         if (config.streamNumber < 1 || config.streamNumber > 32) {
             return Status::InvalidParam("invalid stream number({})", config.streamNumber);
         }
+        if (config.dumpD2hPipelineDepth < 1 || config.dumpD2hPipelineDepth > 128) {
+            return Status::InvalidParam("invalid dump D2H pipeline depth({})",
+                                        config.dumpD2hPipelineDepth);
+        }
         return Status::OK();
     }
     void ShowConfig(const Config& config)
@@ -203,6 +208,7 @@ private:
         UC_INFO("Set {}::RunningQueueDepth to {}.", ns, config.runningQueueDepth);
         UC_INFO("Set {}::TimeoutMs to {}.", ns, config.timeoutMs);
         UC_INFO("Set {}::StreamNumber to {}.", ns, config.streamNumber);
+        UC_INFO("Set {}::DumpD2hPipelineDepth to {}.", ns, config.dumpD2hPipelineDepth);
         UC_INFO("Set {}::LoadExclusiveBufferNumber to {}.", ns, config.loadExclusiveBufferNumber);
     }
 };
