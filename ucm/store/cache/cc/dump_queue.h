@@ -25,6 +25,7 @@
 #define UNIFIEDCACHE_CACHE_STORE_CC_DUMP_QUEUE_H
 
 #include <atomic>
+#include <future>
 #include <thread>
 #include "copy_stream.h"
 #include "template/hashset.h"
@@ -82,11 +83,11 @@ public:
     void Submit(TaskPtr task, WaiterPtr waiter);
 
 private:
-    void DispatchStage();
+    void DispatchStage(std::promise<Status>& started);
     void DispatchOneTask(TaskPair&& pair);
     bool AcquireD2hPipelineToken(CopyStream& stream);
     Status SubmitD2H(CopyStream& stream, TaskPtr task, WaiterPtr waiter, D2hSyncCtx& submitted);
-    void SyncStage();
+    void SyncStage(std::promise<Status>& started);
     void SyncOneTask(D2hSyncCtx&& ctx);
     Status SyncAndDumpOneTask(D2hSyncCtx&& ctx);
     Status DeviceToHostGatherAsync(std::shared_ptr<Trans::Stream> stream, void** device,

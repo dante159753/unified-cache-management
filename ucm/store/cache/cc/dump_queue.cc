@@ -51,15 +51,17 @@ Status DumpQueue::Setup(const Config& config, TaskIdSet* failureSet, TransBuffer
     syncing_.Setup(config.runningQueueDepth);
     dumping_.Setup(config.runningQueueDepth);
     freeD2hPipelineTokens_.Setup(dumpD2hPipelineDepth_ + 1);
-    for (size_t i = 0; i < dumpD2hPipelineDepth_; ++i) {
-        CopyStream stream;
-        auto s = stream.Setup(deviceId_, streamNumber_, useGdr_);
-        if (s.Failure()) [[unlikely]] { return s; }
-        freeD2hPipelineTokens_.Push(std::move(stream));
-    }
+    std::promise<Status> dispatchStarted;
+    auto dispatchFut = dispatchStarted.get_future();
+    dispatcher_ = std::thread{&DumpQueue::DispatchStage, this, std::ref(dispatchStarted)};
+    auto s = dispatchFut.get();
+    if (s.Failure()) [[unlikely]] { return s; }
+    std::promise<Status> syncStarted;
+    auto syncFut = syncStarted.get_future();
+    syncer_ = std::thread{&DumpQueue::SyncStage, this, std::ref(syncStarted)};
+    s = syncFut.get();
+    if (s.Failure()) [[unlikely]] { return s; }
     dumper_ = std::thread{&DumpQueue::BackendDumpStage, this};
-    dispatcher_ = std::thread{&DumpQueue::DispatchStage, this};
-    syncer_ = std::thread{&DumpQueue::SyncStage, this};
     return Status::OK();
 }
 
@@ -73,8 +75,18 @@ void DumpQueue::Submit(TaskPtr task, WaiterPtr waiter)
     waiter->Done();
 }
 
-void DumpQueue::DispatchStage()
+void DumpQueue::DispatchStage(std::promise<Status>& started)
 {
+    for (size_t i = 0; i < dumpD2hPipelineDepth_; ++i) {
+        CopyStream stream;
+        auto s = stream.Setup(deviceId_, streamNumber_, useGdr_);
+        if (s.Failure()) [[unlikely]] {
+            started.set_value(s);
+            return;
+        }
+        freeD2hPipelineTokens_.Push(std::move(stream));
+    }
+    started.set_value(Status::OK());
     if (!cpuAffinityCores_.empty()) {
         auto s = CpuAffinity::SetCpuAffinity4CurrentThread(cpuAffinityCores_);
         if (s.Failure()) { UC_WARN("Failed({}) to set affinity.", s); }
@@ -156,10 +168,14 @@ Status DumpQueue::SubmitD2H(CopyStream& stream, TaskPtr task, WaiterPtr waiter,
     return Status::OK();
 }
 
-void DumpQueue::SyncStage()
+void DumpQueue::SyncStage(std::promise<Status>& started)
 {
+    Trans::Device device;
+    auto s = device.Setup(deviceId_);
+    started.set_value(s);
+    if (s.Failure()) [[unlikely]] { return; }
     if (!cpuAffinityCores_.empty()) {
-        auto s = CpuAffinity::SetCpuAffinity4CurrentThread(cpuAffinityCores_);
+        s = CpuAffinity::SetCpuAffinity4CurrentThread(cpuAffinityCores_);
         if (s.Failure()) { UC_WARN("Failed({}) to set affinity.", s); }
     }
     syncing_.ConsumerLoop(stop_, &DumpQueue::SyncOneTask, this);
