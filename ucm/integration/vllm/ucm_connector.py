@@ -1,5 +1,6 @@
 import copy
 import hashlib
+import logging
 import math
 import os
 import pickle
@@ -50,6 +51,7 @@ if TYPE_CHECKING:
 from ucm.sparse.state import has_ucm_sparse
 
 logger = init_logger(__name__)
+trace_logger = logging.getLogger("ucm.trace")
 
 
 def _short_list(values: list[int], limit: int = 12) -> list[int]:
@@ -529,11 +531,13 @@ class UCMDirectConnector(KVConnectorBase_V1):
             and len(ucm_block_ids) > 0
         ):
             hex_ucm_block_ids = [id.hex() for id in ucm_block_ids]
-            logger.info_once(
-                f"timestamp: {time.perf_counter()}, "
-                f"input_length: {request.num_tokens}, "
-                f"output_length: {request.max_tokens}, "
-                f"ucm_block_ids: {hex_ucm_block_ids}"
+            trace_logger.info(
+                "timestamp: %s, input_length: %s, output_length: %s, "
+                "ucm_block_ids: %s",
+                time.perf_counter(),
+                request.num_tokens,
+                request.max_tokens,
+                hex_ucm_block_ids,
             )
 
         # Skip persistence if token count is below the threshold
@@ -2160,11 +2164,13 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
             and len(primary_block_ids) > 0
         ):
             hex_block_ids = [b.hex() for b in primary_block_ids]
-            logger.info_once(
-                f"timestamp: {time.perf_counter()}, "
-                f"input_length: {request.num_tokens}, "
-                f"output_length: {request.max_tokens}, "
-                f"ucm_block_ids: {hex_block_ids}"
+            trace_logger.info(
+                "timestamp: %s, input_length: %s, output_length: %s, "
+                "ucm_block_ids: %s",
+                time.perf_counter(),
+                request.num_tokens,
+                request.max_tokens,
+                hex_block_ids,
             )
 
         total_hit_block_num = hbm_hit_block_num + external_hit_lcm_blocks

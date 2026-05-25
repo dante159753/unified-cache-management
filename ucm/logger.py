@@ -22,162 +22,54 @@
 # SOFTWARE.
 #
 
-"""
-UCM Logger Module
-
-Environment Variables for Rate Limiting:
-    UCM_LOG_RATE_LIMIT_ENABLE: Enable/disable rate limiting (default: true)
-                               Values: true/false/0/1/off/on
-    UCM_LOG_RATE_LIMIT_WINDOW_MS: Time window in milliseconds (default: 60000 = 60s)
-    UCM_LOG_RATE_LIMIT_MAX_LOGS: Max logs per window (default: 3, max: 3)
-
-Usage:
-    logger = init_logger()
-    
-    # Rate-limited logging (60s window, max 3 logs per location)
-    logger.info_limit("Processing request %s", req_id)
-    
-    # One-time logging (cached by lru_cache)
-    logger.info_once("Cache hit rate: %.2f", rate)
-"""
-
-import atexit
-import collections
-import inspect
-import io
-import logging
-import os
-import sys
-import traceback
 from collections.abc import Hashable
-from functools import lru_cache
-
-from ucm.shared.infra import ucmlogger
-
-LevelMap = {
-    logging.DEBUG: ucmlogger.Level.DEBUG,
-    logging.INFO: ucmlogger.Level.INFO,
-    logging.WARNING: ucmlogger.Level.WARNING,
-    logging.ERROR: ucmlogger.Level.ERROR,
-    logging.CRITICAL: ucmlogger.Level.CRITICAL,
-}
 
 
-def add_log_methods(cls):
-    LOG_LEVELS = {
-        "info": logging.INFO,
-        "debug": logging.DEBUG,
-        "warning": logging.WARNING,
-        "error": logging.ERROR,
-        "critical": logging.CRITICAL,
-    }
-
-    def _create_log_method(level):
-        def log_method(self, message: str, *args, **kwargs):
-            self.log(level, message, *args, **kwargs)
-
-        return log_method
-
-    for method_name, level in LOG_LEVELS.items():
-        setattr(cls, method_name, _create_log_method(level))
-    return cls
-
-
-@add_log_methods
-class Logger(logging.Logger):
+class Logger:
     def __init__(self, name: str = "UC"):
         self.name = name
-        log_path, log_max_files, log_max_size = self._get_log_config()
-        ucmlogger.setup(log_path, log_max_files, log_max_size)
-        atexit.register(ucmlogger.flush)
 
     def isEnabledFor(self, levelno: int) -> bool:
-        return ucmlogger.isEnabledFor(LevelMap[levelno])
-
-    @staticmethod
-    def _get_log_config():
-        """Get log configuration from environment variables or CLI arguments."""
-        log_path = os.getenv("UCM_LOG_PATH", "log")
-        try:
-            log_max_files = int(os.getenv("UCM_LOG_MAX_FILES", "10"))
-        except (ValueError, TypeError):
-            log_max_files = 10
-        try:
-            log_max_size = int(os.getenv("UCM_LOG_MAX_SIZE", "5"))
-        except (ValueError, TypeError):
-            log_max_size = 5
-        return log_path, log_max_files, log_max_size
-
-    @staticmethod
-    def format_log_msg(msg, *args) -> str:
-
-        if not isinstance(msg, str):
-            msg = str(msg)
-
-        if args:
-            if (
-                len(args) == 1
-                and args[0]
-                and isinstance(args[0], collections.abc.Mapping)
-            ):
-                args = args[0]
-            return msg % args
-        return msg
+        return False
 
     def log(self, levelno, message, *args, exc_info=None, scope=None, rate_limit=False):
-        level = LevelMap[levelno]
-        frame = inspect.currentframe()
-        caller_frame = frame.f_back.f_back
-        file = os.path.basename(caller_frame.f_code.co_filename)
-        line = caller_frame.f_lineno
-        func = caller_frame.f_code.co_name
-        msg = self.format_log_msg(message, *args)
-        if exc_info:
-            exc_text = self.format_exception(exc_info)
-            msg = msg + "\n" + exc_text
-        if rate_limit:
-            ucmlogger.log_rate_limit(level, file, func, line, msg)
-            return
-        ucmlogger.log(level, file, func, line, msg)
+        return None
 
-    @staticmethod
-    def format_exception(e):
-        if isinstance(e, BaseException):
-            e = (type(e), e, e.__traceback__)
-        elif not isinstance(e, tuple):
-            e = sys.exc_info()
-        sio = io.StringIO()
-        tb = e[2]
-        traceback.print_exception(e[0], e[1], tb, None, sio)
-        s = sio.getvalue()
-        sio.close()
-        if s[-1:] == "\n":
-            s = s[:-1]
-        return s
+    def debug(self, message: str, *args, **kwargs):
+        return None
 
-    @lru_cache
-    def info_once(self, message: str, *args: Hashable, **kwargs: Hashable):
-        self.log(logging.INFO, message, *args, **kwargs)
+    def info(self, message: str, *args, **kwargs):
+        return None
 
-    @lru_cache
-    def warning_once(self, message: str, *args: Hashable, **kwargs: Hashable):
-        self.log(logging.WARNING, message, *args, **kwargs)
+    def warning(self, message: str, *args, **kwargs):
+        return None
 
-    @lru_cache
-    def debug_once(self, message: str, *args: Hashable, **kwargs: Hashable):
-        self.log(logging.DEBUG, message, *args, **kwargs)
+    def error(self, message: str, *args, **kwargs):
+        return None
+
+    def critical(self, message: str, *args, **kwargs):
+        return None
 
     def exception(self, message: str, *args: Hashable, **kwargs: Hashable):
-        self.log(logging.ERROR, message, *args, **kwargs, exc_info=True)
+        return None
+
+    def info_once(self, message: str, *args: Hashable, **kwargs: Hashable):
+        return None
+
+    def warning_once(self, message: str, *args: Hashable, **kwargs: Hashable):
+        return None
+
+    def debug_once(self, message: str, *args: Hashable, **kwargs: Hashable):
+        return None
 
     def info_limit(self, message: str, *args, **kwargs):
-        self.log(logging.INFO, message, *args, **kwargs, rate_limit=True)
+        return None
 
     def warning_limit(self, message: str, *args, **kwargs):
-        self.log(logging.WARNING, message, *args, **kwargs, rate_limit=True)
+        return None
 
     def debug_limit(self, message: str, *args, **kwargs):
-        self.log(logging.DEBUG, message, *args, **kwargs, rate_limit=True)
+        return None
 
 
 def init_logger(name: str = "UC") -> Logger:

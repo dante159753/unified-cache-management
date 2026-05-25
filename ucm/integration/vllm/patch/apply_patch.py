@@ -110,8 +110,6 @@ def apply_all_patches() -> None:
     """Apply all vLLM patches based on detected version."""
     version: Optional[str] = None
     try:
-        from ucm.integration.vllm.patch.logger_patch import patch_logger
-
         if not ENABLE_UCM_PATCH:
             return
 
