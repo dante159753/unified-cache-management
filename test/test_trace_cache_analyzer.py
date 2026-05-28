@@ -204,6 +204,63 @@ class TraceCacheAnalyzerTest(unittest.TestCase):
             self.assertEqual(data["config"]["num_nodes"], 2)
             self.assertEqual(data["config"]["random_seed"], 1)
 
+    def test_cli_uses_block_bytes_without_model_params(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            trace = tmp_path / "trace.jsonl"
+            output = tmp_path / "result.json"
+            trace.write_text(
+                json.dumps(
+                    {
+                        "timestamp": 1.0,
+                        "input_length": 512,
+                        "output_length": 1,
+                        "hash_ids": ["a", "b"],
+                    }
+                )
+                + "\n"
+                + json.dumps(
+                    {
+                        "timestamp": 2.0,
+                        "input_length": 512,
+                        "output_length": 1,
+                        "hash_ids": ["a", "b"],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--trace-path",
+                    str(trace),
+                    "--block-bytes",
+                    "4",
+                    "--gpu-kv-cache-gb",
+                    "0.00000001",
+                    "--ucm-memory-cache-gb",
+                    "0.00000001",
+                    "--ucm-filesystem-cache-gb",
+                    "0.00000001",
+                    "--output",
+                    str(output),
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            data = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(data["block_bytes"], 4)
+            self.assertEqual(data["config"]["block_bytes_source"], "override")
+            self.assertEqual(data["config"]["attention_type"], None)
+            self.assertEqual(data["layers"]["gpu"]["capacity_blocks"], 2)
+            self.assertEqual(data["totals"]["gpu_hit_blocks"], 2)
+
     def test_cli_infers_gqa_model_config_from_model_path(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)

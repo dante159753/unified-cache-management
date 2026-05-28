@@ -201,6 +201,17 @@ def calculate_block_bytes(
     raise ValueError(f"Unsupported attention type: {attention_type}")
 
 
+def empty_model_params(args: argparse.Namespace) -> dict:
+    return {
+        "attention_type": args.attention_type,
+        "num_layers": args.num_layers,
+        "num_kv_heads": args.num_kv_heads,
+        "head_dim": args.head_dim,
+        "kv_lora_rank": args.kv_lora_rank,
+        "qk_rope_head_dim": args.qk_rope_head_dim,
+    }
+
+
 def capacity_gb_to_blocks(capacity_gb: float, block_bytes: int) -> int:
     if capacity_gb <= 0:
         return 0
@@ -438,6 +449,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--tp", type=int, default=1)
     parser.add_argument("--trace-block-size", type=int, default=512)
+    parser.add_argument("--block-bytes", type=int)
     parser.add_argument("--gpu-kv-cache-gb", type=float, required=True)
     parser.add_argument("--ucm-memory-cache-gb", type=float, required=True)
     parser.add_argument("--ucm-filesystem-cache-gb", type=float, required=True)
@@ -449,18 +461,26 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_analysis(args: argparse.Namespace) -> dict:
-    model_params = resolve_model_params(args)
-    block_bytes = calculate_block_bytes(
-        attention_type=model_params["attention_type"],
-        num_layers=model_params["num_layers"],
-        trace_block_size=args.trace_block_size,
-        kv_cache_dtype=args.kv_cache_dtype,
-        tp=args.tp,
-        num_kv_heads=model_params["num_kv_heads"],
-        head_dim=model_params["head_dim"],
-        kv_lora_rank=model_params["kv_lora_rank"],
-        qk_rope_head_dim=model_params["qk_rope_head_dim"],
-    )
+    if args.block_bytes is not None:
+        if args.block_bytes <= 0:
+            raise ValueError("--block-bytes must be greater than 0")
+        model_params = empty_model_params(args)
+        block_bytes = args.block_bytes
+        block_bytes_source = "override"
+    else:
+        model_params = resolve_model_params(args)
+        block_bytes = calculate_block_bytes(
+            attention_type=model_params["attention_type"],
+            num_layers=model_params["num_layers"],
+            trace_block_size=args.trace_block_size,
+            kv_cache_dtype=args.kv_cache_dtype,
+            tp=args.tp,
+            num_kv_heads=model_params["num_kv_heads"],
+            head_dim=model_params["head_dim"],
+            kv_lora_rank=model_params["kv_lora_rank"],
+            qk_rope_head_dim=model_params["qk_rope_head_dim"],
+        )
+        block_bytes_source = "estimated"
     configured_gb = {
         "gpu": args.gpu_kv_cache_gb,
         "memory": args.ucm_memory_cache_gb,
@@ -484,6 +504,8 @@ def build_analysis(args: argparse.Namespace) -> dict:
     result["config"] = {
         "model_path": str(args.model_path) if args.model_path is not None else None,
         **model_params,
+        "block_bytes_override": args.block_bytes,
+        "block_bytes_source": block_bytes_source,
         "kv_cache_dtype": args.kv_cache_dtype,
         "tp": args.tp,
         "trace_block_size": args.trace_block_size,
