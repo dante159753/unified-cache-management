@@ -46,6 +46,7 @@ struct Config {
     size_t runningQueueDepth{524288};
     size_t timeoutMs{30000};
     size_t streamNumber{4};
+    size_t dumpD2hPipelineDepth{2};
     bool cacheLoadBackendOnly{false};
     std::vector<uintptr_t> gpuKvBufferAddrs{};
     std::vector<size_t> gpuKvBufferSizes{};

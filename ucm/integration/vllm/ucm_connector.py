@@ -487,6 +487,9 @@ class UCMDirectConnector(KVConnectorBase_V1):
         self.block_data_size = self.kv_cache_layout.block_size
         self.layer_name_to_id = self.kv_cache_layout.layer_name_to_id
         self.layer_ids = sorted(set(self.layer_name_to_id.values()))
+        self.layer_id_to_local_row = {
+            layer_id: local_row for local_row, layer_id in enumerate(self.layer_ids)
+        }
         self.first_layer_id = self.layer_ids[0]
 
         self.device = create_device()
@@ -924,7 +927,47 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         self._failure_req_ids: set[str] = set()
         self._layerwise_prev_wait_end: Optional[float] = None
         self._layerwise_batch_start: Optional[float] = None
-        logger.info("Init UCMLayerWiseConnector.")
+        self.layerwise_load_ahead = self._get_layerwise_load_ahead()
+        self._next_load_layer_index = 0
+        self._submitted_load_layers: set[int] = set()
+        self._waited_load_layers: set[int] = set()
+        logger.info(
+            f"Init UCMLayerWiseConnector with layerwise_load_ahead={self.layerwise_load_ahead}."
+        )
+
+    def _get_layerwise_load_ahead(self) -> int:
+        raw_load_ahead = self.launch_config.get("layerwise_load_ahead", 1)
+        try:
+            load_ahead = int(raw_load_ahead)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "layerwise_load_ahead must be a positive integer."
+            ) from exc
+        if load_ahead < 1:
+            raise ValueError("layerwise_load_ahead must be a positive integer.")
+        return load_ahead
+
+    def _get_layer_local_row(self, layer_id: int) -> int:
+        layer_id_to_local_row = getattr(self, "layer_id_to_local_row", None)
+        if layer_id_to_local_row is not None:
+            return layer_id_to_local_row[layer_id]
+        return self.layer_ids.index(layer_id)
+
+    def _submit_next_load_layers(
+        self, metadata: "UCMConnectorMetadata", count: int
+    ) -> None:
+        submitted_count = 0
+        while submitted_count < count and self._next_load_layer_index < len(
+            self.layer_ids
+        ):
+            layer_id = self.layer_ids[self._next_load_layer_index]
+            self._next_load_layer_index += 1
+            if layer_id in self._submitted_load_layers:
+                continue
+            self._submitted_load_layers.add(layer_id)
+            local_row = self._get_layer_local_row(layer_id)
+            self._submit_request_load_tasks_for_layer(layer_id, local_row, metadata)
+            submitted_count += 1
 
     def _submit_request_load_tasks_for_layer(
         self,
@@ -955,6 +998,9 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         self.load_tasks.clear()
         self.request_data.clear()
         self._failure_req_ids.clear()
+        self._submitted_load_layers = set()
+        self._waited_load_layers = set()
+        self._next_load_layer_index = 0
         self.need_load = False
         self._layerwise_prev_wait_end = None
 
@@ -974,7 +1020,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
 
         if self.need_load:
             first_submit_start = time.perf_counter()
-            self._submit_request_load_tasks_for_layer(self.first_layer_id, 0, metadata)
+            self._submit_next_load_layers(metadata, self.layerwise_load_ahead)
             first_submit_end = time.perf_counter()
             n_reqs = len(self.request_data) - len(self._failure_req_ids)
             ucmmetrics.update_stats(
@@ -994,6 +1040,8 @@ class UCMLayerWiseConnector(UCMDirectConnector):
             return
         metadata = self._get_connector_metadata()
         current_layer_id = self.layer_name_to_id[layer_name]
+        should_refill_window = current_layer_id not in self._waited_load_layers
+        self._waited_load_layers.add(current_layer_id)
 
         wait_start = time.perf_counter()
 
@@ -1015,13 +1063,10 @@ class UCMLayerWiseConnector(UCMDirectConnector):
 
         wait_end = time.perf_counter()
 
-        next_layer_id = current_layer_id + 1
-        has_next = next_layer_id in self.layer_ids
-        if has_next:
-            next_local_row = next_layer_id - self.first_layer_id
-            self._submit_request_load_tasks_for_layer(
-                next_layer_id, next_local_row, metadata
-            )
+        submitted_next = False
+        if should_refill_window and self._next_load_layer_index < len(self.layer_ids):
+            self._submit_next_load_layers(metadata, 1)
+            submitted_next = True
 
         blocking_ms = (wait_end - wait_start) * 1000
         stats = {
@@ -1032,7 +1077,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
             stats["layerwise_inter_wait_interval_ms"] = (
                 wait_start - self._layerwise_prev_wait_end
             ) * 1000
-        if has_next:
+        if submitted_next:
             submit_end = time.perf_counter()
             stats["layerwise_next_layer_submit_ms"] = (submit_end - wait_end) * 1000
         ucmmetrics.update_stats(stats)
