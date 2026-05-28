@@ -154,8 +154,9 @@ class KVCacheLayout:
             name: extract_layer_index(name) for name in kvcaches.keys()
         }
         self.first_layer_id = next(iter(self.layer_name_to_id.values()))
-        self.num_blocks = self.kv_cache_config.num_blocks
-        self.layer_name_to_kv_cache_spec = layer_name_to_kv_cache_spec(kv_cache_config)
+        if kv_cache_config is not None:
+            self.num_blocks = kv_cache_config.num_blocks
+            self.layer_name_to_kv_cache_spec = layer_name_to_kv_cache_spec(kv_cache_config)
         self._build_layout(kvcaches)
 
     def _build_layout(self, kvcaches):
