@@ -129,12 +129,6 @@ Status DumpQueue::SubmitD2H(CopyStream& stream, TaskPtr task, WaiterPtr waiter,
                      task->id);
             return s;
         }
-        s = stream.Synchronize();
-        if (s.Failure()) [[unlikely]] {
-            UC_ERROR("Failed({}) to synchronize prerequisite event for dump task({}).", s,
-                     task->id);
-            return s;
-        }
     }
     const auto nShard = task->desc.size();
     UC_DEBUG("Try to dump ({}) shards.", nShard);
