@@ -52,7 +52,7 @@ class DumpQueue {
         Detail::TaskDesc backendTaskDesc;
         std::vector<TransBuffer::Handle> bufferHandles;
         WaiterPtr waiter;
-        CopyStream stream;
+        CopyStream::Completion completion;
         Status status{Status::OK()};
         double startTp{0};
         double d2hSubmittedTp{0};
@@ -66,13 +66,11 @@ private:
     int32_t deviceId_{-1};
     std::vector<size_t> tensorSizes_{};
     size_t streamNumber_{1};
-    size_t dumpD2hPipelineDepth_{1};
     bool useGdr_{false};
     std::vector<ssize_t> cpuAffinityCores_{};
     SpscRingQueue<TaskPair> waiting_;
     SpscRingQueue<D2hSyncCtx> syncing_;
     SpscRingQueue<BackendWaitCtx> dumping_;
-    SpscRingQueue<CopyStream> freeD2hPipelineTokens_;
     std::thread dispatcher_;
     std::thread syncer_;
     std::thread dumper_;
@@ -84,8 +82,7 @@ public:
 
 private:
     void DispatchStage(std::promise<Status>& started);
-    void DispatchOneTask(TaskPair&& pair);
-    bool AcquireD2hPipelineToken(CopyStream& stream);
+    void DispatchOneTask(CopyStream& stream, TaskPair&& pair);
     Status SubmitD2H(CopyStream& stream, TaskPtr task, WaiterPtr waiter, D2hSyncCtx& submitted);
     void SyncStage(std::promise<Status>& started);
     void SyncOneTask(D2hSyncCtx&& ctx);

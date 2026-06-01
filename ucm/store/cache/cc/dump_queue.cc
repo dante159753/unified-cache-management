@@ -44,13 +44,11 @@ Status DumpQueue::Setup(const Config& config, TaskIdSet* failureSet, TransBuffer
     deviceId_ = config.deviceId;
     tensorSizes_ = config.tensorSizes;
     streamNumber_ = config.streamNumber;
-    dumpD2hPipelineDepth_ = config.dumpD2hPipelineDepth;
     useGdr_ = config.useGdr;
     cpuAffinityCores_ = config.cpuAffinityCores;
     waiting_.Setup(config.waitingQueueDepth);
     syncing_.Setup(config.runningQueueDepth);
     dumping_.Setup(config.runningQueueDepth);
-    freeD2hPipelineTokens_.Setup(dumpD2hPipelineDepth_ + 1);
     std::promise<Status> dispatchStarted;
     auto dispatchFut = dispatchStarted.get_future();
     dispatcher_ = std::thread{&DumpQueue::DispatchStage, this, std::ref(dispatchStarted)};
@@ -77,24 +75,18 @@ void DumpQueue::Submit(TaskPtr task, WaiterPtr waiter)
 
 void DumpQueue::DispatchStage(std::promise<Status>& started)
 {
-    for (size_t i = 0; i < dumpD2hPipelineDepth_; ++i) {
-        CopyStream stream;
-        auto s = stream.Setup(deviceId_, streamNumber_, useGdr_);
-        if (s.Failure()) [[unlikely]] {
-            started.set_value(s);
-            return;
-        }
-        freeD2hPipelineTokens_.Push(std::move(stream));
-    }
-    started.set_value(Status::OK());
+    CopyStream stream;
+    auto s = stream.Setup(deviceId_, streamNumber_, useGdr_);
+    started.set_value(s);
+    if (s.Failure()) [[unlikely]] { return; }
     if (!cpuAffinityCores_.empty()) {
-        auto s = CpuAffinity::SetCpuAffinity4CurrentThread(cpuAffinityCores_);
+        s = CpuAffinity::SetCpuAffinity4CurrentThread(cpuAffinityCores_);
         if (s.Failure()) { UC_WARN("Failed({}) to set affinity.", s); }
     }
-    waiting_.ConsumerLoop(stop_, &DumpQueue::DispatchOneTask, this);
+    waiting_.ConsumerLoop(stop_, &DumpQueue::DispatchOneTask, this, stream);
 }
 
-void DumpQueue::DispatchOneTask(TaskPair&& pair)
+void DumpQueue::DispatchOneTask(CopyStream& stream, TaskPair&& pair)
 {
     auto& task = pair.first;
     auto& waiter = pair.second;
@@ -105,25 +97,10 @@ void DumpQueue::DispatchOneTask(TaskPair&& pair)
         waiter->Done();
         return;
     }
-    CopyStream stream;
-    if (!AcquireD2hPipelineToken(stream)) {
-        waiter->Done();
-        return;
-    }
     D2hSyncCtx submitted;
     auto s = SubmitD2H(stream, task, waiter, submitted);
-    submitted.stream = std::move(stream);
     submitted.status = s;
     syncing_.Push(std::move(submitted));
-}
-
-bool DumpQueue::AcquireD2hPipelineToken(CopyStream& stream)
-{
-    while (!stop_.load(std::memory_order_acquire)) {
-        if (freeD2hPipelineTokens_.TryPop(stream)) { return true; }
-        std::this_thread::yield();
-    }
-    return false;
 }
 
 Status DumpQueue::SubmitD2H(CopyStream& stream, TaskPtr task, WaiterPtr waiter,
@@ -144,16 +121,21 @@ Status DumpQueue::SubmitD2H(CopyStream& stream, TaskPtr task, WaiterPtr waiter,
     }
     const auto nShard = task->desc.size();
     UC_DEBUG("Try to dump ({}) shards.", nShard);
+    auto status = Status::OK();
+    bool d2hSubmitted = false;
     for (size_t i = 0; i < nShard; i++) {
         auto& shard = task->desc[i];
         auto handle = buffer_->Get(shard.owner, shard.index);
         if (!handle.Owner()) { continue; }
         if (!handle.Ready()) {
-            auto s =
-                DeviceToHostGatherAsync(stream.NextStream(), shard.addrs.data(), handle.Data());
+            auto copyStream = stream.NextStream();
+            d2hSubmitted = true;
+            auto s = DeviceToHostGatherAsync(copyStream, shard.addrs.data(), handle.Data());
             if (s.Failure()) [[unlikely]] {
                 UC_ERROR("Failed({}) to do D2H batch async for task({}).", s, task->id);
-                return s;
+                status = s;
+                submitted.bufferHandles.push_back(std::move(handle));
+                break;
             }
         }
         submitted.backendTaskDesc.push_back(
@@ -161,6 +143,14 @@ Status DumpQueue::SubmitD2H(CopyStream& stream, TaskPtr task, WaiterPtr waiter,
         submitted.bufferHandles.push_back(std::move(handle));
     }
     submitted.d2hSubmittedTp = NowTime::Now();
+    if (d2hSubmitted) {
+        auto s = stream.AppendCompletion(submitted.completion);
+        if (s.Failure()) [[unlikely]] {
+            UC_ERROR("Failed({}) to append D2H completion for dump task({}).", s, task->id);
+            if (status.Success()) { status = s; }
+        }
+    }
+    if (status.Failure()) [[unlikely]] { return status; }
     UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dump_shards_total"),
                              static_cast<double>(nShard));
     UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dump_backend_shards_total"),
@@ -170,12 +160,9 @@ Status DumpQueue::SubmitD2H(CopyStream& stream, TaskPtr task, WaiterPtr waiter,
 
 void DumpQueue::SyncStage(std::promise<Status>& started)
 {
-    Trans::Device device;
-    auto s = device.Setup(deviceId_);
-    started.set_value(s);
-    if (s.Failure()) [[unlikely]] { return; }
+    started.set_value(Status::OK());
     if (!cpuAffinityCores_.empty()) {
-        s = CpuAffinity::SetCpuAffinity4CurrentThread(cpuAffinityCores_);
+        auto s = CpuAffinity::SetCpuAffinity4CurrentThread(cpuAffinityCores_);
         if (s.Failure()) { UC_WARN("Failed({}) to set affinity.", s); }
     }
     syncing_.ConsumerLoop(stop_, &DumpQueue::SyncOneTask, this);
@@ -192,11 +179,10 @@ void DumpQueue::SyncOneTask(D2hSyncCtx&& ctx)
 
 Status DumpQueue::SyncAndDumpOneTask(D2hSyncCtx&& ctx)
 {
-    auto s = ctx.stream.Synchronize();
+    auto s = ctx.completion.Wait();
     auto tpSyncStream = NowTime::Now();
-    freeD2hPipelineTokens_.Push(std::move(ctx.stream));
     if (s.Failure()) [[unlikely]] {
-        UC_ERROR("Failed({}) to sync on stream for task({}).", s, ctx.taskHandle);
+        UC_ERROR("Failed({}) to wait D2H completion for task({}).", s, ctx.taskHandle);
         return s;
     }
     if (ctx.status.Failure()) [[unlikely]] { return ctx.status; }

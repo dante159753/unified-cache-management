@@ -24,6 +24,7 @@
 #include <gtest/gtest.h>
 #include <array>
 #include <atomic>
+#include <thread>
 #include <string>
 #include "cache/cc/dump_queue.h"
 #include "detail/data_generator.h"
@@ -80,7 +81,6 @@ TEST_F(UCCacheDumpQueueTest, DumpOneBlock)
     UC::HashSet<UC::Detail::TaskHandle> failureSet;
     size_t tensorSize = 32768;
     auto config = MakeConfig(&backend, rd.RandomString(10), tensorSize);
-    config.dumpD2hPipelineDepth = 1;
     TransBuffer buffer;
     DumpQueue dumpQ;
     auto s = buffer.Setup(config);
@@ -124,7 +124,32 @@ TEST_F(UCCacheDumpQueueTest, DumpBlockWhileBackendSubmitFailed)
     ASSERT_TRUE(failureSet.Contains(task->id));
 }
 
-TEST_F(UCCacheDumpQueueTest, DumpMultipleBlocksThroughStreamGroups)
+TEST_F(UCCacheDumpQueueTest, CopyStreamCompletionDoesNotWaitLaterWork)
+{
+    using namespace UC::CacheStore;
+    CopyStream stream;
+    ASSERT_EQ(stream.Setup(0, 1, false), UC::Status::OK());
+    UC::Latch blockLaterCallback{};
+    UC::Latch completionDone{};
+    blockLaterCallback.Up();
+    completionDone.Up();
+    ASSERT_EQ(stream.NextStream()->AppendCallback([](bool) {}), UC::Status::OK());
+    CopyStream::Completion completion;
+    ASSERT_EQ(stream.AppendCompletion(completion), UC::Status::OK());
+    ASSERT_EQ(stream.NextStream()->AppendCallback([&](bool) { blockLaterCallback.Wait(); }),
+              UC::Status::OK());
+    std::thread waiter([&] {
+        EXPECT_EQ(completion.Wait(), UC::Status::OK());
+        completionDone.Done();
+    });
+    auto completed = completionDone.WaitForDuration(5000);
+    EXPECT_TRUE(completed);
+    blockLaterCallback.Done();
+    waiter.join();
+    ASSERT_TRUE(completed);
+}
+
+TEST_F(UCCacheDumpQueueTest, DumpMultipleBlocksThroughSingleCopyStream)
 {
     using namespace UC::CacheStore;
     UC::Test::Detail::MockStore backend;
@@ -138,7 +163,6 @@ TEST_F(UCCacheDumpQueueTest, DumpMultipleBlocksThroughStreamGroups)
     }));
     UC::HashSet<UC::Detail::TaskHandle> failureSet;
     auto config = MakeConfig(&backend, rd.RandomString(10));
-    config.dumpD2hPipelineDepth = 2;
     TransBuffer buffer;
     DumpQueue dumpQ;
     auto s = buffer.Setup(config);
