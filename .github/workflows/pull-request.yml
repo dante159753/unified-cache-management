@@ -211,6 +211,7 @@ jobs:
       GIT_HTTP_LOW_SPEED_LIMIT: "0"
       GIT_HTTP_LOW_SPEED_TIME: "999999"
       ASCEND_RT_VISIBLE_DEVICES: "0"
+      E2E_TEST_GPU_MEMORY_UTILIZATION: "0.02"
       UCM_E2E_ACCELERATOR: ascend
       UCM_E2E_MODEL_NAME: Qwen3-0.6B
     steps:
@@ -301,6 +302,7 @@ jobs:
             -e https_proxy="${https_proxy:-}" \
             -e no_proxy="${no_proxy:-}" \
             -e ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES}" \
+            -e E2E_TEST_GPU_MEMORY_UTILIZATION="${E2E_TEST_GPU_MEMORY_UTILIZATION}" \
             -e UCM_E2E_ACCELERATOR="${UCM_E2E_ACCELERATOR}" \
             -e UCM_E2E_MODEL_NAME="${UCM_E2E_MODEL_NAME}" \
             --entrypoint /bin/bash \
