@@ -24,6 +24,8 @@ from common.path_utils import get_path_relative_to_test_root, get_path_to_model
 
 os.environ["ENABLE_UCM_PATCH"] = "1"
 
+DEFAULT_MODEL_NAME = os.getenv("UCM_E2E_MODEL_NAME", "Qwen2.5-1.5B-Instruct")
+
 
 class TestBasicOnlineInference:
     """Test basic online inference functionality."""
@@ -31,7 +33,7 @@ class TestBasicOnlineInference:
     @pytest.mark.stage(1)
     @pytest.mark.gpu_mem(6000)
     @pytest.mark.feature("online_inference")
-    @pytest.mark.parametrize("model_name", ["Qwen2.5-1.5B-Instruct"])
+    @pytest.mark.parametrize("model_name", [DEFAULT_MODEL_NAME])
     @pytest.mark.parametrize("max_tokens", [200])
     @pytest.mark.parametrize("prompt_split_ratio", [0.5])
     @pytest.mark.parametrize("ucm_connector_name", ["UcmNfsStore", "UcmPipelineStore"])
@@ -121,7 +123,7 @@ class TestBasicOnlineInference:
     @pytest.mark.gpu_mem(6000)
     @pytest.mark.gpu_count(2)
     @pytest.mark.feature("online_inference")
-    @pytest.mark.parametrize("model_name", ["Qwen2.5-1.5B-Instruct"])
+    @pytest.mark.parametrize("model_name", [DEFAULT_MODEL_NAME])
     @pytest.mark.parametrize("max_tokens", [200])
     @pytest.mark.parametrize("prompt_split_ratio", [0.5])
     @pytest.mark.parametrize("ucm_connector_name", ["UcmPipelineStore"])
@@ -209,7 +211,7 @@ class TestBasicOnlineInference:
     @pytest.mark.gpu_mem(6000)
     @pytest.mark.gpu_count(2)
     @pytest.mark.feature("online_inference")
-    @pytest.mark.parametrize("model_name", ["Qwen2.5-1.5B-Instruct"])
+    @pytest.mark.parametrize("model_name", [DEFAULT_MODEL_NAME])
     @pytest.mark.parametrize("max_tokens", [200])
     @pytest.mark.parametrize("prompt_split_ratio", [0.5])
     @pytest.mark.parametrize("ucm_connector_name", ["UcmPipelineStore"])
