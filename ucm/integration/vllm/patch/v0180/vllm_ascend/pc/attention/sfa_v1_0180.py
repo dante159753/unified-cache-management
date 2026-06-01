@@ -1,5 +1,6 @@
 import torch
 import torch_npu
+from vllm.distributed import get_tp_group
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.mla_v1 import (
@@ -20,6 +21,19 @@ from vllm_ascend.utils import get_weight_prefetch_method
 
 
 class AscendSFAImpl:
+    @staticmethod
+    def update_graph_params(
+        update_stream,
+        forward_context,
+        num_tokens,
+        vllm_config=None,
+        speculative_config=None,
+        num_dcp_pcp_tokens=None,
+        draft_attn_metadatas=None,
+    ):
+        # sfa does not need to update graph params
+        pass
+
     def forward(
         self,
         layer_name,
@@ -177,7 +191,7 @@ class AscendSFAImpl:
                     _, o_proj_full_handle = all_gather_async(
                         self.o_proj_tp_weight,
                         get_tp_group(),
-                        output=AscendSFAImpl.o_proj_full_pool,
+                        output=type(self).o_proj_full_pool,
                     )
 
                 if kv_cache is not None:
@@ -267,18 +281,6 @@ class AscendSFAImpl:
             if not require_o_proj_forward:
                 return result
             attn_output = result
-
-        if self.enable_dsa_cp_strict_accuracy:
-            send = (
-                attn_output.view(-1, self.tp_size, self.num_heads * self.v_head_dim)
-                .permute(1, 0, 2)
-                .reshape(-1, self.num_heads * self.v_head_dim)
-            )
-
-            attn_output = torch.empty_like(send)
-            torch.distributed.all_to_all_single(
-                attn_output, send, group=get_tp_group().device_group
-            )
 
         output[...] = self.o_proj(attn_output)[0]
 

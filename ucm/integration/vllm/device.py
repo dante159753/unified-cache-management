@@ -25,8 +25,8 @@ logger = init_logger(__name__)
 
 class Device(ABC):
     def __init__(self):
-        self.events = []
-        self.borrowed_events = []
+        self.events: Dict[int, Any] = {}
+        self.borrowed_events: List[Any] = []
 
     @abstractmethod
     def get_event_handle(self) -> int:
@@ -42,6 +42,10 @@ class Device(ABC):
 
     @abstractmethod
     def destroy_event_handles(self):
+        pass
+
+    @abstractmethod
+    def destroy_event_handle(self, handle: int):
         pass
 
     @abstractmethod
@@ -110,7 +114,7 @@ class CudaDevice(Device):
             handle = int(cuda_event.cuda_event)
             if handle is None or handle == 0:
                 return 0
-            self.events.append(cuda_event)
+            self.events[handle] = cuda_event
             return handle
         except Exception as e:
             logger.error(f"get cuda event handle failed. {e}")
@@ -133,6 +137,9 @@ class CudaDevice(Device):
     def destroy_event_handles(self):
         self.events.clear()
         self.borrowed_events.clear()
+
+    def destroy_event_handle(self, handle: int):
+        self.events.pop(handle, None)
 
     def get_cpu_affinity(self, local_rank: int) -> Optional[str]:
         """
@@ -247,14 +254,15 @@ class NpuDevice(Device):
             if ret != 0:
                 logger.error(f"acl create_event failed: {ret}")
                 return 0
-            self.events.append(event)
             ret = acl.rt.record_event(event, stream)
             if ret != 0:
+                acl.rt.destroy_event(event)
                 logger.error(f"acl record_event failed: {ret}")
                 return 0
             handle = int(event)
             if not handle:
                 return 0
+            self.events[handle] = event
             return handle
         except Exception as e:
             logger.error(f"get npu event handle failed. {e}")
@@ -282,13 +290,23 @@ class NpuDevice(Device):
     def destroy_event_handles(self):
         import acl
 
-        for event in self.events:
+        for event in self.events.values():
             try:
                 acl.rt.destroy_event(event)
             except Exception as e:
                 logger.error(f"destroy npu event failed. {e}")
         self.events.clear()
         self.borrowed_events.clear()
+
+    def destroy_event_handle(self, handle: int):
+        import acl
+
+        event = self.events.pop(handle, None)
+        if event is not None:
+            try:
+                acl.rt.destroy_event(event)
+            except Exception as e:
+                logger.error(f"destroy npu event failed. {e}")
 
     def _execute_command(self, cmd_list: List[str]) -> str:
         try:

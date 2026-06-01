@@ -147,14 +147,18 @@ Open `http://<your-host>:3000`, add a Prometheus data source pointing to
 | `examples/metrics/grafana_connector.json` | Connector-level activity: hit rate, request/block sizes, end-to-end load/save durations and speeds. |
 | `examples/metrics/grafana_pipeline_store.json` | Cache Store and Posix Store diagnosis: task breakdowns, queue wait, transfer duration, bandwidth, backend load ratio. |
 | `examples/metrics/grafana_layerwise.json` | `use_layerwise=true` diagnosis: `wait_for_layer_load()` blocking, inter-call interval, submit diagnostics, `wait_for_save()` tail. |
+| `examples/metrics/grafana_vllm.json` | vLLM service-side request latency, token throughput, scheduler state, and cache state. |
 
 The dashboards share the `ucm` Grafana tag. After importing them, the dashboard
 header contains an "Other UCM dashboards" dropdown that links between UCM
 dashboards while preserving the time range and `model_name` value.
 
-## Dashboard View and Worker Selectors
+## Dashboard Job, View, and Worker Selectors
 
-Each dashboard has a `View` selector and a `worker_id` selector:
+Each dashboard has a `job` selector. It defaults to **All** and uses regex
+matching, so dashboards also work for metrics that do not carry a `job` label.
+
+The UCM dashboards also have a `View` selector and a `worker_id` selector:
 
 - **Aggregated**: default service-level view. Worker labels are collapsed.
 - **Per Worker**: split panels by `worker_id` for worker-specific diagnosis.
@@ -259,6 +263,7 @@ The default metrics configuration contains the following UCM metrics.
 | `ucm:posix_h2s_bandwidth_gbps` | Posix stage write bandwidth per task in GB/s. |
 | `ucm:posix_load_queue_wait_duration_ms` | Time a Posix load task spent queued before first worker pickup. |
 | `ucm:posix_dump_queue_wait_duration_ms` | Time a Posix dump task spent queued before first worker pickup. |
+| `ucm:layerwise_batch_total_ms` | Layerwise batch wall-clock time from `start_load_kv()` entry to `wait_for_save()` return. |
 | `ucm:layerwise_wait_blocking_ms` | Time `wait_for_layer_load()` blocked before returning. |
 | `ucm:layerwise_wait_tasks_count` | Number of per-request load tasks awaited in a single layer wait. |
 | `ucm:layerwise_inter_wait_interval_ms` | Interval between consecutive `wait_for_layer_load()` calls. |
