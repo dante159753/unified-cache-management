@@ -38,6 +38,7 @@ def _get_bool_csv_env(name: str, default: List[bool]) -> List[bool]:
         return default
     return [item.strip().lower() in ("1", "true", "yes") for item in value.split(",")]
 
+
 DEFAULT_MODEL_NAME = os.getenv("UCM_E2E_MODEL_NAME", "Qwen2.5-1.5B-Instruct")
 DEFAULT_CACHE_BUFFER_CAPACITY_GB = int(
     os.getenv("UCM_E2E_CACHE_BUFFER_CAPACITY_GB", "32")
