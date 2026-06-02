@@ -25,6 +25,9 @@ from common.path_utils import get_path_relative_to_test_root, get_path_to_model
 os.environ["ENABLE_UCM_PATCH"] = "1"
 
 DEFAULT_MODEL_NAME = os.getenv("UCM_E2E_MODEL_NAME", "Qwen2.5-1.5B-Instruct")
+DEFAULT_CACHE_BUFFER_CAPACITY_GB = int(
+    os.getenv("UCM_E2E_CACHE_BUFFER_CAPACITY_GB", "32")
+)
 
 
 class TestBasicOnlineInference:
@@ -89,7 +92,7 @@ class TestBasicOnlineInference:
                         "store_pipeline": "Cache|Posix",
                         "storage_backends": ucm_storage_dir,
                         "use_direct": False,
-                        "cache_buffer_capacity_gb": 32,
+                        "cache_buffer_capacity_gb": DEFAULT_CACHE_BUFFER_CAPACITY_GB,
                     },
                 }
             ],
@@ -176,7 +179,7 @@ class TestBasicOnlineInference:
                         "store_pipeline": "Cache|Posix",
                         "storage_backends": ucm_storage_dir,
                         "use_direct": False,
-                        "cache_buffer_capacity_gb": 32,
+                        "cache_buffer_capacity_gb": DEFAULT_CACHE_BUFFER_CAPACITY_GB,
                     },
                 }
             ],
@@ -249,7 +252,7 @@ class TestBasicOnlineInference:
                         "store_pipeline": "Cache|Posix",
                         "storage_backends": ucm_storage_dir,
                         "use_direct": False,
-                        "cache_buffer_capacity_gb": 32,
+                        "cache_buffer_capacity_gb": DEFAULT_CACHE_BUFFER_CAPACITY_GB,
                     },
                 }
             ],

@@ -213,6 +213,8 @@ jobs:
       A2_E2E_HOST_DEVICE: /dev/vdavinci212
       ASCEND_RT_VISIBLE_DEVICES: "0"
       E2E_TEST_GPU_MEMORY_UTILIZATION: "0.2"
+      E2E_TEST_VLLM_ADDITIONAL_ARGS: "--enforce-eager"
+      UCM_E2E_CACHE_BUFFER_CAPACITY_GB: "2"
       UCM_E2E_ACCELERATOR: ascend
       UCM_E2E_MODEL_NAME: Qwen3-0.6B
     steps:
@@ -304,6 +306,8 @@ jobs:
             -e no_proxy="${no_proxy:-}" \
             -e ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES}" \
             -e E2E_TEST_GPU_MEMORY_UTILIZATION="${E2E_TEST_GPU_MEMORY_UTILIZATION}" \
+            -e E2E_TEST_VLLM_ADDITIONAL_ARGS="${E2E_TEST_VLLM_ADDITIONAL_ARGS}" \
+            -e UCM_E2E_CACHE_BUFFER_CAPACITY_GB="${UCM_E2E_CACHE_BUFFER_CAPACITY_GB}" \
             -e UCM_E2E_ACCELERATOR="${UCM_E2E_ACCELERATOR}" \
             -e UCM_E2E_MODEL_NAME="${UCM_E2E_MODEL_NAME}" \
             --entrypoint /bin/bash \
