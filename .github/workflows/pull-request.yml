@@ -210,6 +210,7 @@ jobs:
       no_proxy: localhost,127.0.0.1,::1,repo.huaweicloud.com
       GIT_HTTP_LOW_SPEED_LIMIT: "0"
       GIT_HTTP_LOW_SPEED_TIME: "999999"
+      A2_E2E_HOST_DEVICE: /dev/vdavinci212
       ASCEND_RT_VISIBLE_DEVICES: "0"
       E2E_TEST_GPU_MEMORY_UTILIZATION: "0.02"
       UCM_E2E_ACCELERATOR: ascend
@@ -270,7 +271,7 @@ jobs:
             --build-arg no_proxy="repo.huaweicloud.com,${no_proxy:-}" \
             --build-arg PIP_INDEX_URL=https://repo.huaweicloud.com/repository/pypi/simple \
             -t ucm-e2etest-pc-a2:${{ steps.version.outputs.version }} \
-            -f ./docker/Dockerfile.ucm-vllm-ascend.a2-v0.20.2 ./
+            -f ./docker/Dockerfile.ucm-vllm-ascend.a2-v0.18.0 ./
 
       - name: Test E2E Online Inference in Docker
         run: |
@@ -288,7 +289,7 @@ jobs:
           ${SUDO} docker run --name "${CONTAINER_NAME}" \
             --network=host \
             --ipc=host \
-            --device /dev/davinci0 \
+            --device "${A2_E2E_HOST_DEVICE}:/dev/davinci0" \
             --device /dev/davinci_manager \
             --device /dev/devmm_svm \
             --device /dev/hisi_hdc \
