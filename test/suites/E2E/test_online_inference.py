@@ -24,9 +24,29 @@ from common.path_utils import get_path_relative_to_test_root, get_path_to_model
 
 os.environ["ENABLE_UCM_PATCH"] = "1"
 
+
+def _get_csv_env(name: str, default: List[str]) -> List[str]:
+    value = os.getenv(name, "")
+    if not value:
+        return default
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _get_bool_csv_env(name: str, default: List[bool]) -> List[bool]:
+    value = os.getenv(name, "")
+    if not value:
+        return default
+    return [item.strip().lower() in ("1", "true", "yes") for item in value.split(",")]
+
 DEFAULT_MODEL_NAME = os.getenv("UCM_E2E_MODEL_NAME", "Qwen2.5-1.5B-Instruct")
 DEFAULT_CACHE_BUFFER_CAPACITY_GB = int(
     os.getenv("UCM_E2E_CACHE_BUFFER_CAPACITY_GB", "32")
+)
+DEFAULT_CONNECTOR_NAMES = _get_csv_env(
+    "UCM_E2E_CONNECTOR_NAMES", ["UcmNfsStore", "UcmPipelineStore"]
+)
+DEFAULT_USE_LAYERWISE_VALUES = _get_bool_csv_env(
+    "UCM_E2E_USE_LAYERWISE_VALUES", [True, False]
 )
 
 
@@ -39,8 +59,8 @@ class TestBasicOnlineInference:
     @pytest.mark.parametrize("model_name", [DEFAULT_MODEL_NAME])
     @pytest.mark.parametrize("max_tokens", [200])
     @pytest.mark.parametrize("prompt_split_ratio", [0.5])
-    @pytest.mark.parametrize("ucm_connector_name", ["UcmNfsStore", "UcmPipelineStore"])
-    @pytest.mark.parametrize("use_layerwise", [True, False])
+    @pytest.mark.parametrize("ucm_connector_name", DEFAULT_CONNECTOR_NAMES)
+    @pytest.mark.parametrize("use_layerwise", DEFAULT_USE_LAYERWISE_VALUES)
     @pytest.mark.parametrize("max_num_batched_tokens", [2047])
     def test_online_accuracy_hbm_ssd_mixed(
         self,
