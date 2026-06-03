@@ -1,0 +1,63 @@
+name: VNPU Runner Smoke
+
+on:
+  push:
+    branches:
+      - vnpu-runner-smoke
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    name: smoke-vnpu-${{ matrix.dev }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dev: "212"
+            label: vnpu-212
+          - dev: "213"
+            label: vnpu-213
+          - dev: "214"
+            label: vnpu-214
+          - dev: "215"
+            label: vnpu-215
+    runs-on:
+      - self-hosted
+      - npu
+      - ubuntu-24.04-arm
+      - ${{ matrix.label }}
+    steps:
+      - name: Run vNPU Docker workload
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="vnpu-smoke-${{ matrix.dev }}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          image="registry.dev.huawei.com/flash_stor/vllm-ascend:v0.18.0rc1-openeuler"
+          docker rm -f "${name}" >/dev/null 2>&1 || true
+          docker run --rm --name "${name}" \
+            --network host \
+            --ipc host \
+            --device "/dev/vdavinci${{ matrix.dev }}:/dev/davinci0" \
+            --device /dev/davinci_manager \
+            --device /dev/devmm_svm \
+            --device /dev/hisi_hdc \
+            -v /usr/local/dcmi:/usr/local/dcmi \
+            -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+            -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+            -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+            -v /etc/ascend_install.info:/etc/ascend_install.info \
+            -e ASCEND_RT_VISIBLE_DEVICES=0 \
+            -e PYTHONUNBUFFERED=1 \
+            "${image}" \
+            bash -lc 'python3 - <<'"'"'PY'"'"'
+          import torch
+          import torch_npu
+
+          torch.npu.set_device(0)
+          x = torch.randn((2048, 2048), device="npu", dtype=torch.float16)
+          for _ in range(25):
+              y = x @ x
+              torch.npu.synchronize()
+          print("VNPU_SMOKE_OK", y.shape, y.dtype, flush=True)
+          PY'
