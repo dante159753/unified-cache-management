@@ -1,4 +1,5 @@
 import argparse
+import datetime
 import gzip
 import json
 import random
@@ -7,6 +8,7 @@ from pathlib import Path
 from typing import Iterable
 
 GB = 1024**3
+SYSTEM_TIME_FORMAT = "%Y%m%d%H%M%S"
 DTypeBytes = {
     "float32": 4,
     "float16": 2,
@@ -291,6 +293,27 @@ def _add_hit_rates(totals: dict) -> None:
         totals["total_hit_rate"] = 0.0
 
 
+def _request_hit_rates(
+    query_blocks: int,
+    gpu_hits: int,
+    memory_hits: int,
+    disk_hits: int,
+) -> dict:
+    if query_blocks <= 0:
+        return {
+            "gpu_hit_rate": 0.0,
+            "memory_hit_rate": 0.0,
+            "disk_hit_rate": 0.0,
+            "total_hit_rate": 0.0,
+        }
+    return {
+        "gpu_hit_rate": gpu_hits / query_blocks,
+        "memory_hit_rate": memory_hits / query_blocks,
+        "disk_hit_rate": disk_hits / query_blocks,
+        "total_hit_rate": (gpu_hits + memory_hits + disk_hits) / query_blocks,
+    }
+
+
 def _aggregate_cache_stats(
     caches: list[LRUCache],
     block_bytes: int,
@@ -311,6 +334,94 @@ def _aggregate_cache_stats(
     }
 
 
+def parse_range_time_arg(
+    value: str | float | int | None,
+) -> tuple[float | None, str | None]:
+    if value is None:
+        return None, None
+    raw_value = str(value)
+    if raw_value.isdigit() and len(raw_value) == 14:
+        dt = datetime.datetime.strptime(raw_value, SYSTEM_TIME_FORMAT)
+        return dt.timestamp(), "system"
+    try:
+        return float(raw_value), "timestamp"
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid range time: {value}. Use a trace timestamp or YYYYMMDDHHMMSS."
+        ) from exc
+
+
+def resolve_range_times(
+    start: str | float | int | None,
+    end: str | float | int | None,
+) -> tuple[float | None, float | None, str | None]:
+    start_time, start_kind = parse_range_time_arg(start)
+    end_time, end_kind = parse_range_time_arg(end)
+    if (start_time is None) != (end_time is None):
+        raise ValueError(
+            "--range-start-time and --range-end-time must be specified together"
+        )
+    if start_kind != end_kind:
+        raise ValueError(
+            "--range-start-time and --range-end-time must use the same format"
+        )
+    return start_time, end_time, start_kind
+
+
+def _record_system_timestamp(record: dict, request_index: int) -> float:
+    for field_name in ("system_timestamp", "wall_timestamp"):
+        value = record.get(field_name)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"record {request_index} has invalid {field_name}: {value}"
+            ) from exc
+
+    system_time = record.get("system_time")
+    if system_time is not None:
+        try:
+            return datetime.datetime.fromisoformat(str(system_time)).timestamp()
+        except ValueError as exc:
+            raise ValueError(
+                f"record {request_index} has invalid system_time: {system_time}"
+            ) from exc
+
+    timestamp = record.get("timestamp")
+    if timestamp is not None:
+        try:
+            timestamp_value = float(timestamp)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"record {request_index} has invalid timestamp: {timestamp}"
+            ) from exc
+        if timestamp_value >= 1_000_000_000:
+            return timestamp_value
+
+    raise ValueError(
+        f"record {request_index} missing system timestamp required for "
+        "YYYYMMDDHHMMSS range analysis"
+    )
+
+
+def _record_timestamp(record: dict, request_index: int, time_kind: str | None) -> float:
+    if time_kind == "system":
+        return _record_system_timestamp(record, request_index)
+    timestamp = record.get("timestamp")
+    if timestamp is None:
+        raise ValueError(
+            f"record {request_index} missing timestamp required for range analysis"
+        )
+    try:
+        return float(timestamp)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"record {request_index} has invalid timestamp: {timestamp}"
+        ) from exc
+
+
 def analyze_records(
     records: list[dict],
     *,
@@ -321,9 +432,25 @@ def analyze_records(
     configured_gb: dict[str, float] | None = None,
     num_nodes: int = 1,
     random_seed: int | None = None,
+    range_start_time: float | None = None,
+    range_end_time: float | None = None,
+    range_time_kind: str | None = None,
 ) -> dict:
     if num_nodes <= 0:
         raise ValueError("--num-nodes must be greater than 0")
+    range_enabled = range_start_time is not None or range_end_time is not None
+    if (range_start_time is None) != (range_end_time is None):
+        raise ValueError(
+            "--range-start-time and --range-end-time must be specified together"
+        )
+    if (
+        range_start_time is not None
+        and range_end_time is not None
+        and range_start_time > range_end_time
+    ):
+        raise ValueError(
+            "--range-start-time must be less than or equal to --range-end-time"
+        )
     configured_gb = configured_gb or {"gpu": 0.0, "memory": 0.0, "disk": 0.0}
     rng = random.Random(random_seed)
     gpu_caches = [LRUCache(capacities_blocks["gpu"]) for _ in range(num_nodes)]
@@ -332,8 +459,24 @@ def analyze_records(
     totals = _new_totals()
     node_totals = [_new_totals() for _ in range(num_nodes)]
     request_summaries = []
+    processed_requests = 0
+    warmup_requests = 0
+    skipped_after_end_requests = 0
 
     for request_index, record in enumerate(records):
+        if range_enabled:
+            timestamp_value = _record_timestamp(
+                record,
+                request_index,
+                range_time_kind,
+            )
+            if timestamp_value > range_end_time:
+                skipped_after_end_requests += 1
+                continue
+            in_output_range = timestamp_value >= range_start_time
+        else:
+            in_output_range = True
+
         node_index = 0 if num_nodes == 1 else rng.randrange(num_nodes)
         gpu = gpu_caches[node_index]
         memory = memory_caches[node_index]
@@ -366,16 +509,22 @@ def analyze_records(
             "disk_hits": disk_hits,
             "miss_blocks": miss_blocks,
         }
-        _add_request_totals(totals, **request_totals)
-        _add_request_totals(node_totals[node_index], **request_totals)
+        processed_requests += 1
+        if in_output_range:
+            _add_request_totals(totals, **request_totals)
+            _add_request_totals(node_totals[node_index], **request_totals)
+        else:
+            warmup_requests += 1
 
-        if include_requests:
+        if include_requests and in_output_range:
             request_summaries.append(
                 {
                     "request_index": request_index,
                     "node_index": node_index,
                     "trace_path": record.get("_trace_path"),
                     "timestamp": record.get("timestamp"),
+                    "system_time": record.get("system_time"),
+                    "system_timestamp": record.get("system_timestamp"),
                     "input_length": record.get("input_length"),
                     "output_length": record.get("output_length"),
                     "query_blocks": len(block_ids),
@@ -383,6 +532,12 @@ def analyze_records(
                     "memory_hit_blocks": memory_hits,
                     "disk_hit_blocks": disk_hits,
                     "miss_blocks": miss_blocks,
+                    **_request_hit_rates(
+                        len(block_ids),
+                        gpu_hits,
+                        memory_hits,
+                        disk_hits,
+                    ),
                 }
             )
 
@@ -425,6 +580,16 @@ def analyze_records(
             for node_index in range(num_nodes)
         ],
     }
+    if range_enabled:
+        result["range"] = {
+            "start_time": range_start_time,
+            "end_time": range_end_time,
+            "time_kind": range_time_kind or "timestamp",
+            "processed_requests": processed_requests,
+            "warmup_requests": warmup_requests,
+            "selected_requests": totals["total_requests"],
+            "skipped_after_end_requests": skipped_after_end_requests,
+        }
     if include_requests:
         result["requests"] = request_summaries
     return result
@@ -455,6 +620,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ucm-filesystem-cache-gb", type=float, required=True)
     parser.add_argument("--num-nodes", type=int, default=1)
     parser.add_argument("--random-seed", type=int)
+    parser.add_argument(
+        "--range-start-time",
+        "--start-time",
+        dest="range_start_time",
+    )
+    parser.add_argument(
+        "--range-end-time",
+        "--end-time",
+        dest="range_end_time",
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--include-requests", action="store_true")
     return parser.parse_args()
@@ -491,15 +666,23 @@ def build_analysis(args: argparse.Namespace) -> dict:
         for layer, capacity_gb in configured_gb.items()
     }
     records = read_trace_records(args.trace_path)
+    range_start_time, range_end_time, range_time_kind = resolve_range_times(
+        args.range_start_time,
+        args.range_end_time,
+    )
+    include_requests = args.include_requests or range_start_time is not None
     result = analyze_records(
         records,
         block_bytes=block_bytes,
         capacities_blocks=capacities_blocks,
         trace_paths=[str(path) for path in args.trace_path],
-        include_requests=args.include_requests,
+        include_requests=include_requests,
         configured_gb=configured_gb,
         num_nodes=args.num_nodes,
         random_seed=args.random_seed,
+        range_start_time=range_start_time,
+        range_end_time=range_end_time,
+        range_time_kind=range_time_kind,
     )
     result["config"] = {
         "model_path": str(args.model_path) if args.model_path is not None else None,
@@ -511,6 +694,11 @@ def build_analysis(args: argparse.Namespace) -> dict:
         "trace_block_size": args.trace_block_size,
         "num_nodes": args.num_nodes,
         "random_seed": args.random_seed,
+        "range_start_time": range_start_time,
+        "range_end_time": range_end_time,
+        "range_time_kind": range_time_kind,
+        "range_start_time_arg": args.range_start_time,
+        "range_end_time_arg": args.range_end_time,
     }
     return result
 
@@ -527,6 +715,16 @@ def print_summary(result: dict) -> None:
     print(f"  memory_hit_rate: {totals['memory_hit_rate']:.6f}")
     print(f"  disk_hit_rate: {totals['disk_hit_rate']:.6f}")
     print(f"  total_hit_rate: {totals['total_hit_rate']:.6f}")
+    if "range" in result:
+        range_info = result["range"]
+        print(
+            "  "
+            f"range: start_time={range_info['start_time']}, "
+            f"end_time={range_info['end_time']}, "
+            f"time_kind={range_info['time_kind']}, "
+            f"warmup_requests={range_info['warmup_requests']}, "
+            f"selected_requests={range_info['selected_requests']}"
+        )
     for layer_name, layer_stats in result["layers"].items():
         print(
             "  "
@@ -535,6 +733,24 @@ def print_summary(result: dict) -> None:
             f"peak_blocks={layer_stats['peak_blocks']}, "
             f"evictions={layer_stats['evictions']}"
         )
+    if "range" in result and result.get("requests"):
+        print("Range requests")
+        for request in result["requests"]:
+            system_time = request.get("system_time")
+            system_part = (
+                f"system_time={system_time}, " if system_time is not None else ""
+            )
+            print(
+                "  "
+                f"request_index={request['request_index']}, "
+                f"timestamp={request['timestamp']}, "
+                f"{system_part}"
+                f"node_index={request['node_index']}, "
+                f"gpu_hit_rate={request['gpu_hit_rate']:.6f}, "
+                f"memory_hit_rate={request['memory_hit_rate']:.6f}, "
+                f"disk_hit_rate={request['disk_hit_rate']:.6f}, "
+                f"total_hit_rate={request['total_hit_rate']:.6f}"
+            )
 
 
 def main() -> None:

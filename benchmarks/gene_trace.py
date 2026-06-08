@@ -1,5 +1,6 @@
 import argparse
 import ast
+import datetime
 import glob
 import gzip
 import json
@@ -12,6 +13,9 @@ match_pattern = re.compile(
     r"input_length:\s*(?P<input_length>\d+),\s*"
     r"output_length:\s*(?P<output_length>\d+),\s*"
     r"ucm_block_ids:\s*(?P<ucm_block_ids>\[.*?\])"
+)
+system_time_pattern = re.compile(
+    r"^\[(?P<system_time>\d{4}-\d{2}-\d{2} " r"\d{2}:\d{2}:\d{2}(?:\.\d+)?)\]"
 )
 
 DEFAULT_OUTPUT_LOG = Path("./output.jsonl")
@@ -29,12 +33,20 @@ def parse_trace_line(line):
         return None
 
     clean_hash_ids = ast.literal_eval(match.group("ucm_block_ids"))
-    return {
+    record = {
         "timestamp": float(match.group("timestamp")),
         "input_length": int(match.group("input_length")),
         "output_length": int(match.group("output_length")),
         "hash_ids": clean_hash_ids,
     }
+    system_time_match = system_time_pattern.search(line)
+    if system_time_match:
+        system_time = system_time_match.group("system_time")
+        record["system_time"] = system_time
+        record["system_timestamp"] = datetime.datetime.fromisoformat(
+            system_time
+        ).timestamp()
+    return record
 
 
 def process_file(file_path, out_f):
