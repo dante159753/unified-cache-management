@@ -136,7 +136,7 @@ class TraceCacheAnalyzerTest(unittest.TestCase):
         self.assertEqual(result["requests"][0]["gpu_hit_rate"], 0.5)
         self.assertEqual(result["requests"][0]["total_hit_rate"], 0.5)
 
-    def test_system_time_range_uses_system_timestamp(self):
+    def test_system_time_range_uses_system_time_without_timezone(self):
         analyzer = load_analyzer()
         start_time, end_time, time_kind = analyzer.resolve_range_times(
             "20260608140520",
@@ -145,27 +145,24 @@ class TraceCacheAnalyzerTest(unittest.TestCase):
         records = [
             {
                 "timestamp": 1.0,
-                "system_timestamp": datetime.datetime(
-                    2026, 6, 8, 14, 5, 19
-                ).timestamp(),
+                "system_time": "2026-06-08 14:05:19.123456",
+                "system_timestamp": 1780672799,
                 "input_length": 512,
                 "output_length": 1,
                 "hash_ids": ["a"],
             },
             {
                 "timestamp": 2.0,
-                "system_timestamp": datetime.datetime(
-                    2026, 6, 8, 14, 5, 20
-                ).timestamp(),
+                "system_time": "2026-06-08 14:05:20.123456",
+                "system_timestamp": 1780672800,
                 "input_length": 1024,
                 "output_length": 1,
                 "hash_ids": ["a", "b"],
             },
             {
                 "timestamp": 3.0,
-                "system_timestamp": datetime.datetime(
-                    2026, 6, 8, 14, 5, 21
-                ).timestamp(),
+                "system_time": "2026-06-08 14:05:21.123456",
+                "system_timestamp": 1780672801,
                 "input_length": 512,
                 "output_length": 1,
                 "hash_ids": ["b"],
@@ -184,9 +181,14 @@ class TraceCacheAnalyzerTest(unittest.TestCase):
         )
 
         self.assertEqual(result["range"]["time_kind"], "system")
+        self.assertEqual(result["range"]["start_time"], 20260608140520)
         self.assertEqual(result["range"]["warmup_requests"], 1)
         self.assertEqual(result["range"]["selected_requests"], 1)
         self.assertEqual(result["requests"][0]["request_index"], 1)
+        self.assertEqual(
+            result["requests"][0]["system_time"],
+            "2026-06-08 14:05:20.123456",
+        )
         self.assertEqual(result["requests"][0]["gpu_hit_rate"], 0.5)
 
     def test_gene_trace_writes_system_time_fields(self):
@@ -468,9 +470,7 @@ class TraceCacheAnalyzerTest(unittest.TestCase):
                     {
                         "timestamp": 1.0,
                         "system_time": "2026-06-08 14:05:19",
-                        "system_timestamp": datetime.datetime(
-                            2026, 6, 8, 14, 5, 19
-                        ).timestamp(),
+                        "system_timestamp": 1780672799,
                         "input_length": 512,
                         "output_length": 1,
                         "hash_ids": ["a"],
@@ -481,9 +481,7 @@ class TraceCacheAnalyzerTest(unittest.TestCase):
                     {
                         "timestamp": 2.0,
                         "system_time": "2026-06-08 14:05:20",
-                        "system_timestamp": datetime.datetime(
-                            2026, 6, 8, 14, 5, 20
-                        ).timestamp(),
+                        "system_timestamp": 1780672800,
                         "input_length": 1024,
                         "output_length": 1,
                         "hash_ids": ["a", "b"],
@@ -524,6 +522,7 @@ class TraceCacheAnalyzerTest(unittest.TestCase):
             self.assertIn("request_index=1", result.stdout)
             data = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(data["range"]["time_kind"], "system")
+            self.assertEqual(data["range"]["start_time"], 20260608140520)
             self.assertEqual(data["range"]["selected_requests"], 1)
             self.assertEqual(data["requests"][0]["request_index"], 1)
 

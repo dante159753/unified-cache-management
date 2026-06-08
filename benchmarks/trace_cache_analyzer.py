@@ -336,13 +336,13 @@ def _aggregate_cache_stats(
 
 def parse_range_time_arg(
     value: str | float | int | None,
-) -> tuple[float | None, str | None]:
+) -> tuple[float | int | None, str | None]:
     if value is None:
         return None, None
     raw_value = str(value)
     if raw_value.isdigit() and len(raw_value) == 14:
-        dt = datetime.datetime.strptime(raw_value, SYSTEM_TIME_FORMAT)
-        return dt.timestamp(), "system"
+        datetime.datetime.strptime(raw_value, SYSTEM_TIME_FORMAT)
+        return int(raw_value), "system"
     try:
         return float(raw_value), "timestamp"
     except ValueError as exc:
@@ -354,7 +354,7 @@ def parse_range_time_arg(
 def resolve_range_times(
     start: str | float | int | None,
     end: str | float | int | None,
-) -> tuple[float | None, float | None, str | None]:
+) -> tuple[float | int | None, float | int | None, str | None]:
     start_time, start_kind = parse_range_time_arg(start)
     end_time, end_kind = parse_range_time_arg(end)
     if (start_time is None) != (end_time is None):
@@ -368,25 +368,33 @@ def resolve_range_times(
     return start_time, end_time, start_kind
 
 
-def _record_system_timestamp(record: dict, request_index: int) -> float:
+def _system_time_to_key(value: str) -> int:
+    return int(datetime.datetime.fromisoformat(value).strftime(SYSTEM_TIME_FORMAT))
+
+
+def _record_system_time_key(record: dict, request_index: int) -> int:
+    system_time = record.get("system_time")
+    if system_time is not None:
+        try:
+            return _system_time_to_key(str(system_time))
+        except ValueError as exc:
+            raise ValueError(
+                f"record {request_index} has invalid system_time: {system_time}"
+            ) from exc
+
     for field_name in ("system_timestamp", "wall_timestamp"):
         value = record.get(field_name)
         if value is None:
             continue
         try:
-            return float(value)
+            return int(
+                datetime.datetime.fromtimestamp(float(value)).strftime(
+                    SYSTEM_TIME_FORMAT
+                )
+            )
         except (TypeError, ValueError) as exc:
             raise ValueError(
                 f"record {request_index} has invalid {field_name}: {value}"
-            ) from exc
-
-    system_time = record.get("system_time")
-    if system_time is not None:
-        try:
-            return datetime.datetime.fromisoformat(str(system_time)).timestamp()
-        except ValueError as exc:
-            raise ValueError(
-                f"record {request_index} has invalid system_time: {system_time}"
             ) from exc
 
     timestamp = record.get("timestamp")
@@ -398,7 +406,11 @@ def _record_system_timestamp(record: dict, request_index: int) -> float:
                 f"record {request_index} has invalid timestamp: {timestamp}"
             ) from exc
         if timestamp_value >= 1_000_000_000:
-            return timestamp_value
+            return int(
+                datetime.datetime.fromtimestamp(timestamp_value).strftime(
+                    SYSTEM_TIME_FORMAT
+                )
+            )
 
     raise ValueError(
         f"record {request_index} missing system timestamp required for "
@@ -406,9 +418,13 @@ def _record_system_timestamp(record: dict, request_index: int) -> float:
     )
 
 
-def _record_timestamp(record: dict, request_index: int, time_kind: str | None) -> float:
+def _record_timestamp(
+    record: dict,
+    request_index: int,
+    time_kind: str | None,
+) -> float | int:
     if time_kind == "system":
-        return _record_system_timestamp(record, request_index)
+        return _record_system_time_key(record, request_index)
     timestamp = record.get("timestamp")
     if timestamp is None:
         raise ValueError(
@@ -432,8 +448,8 @@ def analyze_records(
     configured_gb: dict[str, float] | None = None,
     num_nodes: int = 1,
     random_seed: int | None = None,
-    range_start_time: float | None = None,
-    range_end_time: float | None = None,
+    range_start_time: float | int | None = None,
+    range_end_time: float | int | None = None,
     range_time_kind: str | None = None,
 ) -> dict:
     if num_nodes <= 0:
