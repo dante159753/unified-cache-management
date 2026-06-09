@@ -161,6 +161,7 @@ ucm_connectors:
       store_pipeline: "Cache|Posix"
       storage_backends: "/mnt/test"
 use_layerwise: true
+enable_reshape_cache_event_sync: false
 ```
 
 **⚠️ Make sure to replace `"/vllm-workspace/unified-cache-management/examples/ucm_config_example.yaml"` with your actual config file path.**
