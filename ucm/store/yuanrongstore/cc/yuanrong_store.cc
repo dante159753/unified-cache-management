@@ -159,6 +159,13 @@ public:
         return taskManager_.Wait(taskId);
     }
 
+    Status RegisterMemory(void* baseAddr, size_t totalSize) override
+    {
+        (void)baseAddr;
+        (void)totalSize;
+        return Status::OK();
+    }
+
 private:
     static Config ParseConfig(const Detail::Dictionary& input)
     {
