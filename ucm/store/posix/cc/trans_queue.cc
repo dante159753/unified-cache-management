@@ -26,7 +26,25 @@
 #include "metrics_api.h"
 #include "posix_file.h"
 
+#include <atomic>
+#include <cstdlib>
+
 namespace UC::PosixStore {
+
+namespace {
+bool IsEnvEnabled(const char* name) { return std::getenv(name) != nullptr; }
+
+bool ShouldInjectLoadFailure(const IoUnit& ios)
+{
+    static std::atomic<bool> injected{false};
+    if (!ios.firstIo) { return false; }
+    if (!IsEnvEnabled("UCM_POSIX_FAIL_LOAD_ONCE") &&
+        !IsEnvEnabled("UCM_POSIX_DELETE_LOAD_FILE_ONCE")) {
+        return false;
+    }
+    return !injected.exchange(true, std::memory_order_relaxed);
+}
+}  // namespace
 
 Status TransQueue::Setup(const Config& config, TaskIdSet* failureSet, const SpaceLayout* layout)
 {
@@ -156,6 +174,18 @@ Status TransQueue::H2S(IoUnit& ios)
 Status TransQueue::S2H(IoUnit& ios)
 {
     const auto& path = layout_->DataFilePath(ios.shard.owner, false);
+    if (ShouldInjectLoadFailure(ios)) {
+        if (IsEnvEnabled("UCM_POSIX_DELETE_LOAD_FILE_ONCE")) {
+            UC_ERROR("Fault injected POSIX load failure by deleting file({}) for task({}), block({}).",
+                     path, ios.owner, ios.shard.owner);
+            PosixFile{path}.Remove();
+        } else {
+            UC_ERROR("Fault injected POSIX load failure for file({}), task({}), block({}).", path,
+                     ios.owner, ios.shard.owner);
+            UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("posix_open_errors_total"), 1.0);
+            return Status::Error(fmt::format("fault injected POSIX load failure for {}", path));
+        }
+    }
     PosixFile file{path};
     auto flags = PosixFile::OpenFlag::READ_ONLY;
     if (ioDirect_) { flags |= PosixFile::OpenFlag::DIRECT; }
