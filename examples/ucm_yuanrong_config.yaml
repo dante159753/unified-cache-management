@@ -1,0 +1,35 @@
+# UCM + YuanRong + Posix configuration example.
+#
+# The YuanRong SDK and worker must be available before starting vLLM.
+# YuanRong|Posix currently requires psync with io_direct disabled because
+# YuanRong shared-memory payload addresses do not guarantee O_DIRECT alignment.
+
+ucm_connectors:
+  - ucm_connector_name: "UcmPipelineStore"
+    ucm_connector_config:
+      store_pipeline: "YuanRong|Posix"
+      yuanrong_host: "127.0.0.1"
+      yuanrong_port: 9088
+      yuanrong_namespace: "ucm_model"
+      yuanrong_enable_remote_h2d: true
+      yuanrong_timeout_ms: 60000
+      # Timeout for the first YuanRong DRAM hit probe before falling back to Posix.
+      yuanrong_miss_timeout_ms: 0
+      yuanrong_waiting_queue_depth: 8192
+      yuanrong_load_worker_count: 4
+      # Posix cold recovery pipeline batch size.
+      yuanrong_recovery_batch_size: 32
+      # Pinned host memory usage is count * one UCM shard size.
+      yuanrong_host_buffer_count: 128
+      yuanrong_h2d_stream_count: 4
+      yuanrong_backfill_worker_count: 1
+      yuanrong_backfill_queue_depth: 128
+      yuanrong_reaper_queue_depth: 8192
+
+      share_buffer_enable: true
+      storage_backends: "/mnt/ucm"
+      posix_io_engine: "psync"
+      io_direct: false
+
+enable_event_sync: true
+use_layerwise: false

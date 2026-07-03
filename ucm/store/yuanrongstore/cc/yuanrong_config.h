@@ -1,7 +1,7 @@
 /**
  * MIT License
  *
- * Copyright (c) 2025 Huawei Technologies Co., Ltd. All rights reserved.
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -21,38 +21,45 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  * */
-#ifndef UNIFIEDCACHE_TEST_DETAIL_PATH_BASE_H
-#define UNIFIEDCACHE_TEST_DETAIL_PATH_BASE_H
+#ifndef UNIFIEDCACHE_YUANRONG_STORE_CC_YUANRONG_CONFIG_H
+#define UNIFIEDCACHE_YUANRONG_STORE_CC_YUANRONG_CONFIG_H
 
-#include <gtest/gtest.h>
-#include "random.h"
+#include <cstdint>
+#include <string>
+#include <vector>
+#include "ucmstore_v1.h"
 
-namespace UC::Test::Detail {
+namespace UC::YuanRongStore {
 
-class PathBase : public ::testing::Test {
-public:
-    void SetUp() override
-    {
-        testing::Test::SetUp();
-        const auto info = testing::UnitTest::GetInstance()->current_test_info();
-        std::string testCaseName = info->test_case_name();
-        std::string testName = info->name();
-        this->path_ = "./" + testCaseName + "_" + testName + "_" + this->rd_.RandomString(20) + "/";
-        if (system((std::string("rm -rf ") + this->path_).c_str())) {}
-        if (system((std::string("mkdir -p ") + this->path_).c_str())) {}
-    }
-    void TearDown() override
-    {
-        if (system((std::string("rm -rf ") + this->path_).c_str())) {}
-        testing::Test::TearDown();
-    }
-    std::string Path() const { return this->path_; }
+struct Config {
+    std::string host{"127.0.0.1"};
+    int32_t port{9088};
+    std::string nameSpace{};
+    bool enableRemoteH2D{true};
 
-private:
-    Random rd_;
-    std::string path_;
+    int32_t deviceId{-1};
+    std::vector<size_t> tensorSizes{};
+    size_t shardSize{0};
+    size_t blockSize{0};
+    size_t objectSize{0};
+
+    size_t timeoutMs{60000};
+    size_t missTimeoutMs{0};
+    size_t waitingQueueDepth{8192};
+    size_t loadWorkerCount{4};
+    size_t recoveryBatchSize{32};
+    size_t hostBufferCount{128};
+    size_t h2dStreamCount{4};
+    size_t backfillWorkerCount{1};
+    size_t backfillQueueDepth{128};
+    size_t reaperQueueDepth{8192};
+    std::vector<ssize_t> cpuAffinityCores{};
+    bool ioDirect{false};
+    std::string posixIoEngine{"psync"};
+
+    StoreV1* storeBackend{nullptr};
 };
 
-}  // namespace UC::Test::Detail
+}  // namespace UC::YuanRongStore
 
 #endif

@@ -1,0 +1,184 @@
+/**
+ * MIT License
+ *
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ * */
+#include <array>
+#include <cstddef>
+#include <gtest/gtest.h>
+#include <string>
+#include <vector>
+#include "yuanrong_helper.h"
+
+namespace {
+
+UC::Detail::BlockId MakeBlock(std::initializer_list<uint8_t> bytes)
+{
+    UC::Detail::BlockId block{};
+    size_t index = 0;
+    for (auto byte : bytes) { block[index++] = static_cast<std::byte>(byte); }
+    return block;
+}
+
+}  // namespace
+
+TEST(YuanRongHelperTest, BuildKeysAndBlobsMapsShardToOneContiguousYuanRongObject)
+{
+    using namespace UC::YuanRongStore;
+
+    Config config;
+    config.nameSpace = "ns";
+    config.deviceId = 3;
+    config.tensorSizes = {64, 96};
+
+    auto block = MakeBlock({0xab, 0xcd});
+    std::array<char, 64> tensor0{};
+    std::array<char, 96> tensor1{};
+    UC::Detail::TaskDesc desc{
+        UC::Detail::Shard{block, 7, {tensor0.data(), tensor1.data()}}
+    };
+
+    std::vector<std::string> keys;
+    std::vector<datasystem::DeviceBlobList> blobLists;
+    auto status = BuildKeysAndBlobs(config, desc, keys, blobLists);
+
+    ASSERT_TRUE(status.Success()) << status.ToString();
+    ASSERT_EQ(keys.size(), 1);
+    EXPECT_EQ(keys[0], "ucm_ns_abcd0000000000000000000000000000_7");
+    ASSERT_EQ(blobLists.size(), 1);
+    EXPECT_EQ(blobLists[0].deviceIdx, 3);
+    EXPECT_EQ(blobLists[0].srcOffset, 0);
+    ASSERT_EQ(blobLists[0].blobs.size(), 2);
+    EXPECT_EQ(blobLists[0].blobs[0].pointer, tensor0.data());
+    EXPECT_EQ(blobLists[0].blobs[0].size, 64);
+    EXPECT_EQ(blobLists[0].blobs[1].pointer, tensor1.data());
+    EXPECT_EQ(blobLists[0].blobs[1].size, 96);
+}
+
+TEST(YuanRongHelperTest, BuildKeysAndBlobsRejectsAddressCountMismatch)
+{
+    using namespace UC::YuanRongStore;
+
+    Config config;
+    config.nameSpace = "ns";
+    config.deviceId = 0;
+    config.tensorSizes = {64, 96};
+    auto block = MakeBlock({0x01});
+    std::array<char, 64> tensor0{};
+    UC::Detail::TaskDesc desc{
+        UC::Detail::Shard{block, 0, {tensor0.data()}}
+    };
+
+    std::vector<std::string> keys;
+    std::vector<datasystem::DeviceBlobList> blobLists;
+    auto status = BuildKeysAndBlobs(config, desc, keys, blobLists);
+
+    EXPECT_TRUE(status.Failure());
+}
+
+TEST(YuanRongHelperTest, FailedIndexesHandlesTotalFailureAndPartialFailure)
+{
+    using namespace UC::YuanRongStore;
+
+    std::vector<std::string> keys{"k0", "k1", "k2"};
+
+    EXPECT_TRUE(FailedIndexes(keys, {}, false).empty());
+
+    auto all = FailedIndexes(keys, {}, true);
+    ASSERT_EQ(all.size(), 3);
+    EXPECT_EQ(all[0], 0);
+    EXPECT_EQ(all[1], 1);
+    EXPECT_EQ(all[2], 2);
+
+    auto partial = FailedIndexes(keys, {"k2", "k0"}, false);
+    ASSERT_EQ(partial.size(), 2);
+    EXPECT_EQ(partial[0], 0);
+    EXPECT_EQ(partial[1], 2);
+}
+
+TEST(YuanRongHelperTest, RecoveryBatchRangesCoverAllIndexesWithoutOverlap)
+{
+    using namespace UC::YuanRongStore;
+
+    auto ranges = RecoveryBatchRanges(119, 32);
+
+    ASSERT_EQ(ranges.size(), 4);
+    EXPECT_EQ(ranges[0], std::make_pair(size_t{0}, size_t{32}));
+    EXPECT_EQ(ranges[1], std::make_pair(size_t{32}, size_t{64}));
+    EXPECT_EQ(ranges[2], std::make_pair(size_t{64}, size_t{96}));
+    EXPECT_EQ(ranges[3], std::make_pair(size_t{96}, size_t{119}));
+    EXPECT_TRUE(RecoveryBatchRanges(0, 32).empty());
+    EXPECT_TRUE(RecoveryBatchRanges(10, 0).empty());
+}
+
+TEST(YuanRongHelperTest, ComposedBufferHeaderMapsPayloadAfterYuanRongHeader)
+{
+    using namespace UC::YuanRongStore;
+
+    std::vector<size_t> tensorSizes{64, 96, 128};
+    std::vector<uint8_t> buffer(YuanRongComposedObjectSize(tensorSizes));
+
+    void* payloadAddress = nullptr;
+    auto initStatus = InitYuanRongComposedBuffer("key-a", buffer.data(), buffer.size(), tensorSizes,
+                                                 payloadAddress);
+    ASSERT_TRUE(initStatus.Success()) << initStatus.ToString();
+
+    const auto headerSize = YuanRongHeaderSize(tensorSizes.size());
+    EXPECT_EQ(payloadAddress, buffer.data() + headerSize);
+
+    auto* offsets = reinterpret_cast<uint64_t*>(buffer.data());
+    EXPECT_EQ(offsets[0], tensorSizes.size());
+    EXPECT_EQ(offsets[1], headerSize);
+    EXPECT_EQ(offsets[2], headerSize + tensorSizes[0]);
+    EXPECT_EQ(offsets[3], headerSize + tensorSizes[0] + tensorSizes[1]);
+    EXPECT_EQ(offsets[4], buffer.size());
+
+    datasystem::MetaInfo metaInfo;
+    metaInfo.blobSizeList = {64, 96, 128};
+    const void* readPayloadAddress = nullptr;
+    auto getStatus = GetYuanRongPayloadAddress("key-a", buffer.data(), buffer.size(), metaInfo,
+                                               tensorSizes, readPayloadAddress);
+    ASSERT_TRUE(getStatus.Success()) << getStatus.ToString();
+    EXPECT_EQ(readPayloadAddress, payloadAddress);
+}
+
+TEST(YuanRongHelperTest, PayloadAddressRejectsInvalidComposedHeader)
+{
+    using namespace UC::YuanRongStore;
+
+    std::vector<size_t> tensorSizes{64, 96};
+    std::vector<uint8_t> buffer(YuanRongComposedObjectSize(tensorSizes));
+    void* payloadAddress = nullptr;
+    ASSERT_TRUE(InitYuanRongComposedBuffer("key-a", buffer.data(), buffer.size(), tensorSizes,
+                                           payloadAddress)
+                    .Success());
+
+    auto* offsets = reinterpret_cast<uint64_t*>(buffer.data());
+    offsets[2] += 1;
+
+    datasystem::MetaInfo metaInfo;
+    metaInfo.blobSizeList = {64, 96};
+    const void* readPayloadAddress = nullptr;
+    auto status = GetYuanRongPayloadAddress("key-a", buffer.data(), buffer.size(), metaInfo,
+                                            tensorSizes, readPayloadAddress);
+    EXPECT_TRUE(status.Failure());
+    EXPECT_EQ(readPayloadAddress, nullptr);
+}
