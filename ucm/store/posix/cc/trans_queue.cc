@@ -26,7 +26,14 @@
 #include "metrics_api.h"
 #include "posix_file.h"
 
+#include <atomic>
+#include <cstdlib>
+
 namespace UC::PosixStore {
+
+namespace {
+bool SkipPosixLoad() { return std::getenv("UCM_POSIX_SKIP_LOAD") != nullptr; }
+}  // namespace
 
 Status TransQueue::Setup(const Config& config, TaskIdSet* failureSet, const SpaceLayout* layout)
 {
@@ -156,6 +163,13 @@ Status TransQueue::H2S(IoUnit& ios)
 Status TransQueue::S2H(IoUnit& ios)
 {
     const auto& path = layout_->DataFilePath(ios.shard.owner, false);
+    if (SkipPosixLoad()) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed)) {
+            UC_WARN("UCM_POSIX_SKIP_LOAD is set. POSIX load reads are bypassed.");
+        }
+        return Status::OK();
+    }
     PosixFile file{path};
     auto flags = PosixFile::OpenFlag::READ_ONLY;
     if (ioDirect_) { flags |= PosixFile::OpenFlag::DIRECT; }
