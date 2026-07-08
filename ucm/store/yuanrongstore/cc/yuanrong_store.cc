@@ -247,6 +247,7 @@ private:
         UC_INFO("{}::Host = {}", name, config.host);
         UC_INFO("{}::Port = {}", name, config.port);
         UC_INFO("{}::Namespace = {}", name, config.nameSpace);
+        UC_INFO("{}::EnableRemoteH2D = {}", name, config.enableRemoteH2D);
         UC_INFO("{}::DeviceId = {}", name, config.deviceId);
         UC_INFO("{}::ObjectSize = {}", name, config.objectSize);
         UC_INFO("{}::TimeoutMs = {}", name, config.timeoutMs);

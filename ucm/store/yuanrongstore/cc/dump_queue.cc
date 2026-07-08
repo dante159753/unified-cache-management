@@ -156,6 +156,8 @@ Status DumpQueue::DumpOne(TaskPtr task, const std::shared_ptr<Trans::Stream>& pr
     if (dumpStatus.IsError()) {
         return Status::Error(fmt::format("YuanRong MSetD2H failed: {}", dumpStatus.ToString()));
     }
+    if (backend_ == nullptr) { return Status::OK(); }
+
     std::vector<bool> exists;
     auto existStatus = heteroClient_->Exist(keys, exists);
     if (existStatus.IsError() || exists.size() != keys.size() ||
@@ -163,7 +165,6 @@ Status DumpQueue::DumpOne(TaskPtr task, const std::shared_ptr<Trans::Stream>& pr
         return Status::Error(
             fmt::format("YuanRong MSetD2H did not publish all keys: {}", existStatus.ToString()));
     }
-    if (backend_ == nullptr) { return Status::OK(); }
 
     std::vector<datasystem::MetaInfo> metaInfos;
     std::vector<std::string> metaFailedKeys;

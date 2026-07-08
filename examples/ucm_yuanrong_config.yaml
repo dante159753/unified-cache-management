@@ -11,7 +11,7 @@ ucm_connectors:
       yuanrong_host: "127.0.0.1"
       yuanrong_port: 9088
       yuanrong_namespace: "ucm_model"
-      yuanrong_enable_remote_h2d: true
+      yuanrong_enable_remote_h2d: false
       yuanrong_timeout_ms: 60000
       # Timeout for the first YuanRong DRAM hit probe before falling back to Posix.
       yuanrong_miss_timeout_ms: 0

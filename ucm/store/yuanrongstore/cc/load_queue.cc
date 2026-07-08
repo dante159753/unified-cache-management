@@ -177,6 +177,9 @@ Status LoadQueue::LoadOne(CopyStream& stream, TaskPtr task)
     const auto firstGetTimeoutMs = backend_ == nullptr ? config_.timeoutMs : config_.missTimeoutMs;
     auto rc = heteroClient_->MGetH2D(keys, blobLists, failedKeys,
                                      static_cast<int32_t>(firstGetTimeoutMs));
+    if (rc.IsError() && backend_ == nullptr) {
+        return Status::Error(fmt::format("YuanRong MGetH2D failed: {}", rc.ToString()));
+    }
     auto missIndexes = FailedIndexes(keys, failedKeys, rc.IsError());
     if (missIndexes.empty()) { return Status::OK(); }
     if (backend_ == nullptr) {
