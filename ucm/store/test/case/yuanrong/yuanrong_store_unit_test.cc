@@ -94,6 +94,43 @@ TEST(YuanRongHelperTest, BuildKeysAndBlobsRejectsAddressCountMismatch)
     EXPECT_TRUE(status.Failure());
 }
 
+TEST(YuanRongHelperTest, DeduplicateYuanRongObjectsKeepsFirstShardForEachKey)
+{
+    using namespace UC::YuanRongStore;
+
+    Config config;
+    config.nameSpace = "ns";
+    config.deviceId = 0;
+    config.tensorSizes = {64};
+    auto block0 = MakeBlock({0x01});
+    auto block1 = MakeBlock({0x02});
+    std::array<char, 64> tensor0{};
+    std::array<char, 64> tensor1{};
+    std::array<char, 64> tensor2{};
+    UC::Detail::TaskDesc desc{
+        UC::Detail::Shard{block0, 0, {tensor0.data()}},
+        UC::Detail::Shard{block1, 0, {tensor1.data()}},
+        UC::Detail::Shard{block0, 0, {tensor2.data()}},
+    };
+
+    std::vector<std::string> keys;
+    std::vector<datasystem::DeviceBlobList> blobLists;
+    auto status = BuildKeysAndBlobs(config, desc, keys, blobLists);
+    ASSERT_TRUE(status.Success()) << status.ToString();
+
+    DeduplicateYuanRongObjects(keys, blobLists, &desc);
+
+    ASSERT_EQ(keys.size(), 2);
+    ASSERT_EQ(blobLists.size(), 2);
+    ASSERT_EQ(desc.size(), 2);
+    EXPECT_EQ(keys[0], "ucm_ns_01000000000000000000000000000000_0");
+    EXPECT_EQ(keys[1], "ucm_ns_02000000000000000000000000000000_0");
+    EXPECT_EQ(blobLists[0].blobs[0].pointer, tensor0.data());
+    EXPECT_EQ(blobLists[1].blobs[0].pointer, tensor1.data());
+    EXPECT_EQ(desc[0].addrs[0], tensor0.data());
+    EXPECT_EQ(desc[1].addrs[0], tensor1.data());
+}
+
 TEST(YuanRongHelperTest, FailedIndexesHandlesTotalFailureAndPartialFailure)
 {
     using namespace UC::YuanRongStore;

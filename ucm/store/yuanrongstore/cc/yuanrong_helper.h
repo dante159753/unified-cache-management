@@ -92,6 +92,30 @@ inline Status BuildKeysAndBlobs(const Config& config, const Detail::TaskDesc& de
     return Status::OK();
 }
 
+inline void DeduplicateYuanRongObjects(std::vector<std::string>& keys,
+                                       std::vector<datasystem::DeviceBlobList>& blobLists,
+                                       Detail::TaskDesc* desc = nullptr)
+{
+    std::unordered_set<std::string> seen;
+    seen.reserve(keys.size());
+    std::vector<std::string> uniqueKeys;
+    std::vector<datasystem::DeviceBlobList> uniqueBlobLists;
+    Detail::TaskDesc uniqueDesc;
+    uniqueKeys.reserve(keys.size());
+    uniqueBlobLists.reserve(blobLists.size());
+    if (desc != nullptr) { uniqueDesc.reserve(desc->size()); }
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (!seen.insert(keys[i]).second) { continue; }
+        uniqueKeys.push_back(std::move(keys[i]));
+        uniqueBlobLists.push_back(std::move(blobLists[i]));
+        if (desc != nullptr) { uniqueDesc.push_back(std::move((*desc)[i])); }
+    }
+    keys = std::move(uniqueKeys);
+    blobLists = std::move(uniqueBlobLists);
+    if (desc != nullptr) { *desc = std::move(uniqueDesc); }
+}
+
 inline std::vector<size_t> FailedIndexes(const std::vector<std::string>& keys,
                                          const std::vector<std::string>& failedKeys,
                                          bool requestFailed)

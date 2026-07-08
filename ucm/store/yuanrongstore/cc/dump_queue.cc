@@ -32,6 +32,40 @@
 #include "yuanrong_helper.h"
 
 namespace UC::YuanRongStore {
+namespace {
+
+bool IsKeyDuplicatedStatus(const datasystem::Status& status)
+{
+    auto message = status.ToString();
+    return message.find("Key duplicated") != std::string::npos ||
+           message.find("duplicate object key") != std::string::npos;
+}
+
+Status FilterMissingKeys(datasystem::HeteroClient& client, const std::vector<std::string>& keys,
+                         std::vector<datasystem::DeviceBlobList>& blobLists,
+                         std::vector<std::string>& missingKeys,
+                         std::vector<datasystem::DeviceBlobList>& missingBlobLists)
+{
+    std::vector<bool> exists;
+    auto existStatus = client.Exist(keys, exists);
+    if (existStatus.IsError() || exists.size() != keys.size()) {
+        return Status::Error(fmt::format("YuanRong Exist before D2H failed: {}",
+                                         existStatus.ToString()));
+    }
+
+    missingKeys.clear();
+    missingBlobLists.clear();
+    missingKeys.reserve(keys.size());
+    missingBlobLists.reserve(blobLists.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (exists[i]) { continue; }
+        missingKeys.push_back(keys[i]);
+        missingBlobLists.push_back(std::move(blobLists[i]));
+    }
+    return Status::OK();
+}
+
+}  // namespace
 
 DumpQueue::~DumpQueue() { Close(); }
 
@@ -147,14 +181,27 @@ Status DumpQueue::DumpOne(TaskPtr task, const std::shared_ptr<Trans::Stream>& pr
     auto s = BuildKeysAndBlobs(config_, task->desc, keys, blobLists);
     if (s.Failure()) { return s; }
     if (keys.empty()) { return Status::OK(); }
+    DeduplicateYuanRongObjects(keys, blobLists, &task->desc);
+
+    std::vector<std::string> missingKeys;
+    std::vector<datasystem::DeviceBlobList> missingBlobLists;
+    s = FilterMissingKeys(*heteroClient_, keys, blobLists, missingKeys, missingBlobLists);
+    if (s.Failure()) { return s; }
 
     datasystem::SetParam setParam;
     setParam.writeMode = datasystem::WriteMode::NONE_L2_CACHE_EVICT;
     setParam.existence = datasystem::ExistenceOpt::NONE;
     setParam.cacheType = datasystem::CacheType::MEMORY;
-    auto dumpStatus = heteroClient_->MSetD2H(keys, blobLists, setParam);
-    if (dumpStatus.IsError()) {
-        return Status::Error(fmt::format("YuanRong MSetD2H failed: {}", dumpStatus.ToString()));
+    if (!missingKeys.empty()) {
+        auto dumpStatus = heteroClient_->MSetD2H(missingKeys, missingBlobLists, setParam);
+        if (dumpStatus.IsError()) {
+            if (IsKeyDuplicatedStatus(dumpStatus)) {
+                UC_WARN("YuanRong MSetD2H hit duplicated keys: {}", dumpStatus.ToString());
+            } else {
+                return Status::Error(
+                    fmt::format("YuanRong MSetD2H failed: {}", dumpStatus.ToString()));
+            }
+        }
     }
     if (backend_ == nullptr) { return Status::OK(); }
 
