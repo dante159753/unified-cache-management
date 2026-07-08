@@ -167,6 +167,7 @@ void LoadQueue::RunOne(CopyStream& stream, TaskPair&& pair)
 
 Status LoadQueue::LoadOne(CopyStream& stream, TaskPtr task)
 {
+    auto taskStart = NowTime::Now();
     std::vector<std::string> keys;
     std::vector<datasystem::DeviceBlobList> blobLists;
     auto s = BuildKeysAndBlobs(config_, task->desc, keys, blobLists);
@@ -175,18 +176,38 @@ Status LoadQueue::LoadOne(CopyStream& stream, TaskPtr task)
 
     std::vector<std::string> failedKeys;
     const auto firstGetTimeoutMs = backend_ == nullptr ? config_.timeoutMs : config_.missTimeoutMs;
+    auto getStart = NowTime::Now();
     auto rc = heteroClient_->MGetH2D(keys, blobLists, failedKeys,
                                      static_cast<int32_t>(firstGetTimeoutMs));
+    auto getEnd = NowTime::Now();
     if (rc.IsError() && backend_ == nullptr) {
         return Status::Error(fmt::format("YuanRong MGetH2D failed: {}", rc.ToString()));
     }
     auto missIndexes = FailedIndexes(keys, failedKeys, rc.IsError());
-    if (missIndexes.empty()) { return Status::OK(); }
+    const auto totalBytes = TotalBlobBytes(blobLists);
+    UC_DEBUG(
+        "YuanRong load task({}) MGetH2D keys={}, miss={}, bytes={}, timeout={}ms, cost={:.3f}ms, "
+        "rc={}.",
+        task->id, keys.size(), missIndexes.size(), totalBytes, firstGetTimeoutMs,
+        (getEnd - getStart) * 1e3, rc.ToString());
+    if (missIndexes.empty()) {
+        UC_DEBUG("YuanRong load task({}) all hit, total={:.3f}ms.", task->id,
+                 (NowTime::Now() - taskStart) * 1e3);
+        return Status::OK();
+    }
     if (backend_ == nullptr) {
         return Status::Error(
             fmt::format("YuanRong miss({}) and no backend is configured", missIndexes.size()));
     }
-    return RecoverFromBackend(stream, task, keys, blobLists, missIndexes);
+    auto recoverStart = NowTime::Now();
+    auto recoverStatus = RecoverFromBackend(stream, task, keys, blobLists, missIndexes);
+    auto recoverEnd = NowTime::Now();
+    UC_DEBUG(
+        "YuanRong load task({}) recovered miss={}, recover={:.3f}ms, total={:.3f}ms, "
+        "status={}.",
+        task->id, missIndexes.size(), (recoverEnd - recoverStart) * 1e3,
+        (recoverEnd - taskStart) * 1e3, recoverStatus.ToString());
+    return recoverStatus;
 }
 
 Status LoadQueue::RecoverFromBackend(CopyStream& stream, TaskPtr task,
@@ -249,6 +270,7 @@ LoadQueue::HostBatch LoadQueue::PrepareHostBatch(TaskPtr task, const std::vector
     batch.hostBuffers.reserve(end - begin);
     Detail::TaskDesc backendTask;
     backendTask.brief = "Posix2Host";
+    auto prepareStart = NowTime::Now();
     for (size_t i = begin; i < end; ++i) {
         const auto index = missIndexes[i];
         auto host = hostBufferPool_.Acquire(std::chrono::milliseconds(config_.timeoutMs));
@@ -264,12 +286,17 @@ LoadQueue::HostBatch LoadQueue::PrepareHostBatch(TaskPtr task, const std::vector
     }
 
     auto backendResult = backend_->Load(std::move(backendTask));
+    auto submitEnd = NowTime::Now();
     if (!backendResult) {
         batch.status = Status::Error(
             fmt::format("failed to submit Posix host load: {}", backendResult.Error().ToString()));
         return batch;
     }
     batch.backendTaskHandle = backendResult.Value();
+    UC_DEBUG(
+        "YuanRong host load task({}) prepared batch({} blocks), submit backend task({}), "
+        "cost {:.3f}ms.",
+        task->id, batch.indexes.size(), batch.backendTaskHandle, (submitEnd - prepareStart) * 1e3);
     return batch;
 }
 
@@ -301,6 +328,7 @@ Status LoadQueue::FinalizeHostBatch(CopyStream& stream,
              batch.indexes.size(), (h2dStart - waitStart) * 1e3, (h2dEnd - h2dStart) * 1e3);
 
     backfillQueue_.Submit(BackfillTask{std::move(batch.keys), std::move(batch.hostBuffers)});
+    UC_DEBUG("YuanRong host batch({}) async backfill submitted.", batch.indexes.size());
     return Status::OK();
 }
 

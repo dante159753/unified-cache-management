@@ -116,6 +116,15 @@ inline void DeduplicateYuanRongObjects(std::vector<std::string>& keys,
     if (desc != nullptr) { *desc = std::move(uniqueDesc); }
 }
 
+inline size_t TotalBlobBytes(const std::vector<datasystem::DeviceBlobList>& blobLists)
+{
+    size_t total = 0;
+    for (const auto& blobList : blobLists) {
+        for (const auto& blob : blobList.blobs) { total += blob.size; }
+    }
+    return total;
+}
+
 inline std::vector<size_t> FailedIndexes(const std::vector<std::string>& keys,
                                          const std::vector<std::string>& failedKeys,
                                          bool requestFailed)

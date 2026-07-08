@@ -119,7 +119,9 @@ void BackfillQueue::RunOne(BackfillTask& task)
     const auto composedSize = YuanRongComposedObjectSize(config_.tensorSizes);
     std::vector<uint64_t> objectSizes(task.keys.size(), composedSize);
     std::vector<std::shared_ptr<datasystem::Buffer>> buffers;
+    auto createStart = NowTime::Now();
     auto createStatus = kvClient_->MCreate(task.keys, objectSizes, param, buffers);
+    auto createEnd = NowTime::Now();
     if (createStatus.IsError() || buffers.size() != task.keys.size()) {
         UC_ERROR("YuanRong async backfill MCreate failed for ({} keys): {}.", task.keys.size(),
                  createStatus.ToString());
@@ -147,14 +149,19 @@ void BackfillQueue::RunOne(BackfillTask& task)
     }
 
     if (created.empty()) { return; }
+    auto setStart = NowTime::Now();
     auto publishStatus = kvClient_->MSet(created);
+    auto setEnd = NowTime::Now();
     if (publishStatus.IsError()) {
         UC_ERROR("YuanRong async backfill MSet failed for ({} keys): {}.", created.size(),
                  publishStatus.ToString());
         return;
     }
-    UC_DEBUG("YuanRong async backfill({} keys) finished, cost {:.3f}ms.", task.keys.size(),
-             (NowTime::Now() - start) * 1e3);
+    UC_DEBUG(
+        "YuanRong async backfill({} keys) finished, mcreate={:.3f}ms, copy={:.3f}ms, "
+        "mset={:.3f}ms, total={:.3f}ms.",
+        task.keys.size(), (createEnd - createStart) * 1e3, (setStart - createEnd) * 1e3,
+        (setEnd - setStart) * 1e3, (setEnd - start) * 1e3);
 }
 
 }  // namespace UC::YuanRongStore
