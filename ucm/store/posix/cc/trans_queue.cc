@@ -37,6 +37,7 @@ Status TransQueue::Setup(const Config& config, TaskIdSet* failureSet, const Spac
     nShardPerBlock_ = config.blockSize / config.shardSize;
     ioDirect_ = config.ioDirect;
     timeoutMs_ = config.timeoutMs;
+    storageSlowdown_.Setup(config);
     auto success =
         loadPool_.SetNWorker(config.dataTransConcurrency)
             .SetWorkerFn([this](auto& ios, auto&) { LoadWorker(ios); })
@@ -148,6 +149,7 @@ Status TransQueue::H2S(IoUnit& ios)
             UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("posix_io_errors_total"), 1.0);
             return s;
         }
+        storageSlowdown_.ApplyWrite(ioSize_);
         offset += ioSize_;
     }
     return Status::OK();
@@ -173,6 +175,7 @@ Status TransQueue::S2H(IoUnit& ios)
             UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("posix_io_errors_total"), 1.0);
             return s;
         }
+        storageSlowdown_.ApplyRead(ioSize_);
         offset += ioSize_;
     }
     return Status::OK();

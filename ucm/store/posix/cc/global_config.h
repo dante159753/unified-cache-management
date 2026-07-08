@@ -52,6 +52,10 @@ struct Config {
     double posixGcTriggerThresholdRatio{0.7};
     size_t posixGcMaxRecycleCountPerShard{50000};
     double posixGcShardSampleRatio{0.1};
+    double storageSlowdownReadDelayMs{0.0};
+    double storageSlowdownWriteDelayMs{0.0};
+    double storageSlowdownReadBandwidthMBps{0.0};
+    double storageSlowdownWriteBandwidthMBps{0.0};
 };
 
 }  // namespace UC::PosixStore

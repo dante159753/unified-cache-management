@@ -38,6 +38,10 @@ public:
             auto keyObj = item.first;
             auto valObj = item.second;
             std::string key = pybind11::cast<std::string>(keyObj);
+            if (key == "storage_slowdown") {
+                if (TryParseStorageSlowdown(dictionary, key, valObj)) { continue; }
+                return Status::InvalidParam("Unsupported storage_slowdown config");
+            }
             if (TryParseScalar(dictionary, key, valObj)) { continue; }
             if (pybind11::isinstance<pybind11::list>(valObj) &&
                 TryParseList(dictionary, key, pybind11::cast<pybind11::list>(valObj))) {
@@ -103,6 +107,43 @@ private:
             return true;
         }
         return false;
+    }
+    static bool IsStorageSlowdownKey(const std::string& key)
+    {
+        return key == "read_delay_ms" || key == "write_delay_ms" ||
+               key == "read_bandwidth_mb_s" || key == "write_bandwidth_mb_s";
+    }
+    static bool TryParseStorageSlowdownNumber(Detail::Dictionary& dictionary,
+                                              const std::string& key,
+                                              const pybind11::handle& obj)
+    {
+        if (pybind11::isinstance<pybind11::bool_>(obj)) { return false; }
+        if (pybind11::isinstance<pybind11::int_>(obj)) {
+            dictionary.SetNumber(key, pybind11::cast<ssize_t>(obj));
+            return true;
+        }
+        if (pybind11::isinstance<pybind11::float_>(obj)) {
+            dictionary.Set(key, pybind11::cast<double>(obj));
+            return true;
+        }
+        return false;
+    }
+    static bool TryParseStorageSlowdown(Detail::Dictionary& dictionary, const std::string& key,
+                                        const pybind11::handle& obj)
+    {
+        if (key != "storage_slowdown" || !pybind11::isinstance<pybind11::dict>(obj)) {
+            return false;
+        }
+        auto dict = pybind11::cast<pybind11::dict>(obj);
+        for (auto item : dict) {
+            auto name = pybind11::cast<std::string>(item.first);
+            if (!IsStorageSlowdownKey(name)) { return false; }
+            auto prefixed = std::string("storage_slowdown_") + name;
+            if (!TryParseStorageSlowdownNumber(dictionary, prefixed, item.second)) {
+                return false;
+            }
+        }
+        return true;
     }
 };
 

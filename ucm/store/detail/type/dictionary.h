@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <any>
 #include <string>
+#include <typeinfo>
 #include <unordered_map>
 #include <vector>
 
@@ -62,6 +63,21 @@ public:
     void GetNumber(const std::string& key, T& target) const
     {
         if (Contains(key)) { target = static_cast<T>(Get<ssize_t>(key)); }
+    }
+    template <typename T>
+    void GetNumeric(const std::string& key, T& target) const
+    {
+        if (!Contains(key)) { return; }
+        const auto& value = data_.find(key)->second;
+        if (value.type() == typeid(ssize_t)) {
+            target = static_cast<T>(std::any_cast<ssize_t>(value));
+            return;
+        }
+        if (value.type() == typeid(double)) {
+            target = static_cast<T>(std::any_cast<double>(value));
+            return;
+        }
+        target = std::any_cast<T>(value);
     }
     template <typename T>
     void GetNumbers(const std::string& key, std::vector<T>& target) const

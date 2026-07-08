@@ -125,6 +125,14 @@ private:
         inConfig.GetNumber("posix_gc_max_recycle_count_per_shard",
                            config.posixGcMaxRecycleCountPerShard);
         inConfig.Get("posix_gc_shard_sample_ratio", config.posixGcShardSampleRatio);
+        inConfig.GetNumeric("storage_slowdown_read_delay_ms",
+                            config.storageSlowdownReadDelayMs);
+        inConfig.GetNumeric("storage_slowdown_write_delay_ms",
+                            config.storageSlowdownWriteDelayMs);
+        inConfig.GetNumeric("storage_slowdown_read_bandwidth_mb_s",
+                            config.storageSlowdownReadBandwidthMBps);
+        inConfig.GetNumeric("storage_slowdown_write_bandwidth_mb_s",
+                            config.storageSlowdownWriteBandwidthMBps);
         return config;
     }
     Status CheckConfig(const Config& config)
@@ -145,6 +153,15 @@ private:
             if (core < 0 || core >= CPU_SETSIZE) {
                 return Status::InvalidParam("invalid cpu core({})", core);
             }
+        }
+        if (config.storageSlowdownReadDelayMs < 0.0 || config.storageSlowdownWriteDelayMs < 0.0 ||
+            config.storageSlowdownReadBandwidthMBps < 0.0 ||
+            config.storageSlowdownWriteBandwidthMBps < 0.0) {
+            return Status::InvalidParam("invalid storage slowdown({},{},{},{})",
+                                        config.storageSlowdownReadDelayMs,
+                                        config.storageSlowdownWriteDelayMs,
+                                        config.storageSlowdownReadBandwidthMBps,
+                                        config.storageSlowdownWriteBandwidthMBps);
         }
         if (config.deviceId == -1) { return Status::OK(); }
         if (config.tensorSize == 0 || config.shardSize < config.tensorSize ||
@@ -226,6 +243,19 @@ private:
             UC_INFO("Set {}::PosixGcMaxRecycleCountPerShard to {}.", ns,
                     config.posixGcMaxRecycleCountPerShard);
             UC_INFO("Set {}::PosixGcShardSampleRatio to {}.", ns, config.posixGcShardSampleRatio);
+        }
+        if (config.storageSlowdownReadDelayMs > 0.0 ||
+            config.storageSlowdownWriteDelayMs > 0.0 ||
+            config.storageSlowdownReadBandwidthMBps > 0.0 ||
+            config.storageSlowdownWriteBandwidthMBps > 0.0) {
+            UC_INFO("Set {}::StorageSlowdownReadDelayMs to {}.", ns,
+                    config.storageSlowdownReadDelayMs);
+            UC_INFO("Set {}::StorageSlowdownWriteDelayMs to {}.", ns,
+                    config.storageSlowdownWriteDelayMs);
+            UC_INFO("Set {}::StorageSlowdownReadBandwidthMBps to {}.", ns,
+                    config.storageSlowdownReadBandwidthMBps);
+            UC_INFO("Set {}::StorageSlowdownWriteBandwidthMBps to {}.", ns,
+                    config.storageSlowdownWriteBandwidthMBps);
         }
     }
 };

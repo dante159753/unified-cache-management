@@ -34,6 +34,7 @@
 #include "block_operator.h"
 #include "logger/logger.h"
 #include "metrics_api.h"
+#include "storage_slowdown.h"
 #include "template/task_wrapper.h"
 #include "trans_task.h"
 
@@ -54,6 +55,7 @@ class IoEngineAio : public Detail::TaskWrapper<TransTask, Detail::TaskHandle> {
     std::mutex regMutex_;
     std::unordered_map<Detail::TaskHandle, Inflight> registry_;
     BlockOperator blockOperator_;
+    StorageSlowdown storageSlowdown_;
     AioImpl aio_;
 
 public:
@@ -63,6 +65,7 @@ public:
         shardSize_ = config.shardSize;
         nShardPerBlock_ = config.blockSize / config.shardSize;
         layout_ = layout;
+        storageSlowdown_.Setup(config);
         blockOperator_.Setup(layout, config.openConcurrency, config.commitConcurrency);
         aio_.SetSweepFn([this] { SweepDeadlines(); });
         UC_INFO(
@@ -108,6 +111,10 @@ private:
             UC_ERROR("Failed({}) to do io on block({}).", result.error, id);
             if (result.error != ECANCELED) { IncrementIoErrorMetric(); }
             failureSet_.Insert(tid);
+        } else if constexpr (dump) {
+            storageSlowdown_.ApplyWrite(static_cast<size_t>(result.nBytes));
+        } else {
+            storageSlowdown_.ApplyRead(static_cast<size_t>(result.nBytes));
         }
         ::close(fd);
         if constexpr (dump) {

@@ -58,6 +58,20 @@ UC::Detail::Dictionary MakeAioConfig(const std::string& path, size_t timeoutMs =
     return config;
 }
 
+UC::Detail::Dictionary MakePsyncConfig(const std::string& path, size_t dataSize)
+{
+    UC::Detail::Dictionary config;
+    config.SetNumber("device_id", 0);
+    config.Set("storage_backends", std::vector<std::string>{path});
+    config.SetNumber("tensor_size", dataSize);
+    config.SetNumber("shard_size", dataSize);
+    config.SetNumber("block_size", dataSize);
+    config.Set("posix_io_engine", std::string("psync"));
+    config.SetNumber("posix_data_trans_concurrency", size_t(1));
+    config.SetNumber("data_dir_shard_bytes", size_t(0));
+    return config;
+}
+
 BufferPtr MakeAlignedBuffer(size_t marker)
 {
     void* buffer = nullptr;
@@ -160,6 +174,13 @@ TEST_F(UCPosixStoreTest, SetupWithInvalidParam)
     using namespace UC::PosixStore;
     {
         UC::Detail::Dictionary config;
+        PosixStore store;
+        ASSERT_EQ(store.Setup(config), UC::Status::InvalidParam());
+    }
+    {
+        UC::Detail::Dictionary config;
+        config.Set("storage_backends", std::vector<std::string>{Path()});
+        config.Set("storage_slowdown_read_delay_ms", -1.0);
         PosixStore store;
         ASSERT_EQ(store.Setup(config), UC::Status::InvalidParam());
     }
@@ -273,6 +294,63 @@ TEST_F(UCPosixStoreTest, DumpThenLoadWithIoDirect)
     ASSERT_EQ(*(size_t*)buffer1, *(size_t*)buffer2);
     free(buffer1);
     free(buffer2);
+}
+
+TEST_F(UCPosixStoreTest, StorageSlowdownDelaysPsyncDump)
+{
+    using namespace UC::PosixStore;
+    constexpr size_t dataSize = 4096;
+    auto config = MakePsyncConfig(Path(), dataSize);
+    config.SetNumber("storage_slowdown_write_delay_ms", size_t(40));
+    PosixStore store;
+    ASSERT_EQ(store.Setup(config), UC::Status::OK());
+    auto block = UC::Test::Detail::TypesHelper::MakeBlockIdRandomly();
+    UC::Test::Detail::DataGenerator data{1, dataSize};
+    data.GenerateRandom();
+    UC::Detail::TaskDesc desc;
+    desc.brief = "SlowDump";
+    desc.push_back(UC::Detail::Shard{block, 0, {data.Buffer()}});
+
+    auto start = std::chrono::steady_clock::now();
+    auto handle = store.Dump(std::move(desc));
+    ASSERT_TRUE(handle.HasValue());
+    ASSERT_EQ(store.Wait(handle.Value()), UC::Status::OK());
+    auto elapsed = std::chrono::steady_clock::now() - start;
+
+    ASSERT_GE(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(), 30);
+}
+
+TEST_F(UCPosixStoreTest, StorageSlowdownDelaysPsyncLoad)
+{
+    using namespace UC::PosixStore;
+    constexpr size_t dataSize = 4096;
+    auto config = MakePsyncConfig(Path(), dataSize);
+    config.SetNumber("storage_slowdown_read_delay_ms", size_t(40));
+    PosixStore store;
+    ASSERT_EQ(store.Setup(config), UC::Status::OK());
+    auto block = UC::Test::Detail::TypesHelper::MakeBlockIdRandomly();
+    UC::Test::Detail::DataGenerator src{1, dataSize};
+    src.GenerateRandom();
+    UC::Detail::TaskDesc dumpDesc;
+    dumpDesc.brief = "DumpBeforeSlowLoad";
+    dumpDesc.push_back(UC::Detail::Shard{block, 0, {src.Buffer()}});
+    auto dumpHandle = store.Dump(std::move(dumpDesc));
+    ASSERT_TRUE(dumpHandle.HasValue());
+    ASSERT_EQ(store.Wait(dumpHandle.Value()), UC::Status::OK());
+    UC::Test::Detail::DataGenerator dst{1, dataSize};
+    dst.Generate();
+    UC::Detail::TaskDesc loadDesc;
+    loadDesc.brief = "SlowLoad";
+    loadDesc.push_back(UC::Detail::Shard{block, 0, {dst.Buffer()}});
+
+    auto start = std::chrono::steady_clock::now();
+    auto loadHandle = store.Load(std::move(loadDesc));
+    ASSERT_TRUE(loadHandle.HasValue());
+    ASSERT_EQ(store.Wait(loadHandle.Value()), UC::Status::OK());
+    auto elapsed = std::chrono::steady_clock::now() - start;
+
+    ASSERT_GE(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(), 30);
+    ASSERT_EQ(src.Compare(dst), 0);
 }
 
 TEST_F(UCPosixStoreTest, AioWaitTimesOutWhenOpenStalls)

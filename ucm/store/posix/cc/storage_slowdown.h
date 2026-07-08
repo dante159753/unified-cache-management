@@ -21,53 +21,42 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  * */
-#ifndef UNIFIEDCACHE_POSIX_STORE_CC_TRANS_QUEUE_H
-#define UNIFIEDCACHE_POSIX_STORE_CC_TRANS_QUEUE_H
+#ifndef UNIFIEDCACHE_POSIX_STORE_CC_STORAGE_SLOWDOWN_H
+#define UNIFIEDCACHE_POSIX_STORE_CC_STORAGE_SLOWDOWN_H
 
+#include <chrono>
+#include <thread>
 #include "global_config.h"
-#include "space_layout.h"
-#include "storage_slowdown.h"
-#include "template/hashset.h"
-#include "thread/latch.h"
-#include "thread/thread_pool.h"
-#include "trans_task.h"
 
 namespace UC::PosixStore {
 
-class TransQueue {
-    using TaskIdSet = HashSet<Detail::TaskHandle>;
-    using TaskPtr = std::shared_ptr<TransTask>;
-    using WaiterPtr = std::shared_ptr<Latch>;
-
-private:
-    struct IoUnit {
-        Detail::TaskHandle owner;
-        Detail::Shard shard;
-        std::shared_ptr<Latch> waiter;
-        bool firstIo{false};
-    };
-    TaskIdSet* failureSet_;
-    const SpaceLayout* layout_;
-    ThreadPool<IoUnit> loadPool_;
-    ThreadPool<IoUnit> dumpPool_;
-    size_t ioSize_;
-    size_t shardSize_;
-    size_t nShardPerBlock_;
-    bool ioDirect_;
-    size_t timeoutMs_;
-    StorageSlowdown storageSlowdown_;
-
+class StorageSlowdown {
 public:
-    Status Setup(const Config& config, TaskIdSet* failureSet, const SpaceLayout* layout);
-    void Push(TaskPtr task, WaiterPtr waiter);
-    void Cancel(TaskPtr task);
+    void Setup(const Config& config)
+    {
+        readDelayMs_ = config.storageSlowdownReadDelayMs;
+        writeDelayMs_ = config.storageSlowdownWriteDelayMs;
+        readBandwidthMBps_ = config.storageSlowdownReadBandwidthMBps;
+        writeBandwidthMBps_ = config.storageSlowdownWriteBandwidthMBps;
+    }
+    void ApplyRead(size_t bytes) const { Apply(readDelayMs_, readBandwidthMBps_, bytes); }
+    void ApplyWrite(size_t bytes) const { Apply(writeDelayMs_, writeBandwidthMBps_, bytes); }
 
 private:
-    void LoadWorker(IoUnit& ios);
-    void DumpWorker(IoUnit& ios);
-    void OnIoUnitTimeout(IoUnit& ios);
-    Status H2S(IoUnit& ios);
-    Status S2H(IoUnit& ios);
+    static void Apply(double delayMs, double bandwidthMBps, size_t bytes)
+    {
+        auto sleepMs = delayMs;
+        if (bandwidthMBps > 0.0 && bytes > 0) {
+            sleepMs += static_cast<double>(bytes) * 1000.0 / (bandwidthMBps * 1024.0 * 1024.0);
+        }
+        if (sleepMs <= 0.0) { return; }
+        std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(sleepMs));
+    }
+
+    double readDelayMs_{0.0};
+    double writeDelayMs_{0.0};
+    double readBandwidthMBps_{0.0};
+    double writeBandwidthMBps_{0.0};
 };
 
 }  // namespace UC::PosixStore

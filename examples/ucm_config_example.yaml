@@ -18,6 +18,11 @@ ucm_connectors:
       io_direct: false
       # cache_buffer_capacity_gb: 256
       # posix_capacity_gb: 1024
+      # storage_slowdown:
+      #   read_delay_ms: 0
+      #   write_delay_ms: 0
+      #   read_bandwidth_mb_s: 0
+      #   write_bandwidth_mb_s: 0
 
       # Enable GPUDirect RDMA transfers for CacheStore/PcStore H2D and D2H copies.
       # This requires an RDMA-capable NIC, a working GPUDirect RDMA environment,
