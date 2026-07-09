@@ -175,29 +175,25 @@ Status LoadQueue::LoadOne(CopyStream& stream, TaskPtr task)
     if (keys.empty()) { return Status::OK(); }
 
     std::vector<std::string> failedKeys;
-    const auto firstGetTimeoutMs = backend_ == nullptr ? config_.timeoutMs : config_.missTimeoutMs;
+    constexpr int32_t mgetTimeoutMs = 0;
     auto getStart = NowTime::Now();
-    auto rc = heteroClient_->MGetH2D(keys, blobLists, failedKeys,
-                                     static_cast<int32_t>(firstGetTimeoutMs));
+    auto rc = heteroClient_->MGetH2D(keys, blobLists, failedKeys, mgetTimeoutMs);
     auto getEnd = NowTime::Now();
-    if (rc.IsError() && backend_ == nullptr) {
-        return Status::Error(fmt::format("YuanRong MGetH2D failed: {}", rc.ToString()));
-    }
     auto missIndexes = FailedIndexes(keys, failedKeys, rc.IsError());
-    const auto totalBytes = TotalBlobBytes(blobLists);
     UC_DEBUG(
-        "YuanRong load task({}) MGetH2D keys={}, miss={}, bytes={}, timeout={}ms, cost={:.3f}ms, "
+        "YuanRong load task({}) MGetH2D keys={}, miss={}, timeout={}ms, cost={:.3f}ms, "
         "rc={}.",
-        task->id, keys.size(), missIndexes.size(), totalBytes, firstGetTimeoutMs,
-        (getEnd - getStart) * 1e3, rc.ToString());
+        task->id, keys.size(), missIndexes.size(), mgetTimeoutMs, (getEnd - getStart) * 1e3,
+        rc.ToString());
     if (missIndexes.empty()) {
         UC_DEBUG("YuanRong load task({}) all hit, total={:.3f}ms.", task->id,
                  (NowTime::Now() - taskStart) * 1e3);
         return Status::OK();
     }
     if (backend_ == nullptr) {
-        return Status::Error(
-            fmt::format("YuanRong miss({}) and no backend is configured", missIndexes.size()));
+        return Status::Error(fmt::format("YuanRong MGetH2D miss({}/{}) and no backend is "
+                                         "configured: {}",
+                                         missIndexes.size(), keys.size(), rc.ToString()));
     }
     auto recoverStart = NowTime::Now();
     auto recoverStatus = RecoverFromBackend(stream, task, keys, blobLists, missIndexes);

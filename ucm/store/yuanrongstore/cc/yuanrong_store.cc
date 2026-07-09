@@ -180,7 +180,6 @@ private:
         input.GetNumber("shard_size", config.shardSize);
         input.GetNumber("block_size", config.blockSize);
         input.GetNumber("yuanrong_timeout_ms", config.timeoutMs);
-        input.GetNumber("yuanrong_miss_timeout_ms", config.missTimeoutMs);
         input.GetNumber("yuanrong_waiting_queue_depth", config.waitingQueueDepth);
         input.GetNumber("yuanrong_load_worker_count", config.loadWorkerCount);
         input.GetNumber("yuanrong_recovery_batch_size", config.recoveryBatchSize);
@@ -216,9 +215,6 @@ private:
         if (config.timeoutMs > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
             return Status::InvalidParam("yuanrong_timeout_ms is too large");
         }
-        if (config.missTimeoutMs > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
-            return Status::InvalidParam("yuanrong_miss_timeout_ms is too large");
-        }
         if (config.waitingQueueDepth <= 1 || config.loadWorkerCount == 0 ||
             config.recoveryBatchSize == 0 || config.hostBufferCount < config.recoveryBatchSize ||
             config.hostBufferCount >= std::numeric_limits<uint32_t>::max() ||
@@ -251,7 +247,6 @@ private:
         UC_INFO("{}::DeviceId = {}", name, config.deviceId);
         UC_INFO("{}::ObjectSize = {}", name, config.objectSize);
         UC_INFO("{}::TimeoutMs = {}", name, config.timeoutMs);
-        UC_INFO("{}::MissTimeoutMs = {}", name, config.missTimeoutMs);
         UC_INFO("{}::LoadWorkerCount = {}", name, config.loadWorkerCount);
         UC_INFO("{}::RecoveryBatchSize = {}", name, config.recoveryBatchSize);
         UC_INFO("{}::HostBufferCount = {}", name, config.hostBufferCount);

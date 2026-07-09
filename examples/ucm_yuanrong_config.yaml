@@ -7,14 +7,12 @@
 ucm_connectors:
   - ucm_connector_name: "UcmPipelineStore"
     ucm_connector_config:
-      store_pipeline: "YuanRong|Posix"
+      store_pipeline: "YuanRong"
       yuanrong_host: "127.0.0.1"
-      yuanrong_port: 9088
+      yuanrong_port: 18481
       yuanrong_namespace: "ucm_model"
       yuanrong_enable_remote_h2d: false
       yuanrong_timeout_ms: 60000
-      # Timeout for the first YuanRong DRAM hit probe before falling back to Posix.
-      yuanrong_miss_timeout_ms: 0
       yuanrong_waiting_queue_depth: 8192
       yuanrong_load_worker_count: 4
       # Posix cold recovery pipeline batch size.

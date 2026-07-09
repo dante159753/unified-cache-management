@@ -44,7 +44,6 @@ struct Config {
     size_t objectSize{0};
 
     size_t timeoutMs{60000};
-    size_t missTimeoutMs{0};
     size_t waitingQueueDepth{8192};
     size_t loadWorkerCount{4};
     size_t recoveryBatchSize{32};
