@@ -17,7 +17,7 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.core.sched.output import SchedulerOutput
 
 from ucm.integration.vllm.device import create_device
-from ucm.integration.vllm.ucm_connector import UCMDirectConnector
+from ucm.integration.vllm.ucm_connector import PendingLoadTask, UCMDirectConnector
 from ucm.logger import init_logger
 from ucm.shared.metrics import ucmmetrics
 from ucm.sparse.utils import round_up
@@ -246,6 +246,10 @@ class FAWARequestMeta:
     num_token_ids: int = 0
     vllm_block_ids: tuple[list[int], ...] = field(default_factory=tuple)
     token_processed: int = 0
+    do_async_load: bool = False
+    load_async_pending: bool = False
+    async_loaded: bool = False
+    async_vllm_block_ids: tuple[list[int], ...] = field(default_factory=tuple)
 
 
 @dataclass
@@ -260,6 +264,7 @@ class FAWARequestDispatchMeta:
     dump_hash_start: int = 0
     dump_hash_end: int = 0
     dump_vllm_block_ids: tuple[list[int], ...] = field(default_factory=tuple)
+    is_async_load: bool = False
 
 
 @dataclass
@@ -303,6 +308,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
 
     DEFAULT_HASH_BLOCK_SIZE = 256
     ASCEND_DEFAULT_HASH_BLOCK_SIZE = 512
+    _supports_async_load = True
 
     def __init__(
         self,
@@ -784,6 +790,8 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             # let wa_hbm_hit_block_num equal to total_hit_block_num,so no need to load external blocks
             wa_hbm_hit_block_num += external_hit_blocks
 
+        do_async_load = self.load_async and external_hit_tokens > 0
+
         # TODO :for HMA, vllm should offer all kv group's prefix block hits，so that more FA blocks can be reused
         self.requests_meta[request.request_id] = FAWARequestMeta(
             ucm_block_ids=canonical_hashes,
@@ -791,6 +799,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             total_hit_block_num=total_hit_block_num,
             num_token_ids=request.num_tokens,
             token_processed=num_total_hit_tokens,
+            do_async_load=do_async_load,
         )
         logger.info_once(
             f"FAWA request_id: {request.request_id}, "
@@ -800,7 +809,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             f"load blocks: {total_hit_block_num - wa_hbm_hit_block_num}, "
             f"dump blocks: {len(canonical_hashes) - total_hit_block_num}, "
         )
-        return external_hit_tokens, False
+        return external_hit_tokens, do_async_load
 
     def update_state_after_alloc(
         self,
@@ -808,7 +817,16 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         blocks: "KVCacheBlocks",
         num_external_tokens: int,
     ) -> None:
-        pass
+        req_meta = self.requests_meta.get(request.request_id)
+        if req_meta is None or not req_meta.do_async_load:
+            return
+        if num_external_tokens == 0:
+            req_meta.do_async_load = False
+            return
+        req_meta.async_vllm_block_ids = tuple(
+            list(ids) for ids in blocks.get_block_ids()
+        )
+        req_meta.load_async_pending = True
 
     def _slice_group_block_ids(
         self,
@@ -938,10 +956,36 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             dump_vllm_block_ids=tuple(dump_vllm_block_ids),
         )
 
+    def _build_async_load_dispatch_meta(
+        self,
+        requests_dispatch_meta: dict[str, FAWARequestDispatchMeta],
+    ) -> None:
+        for request_id, req_meta in self.requests_meta.items():
+            if not req_meta.load_async_pending:
+                continue
+            req_meta.load_async_pending = False
+            req_meta.async_loaded = True
+            dispatch_meta = self._generate_dispatch_meta(
+                req_meta,
+                0,
+                req_meta.async_vllm_block_ids,
+            )
+            dispatch_meta.is_async_load = True
+            # _generate_dispatch_meta extended vllm_block_ids with the parked
+            # allocation snapshot; reset so the wake-up dispatch (which passes
+            # the request's full block table) starts from an empty table.
+            req_meta.vllm_block_ids = tuple([] for _ in self.group_metas)
+            requests_dispatch_meta[request_id] = dispatch_meta
+            logger.info(
+                f"request {request_id} FAWA async load dispatched, "
+                f"blocks: {len(dispatch_meta.load_keys)}"
+            )
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> UCMFAWAConnectorMetadata:
         requests_dispatch_meta: dict[str, FAWARequestDispatchMeta] = {}
+        self._build_async_load_dispatch_meta(requests_dispatch_meta)
         # New requests may need both external-prefix load and new-block dump.
         for request in scheduler_output.scheduled_new_reqs:
             request_id, vllm_block_ids = request.req_id, request.block_ids
@@ -951,6 +995,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                     req_meta,
                     scheduler_output.num_scheduled_tokens[request_id],
                     tuple(vllm_block_ids),
+                    self._consume_async_loaded(req_meta, True),
                 )
 
         scheduled_cached_reqs = scheduler_output.scheduled_cached_reqs
@@ -976,7 +1021,9 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                     req_meta,
                     scheduler_output.num_scheduled_tokens[request_id],
                     new_block_ids,
-                    need_load=resumed_from_preemption,
+                    need_load=self._consume_async_loaded(
+                        req_meta, resumed_from_preemption
+                    ),
                 )
 
         for request_id in scheduler_output.finished_req_ids:
@@ -1142,6 +1189,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             if not request.load_keys:
                 continue
 
+            submitted: list[FAWALoadTask] = []
             try:
                 if self.fa_store is None:
                     raise RuntimeError("FA store is not initialized.")
@@ -1155,7 +1203,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                     request.load_hash_end,
                     request.load_vllm_block_ids,
                 )
-                tasks.append(
+                submitted.append(
                     self._submit_load_task(
                         request_id,
                         "FA",
@@ -1171,7 +1219,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                     window_keys,
                     request.load_vllm_block_ids,
                 )
-                tasks.append(
+                submitted.append(
                     self._submit_load_task(
                         request_id,
                         "WA",
@@ -1186,8 +1234,42 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                     f"error. {type(e).__name__}: {e}"
                 )
                 self._handle_load_err(request_id)
+                if request.is_async_load:
+                    self._register_pending_async_load(
+                        request_id, request, submitted, failed=True
+                    )
+                else:
+                    tasks.extend(submitted)
+                continue
+
+            if request.is_async_load:
+                self._register_pending_async_load(
+                    request_id, request, submitted, failed=False
+                )
+            else:
+                tasks.extend(submitted)
 
         self._wait_all_load_task(tasks)
+
+    def _register_pending_async_load(
+        self,
+        request_id: str,
+        request: FAWARequestDispatchMeta,
+        submitted: list[FAWALoadTask],
+        failed: bool,
+    ) -> None:
+        if not submitted:
+            if failed:
+                self._ready_recving.add(request_id)
+            return
+        self._pending_load_reqs[request_id] = PendingLoadTask(
+            request_id=request_id,
+            tasks=[(load_task.store, load_task.task) for load_task in submitted],
+            vllm_block_ids=list(self._get_request_all_block_ids(request_id)),
+            num_blocks=len(request.load_keys),
+            submit_ms=time.perf_counter() * 1000,
+            failed=failed,
+        )
 
     @fawa_latency_metric(
         "fawa_worker_wait_wait_all_load_task_ms",
@@ -1431,7 +1513,8 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
     ) -> tuple[set[str] | None, set[str] | None]:
         # Worker side method
         self._drain_best_effort_dump_tasks(finished_req_ids)
-        return finished_req_ids, None
+        finished_recving = self._poll_pending_load_reqs()
+        return finished_req_ids, finished_recving or None
 
     def request_finished_all_groups(
         self,
