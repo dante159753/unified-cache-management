@@ -55,6 +55,7 @@ class FakeStore:
         self.in_flight: dict[int, bool] = {}
         self.check_errors: set[int] = set()
         self.wait_errors: set[int] = set()
+        self.waited: list[int] = []
         self.submit_error = False
         self._next_id = 0
 
@@ -76,6 +77,7 @@ class FakeStore:
         return not self.in_flight.get(task.task_id, False)
 
     def wait(self, task):
+        self.waited.append(task.task_id)
         if task.task_id in self.wait_errors:
             raise RuntimeError("injected wait failure")
 
@@ -150,6 +152,32 @@ def make_worker_connector(cls=UCMDirectConnector):
         conn.layer_ids = [0, 1]
         conn.first_layer_id = 0
     return conn
+
+
+def make_fawa_worker_connector():
+    from ucm.integration.vllm.hma_connector import UCMFAWAConnector
+
+    conn = UCMFAWAConnector.__new__(UCMFAWAConnector)
+    conn.store = FakeStore()
+    conn.block_data_size = 0
+    conn.tp_dump_tasks = {}
+    conn._invalid_block_ids = set()
+    conn._connector_worker_meta = UCMWorkerMetadata()
+    conn._pending_load_reqs = {}
+    conn._ready_recving = set()
+    return conn
+
+
+def add_pending_load(conn, request_id="req-0"):
+    task = conn.store.load_data([b"h0"], [0], [[0]])
+    conn._pending_load_reqs[request_id] = PendingLoadTask(
+        request_id=request_id,
+        tasks=[(conn.store, task)],
+        vllm_block_ids=[100],
+        num_blocks=1,
+        submit_ms=0,
+    )
+    return task
 
 
 def make_request(request_id="req-0", num_blocks=8):
@@ -355,6 +383,70 @@ class TestWorkerSide:
         assert finished_recving == {"req-0"}
         assert conn._invalid_block_ids == {100}
 
+    def test_failed_pending_load_drains_all_completed_tasks(self, monkeypatch):
+        patch_metrics(monkeypatch)
+        conn = make_worker_connector(UCMLayerWiseConnector)
+        conn._submit_async_load("req-0", [b"h0"], [100])
+        conn._pending_load_reqs["req-0"].failed = True
+        conn.store.complete(0)
+        conn.store.complete(1)
+
+        _, finished_recving = conn.get_finished(set())
+
+        assert finished_recving == {"req-0"}
+        assert conn.store.waited == [0, 1]
+
+    def test_wait_failure_does_not_skip_later_completed_tasks(self, monkeypatch):
+        patch_metrics(monkeypatch)
+        conn = make_worker_connector(UCMLayerWiseConnector)
+        conn._submit_async_load("req-0", [b"h0"], [100])
+        conn.store.complete(0)
+        conn.store.complete(1)
+        conn.store.wait_errors.add(0)
+
+        _, finished_recving = conn.get_finished(set())
+
+        assert finished_recving == {"req-0"}
+        assert conn.store.waited == [0, 1]
+        assert conn._invalid_block_ids == {100}
+
+    def test_check_failure_drains_task_before_reporting_completion(self, monkeypatch):
+        patch_metrics(monkeypatch)
+        conn = make_worker_connector()
+        conn._submit_async_load("req-0", [b"h0"], [100])
+        conn.store.check_errors.add(0)
+
+        _, finished_recving = conn.get_finished(set())
+
+        assert finished_recving == {"req-0"}
+        assert conn.store.waited == [0]
+        assert conn._invalid_block_ids == {100}
+
+
+class TestFAWAWorkerSide:
+    def test_aborted_pending_load_is_not_reported_as_finished_sending(
+        self, monkeypatch
+    ):
+        patch_metrics(monkeypatch)
+        conn = make_fawa_worker_connector()
+        task = add_pending_load(conn)
+
+        assert conn.get_finished({"req-0"}) == (None, None)
+        assert "req-0" in conn._pending_load_reqs
+
+        conn.store.complete(task.task_id)
+        assert conn.get_finished(set()) == (None, {"req-0"})
+
+    def test_completed_aborted_load_is_reported_only_as_finished_recving(
+        self, monkeypatch
+    ):
+        patch_metrics(monkeypatch)
+        conn = make_fawa_worker_connector()
+        task = add_pending_load(conn)
+        conn.store.complete(task.task_id)
+
+        assert conn.get_finished({"req-0"}) == (None, {"req-0"})
+
 
 class TestWhitelist:
     def test_supported_connectors(self):
@@ -442,3 +534,70 @@ class TestMultiGroupInvalidBlocksPatch:
         assert affected == set()
         assert total_tokens == 0
         assert request.num_computed_tokens == 8
+
+    def test_v018_async_failure_updates_external_computed_tokens(self):
+        from ucm.integration.vllm.patch.load_failure_patch import (
+            _update_multi_group_requests_with_invalid_blocks,
+        )
+
+        scheduler = self._make_scheduler(
+            {"req-0": ([1, 2, 3, 4], [11, 12])},
+            [4, 8],
+        )
+        request = SimpleNamespace(
+            request_id="req-0",
+            status=SimpleNamespace(name="WAITING_FOR_REMOTE_KVS"),
+            num_computed_tokens=16,
+            num_cached_tokens=0,
+            num_external_computed_tokens=16,
+            num_output_placeholders=1,
+        )
+
+        affected, total_tokens, _ = _update_multi_group_requests_with_invalid_blocks(
+            scheduler, [request], {12}, evict_blocks=False
+        )
+
+        assert affected == {"req-0"}
+        assert total_tokens == 8
+        assert request.num_computed_tokens == 8
+        assert request.num_external_computed_tokens == 8
+
+    def test_v018_sync_failure_uses_cached_token_count(self):
+        from ucm.integration.vllm.patch.load_failure_patch import (
+            _update_multi_group_requests_with_invalid_blocks,
+        )
+
+        scheduler = self._make_scheduler(
+            {"req-0": ([1, 2, 3, 4, 5], [11, 12, 13])},
+            [4, 8],
+        )
+        request = SimpleNamespace(
+            request_id="req-0",
+            status=SimpleNamespace(name="RUNNING"),
+            num_computed_tokens=20,
+            num_cached_tokens=16,
+            num_external_computed_tokens=8,
+            num_output_placeholders=1,
+        )
+
+        affected, total_tokens, _ = _update_multi_group_requests_with_invalid_blocks(
+            scheduler, [request], {3}, evict_blocks=False
+        )
+
+        assert affected == {"req-0"}
+        assert total_tokens == 8
+        assert request.num_computed_tokens == 8
+        assert request.num_external_computed_tokens == 0
+
+
+class TestLoadFailurePatchRouting:
+    def test_generic_patch_is_enabled_for_v018(self):
+        from ucm.integration.vllm.patch import apply_patch
+
+        should_apply = getattr(
+            apply_patch, "_should_apply_generic_load_failure_patch", None
+        )
+        assert should_apply is not None
+        assert should_apply("0.18.0") is True
+        assert should_apply("0.20.2") is True
+        assert should_apply("0.11.0") is False

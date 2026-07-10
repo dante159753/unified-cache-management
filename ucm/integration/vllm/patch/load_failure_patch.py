@@ -14,6 +14,12 @@ def _update_multi_group_requests_with_invalid_blocks(
         req_num_computed_tokens = request.num_computed_tokens
         if num_scheduled_tokens is not None:
             req_num_computed_tokens -= num_scheduled_tokens.get(req_id, 0)
+        elif getattr(getattr(request, "status", None), "name", None) != (
+            "WAITING_FOR_REMOTE_KVS"
+        ):
+            req_num_computed_tokens = getattr(
+                request, "num_cached_tokens", req_num_computed_tokens
+            )
         valid_tokens = req_num_computed_tokens
         is_affected = False
         for group, block_ids in zip(kv_cache_groups, group_block_ids):
@@ -34,8 +40,11 @@ def _update_multi_group_requests_with_invalid_blocks(
         block_size = getattr(self, "block_size", 0)
         if block_size:
             valid_tokens -= valid_tokens % block_size
-        total_affected_tokens += req_num_computed_tokens - valid_tokens
+        num_affected_tokens = req_num_computed_tokens - valid_tokens
+        total_affected_tokens += num_affected_tokens
         request.num_computed_tokens = valid_tokens
+        if hasattr(request, "num_external_computed_tokens"):
+            request.num_external_computed_tokens -= num_affected_tokens
         if hasattr(request, "num_output_placeholders"):
             request.num_output_placeholders = 0
         affected_req_ids.add(req_id)

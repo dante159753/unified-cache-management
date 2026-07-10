@@ -1514,7 +1514,10 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         # Worker side method
         self._drain_best_effort_dump_tasks(finished_req_ids)
         finished_recving = self._poll_pending_load_reqs()
-        return finished_req_ids, finished_recving or None
+        finished_sending = finished_req_ids.difference(
+            self._pending_load_reqs, finished_recving
+        )
+        return finished_sending or None, finished_recving or None
 
     def request_finished_all_groups(
         self,

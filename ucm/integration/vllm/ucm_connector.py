@@ -1276,32 +1276,31 @@ class UCMDirectConnector(KVConnectorBase_V1):
         finished_recving = set(self._ready_recving)
         self._ready_recving.clear()
         for request_id, pending in list(self._pending_load_reqs.items()):
-            all_done = True
             failed = pending.failed
+            remaining_tasks: list[tuple[UcmKVStoreBaseV1, Task]] = []
             for store, task in pending.tasks:
                 try:
                     if not store.check(task):
-                        all_done = False
-                        break
+                        remaining_tasks.append((store, task))
+                        continue
                 except Exception as e:
                     logger.error(
                         f"request {request_id} check async load task error. "
                         f"{type(e).__name__}: {e}"
                     )
                     failed = True
-                    pending.failed = True
-            if not all_done:
-                continue
-            if not failed:
                 try:
-                    for store, task in pending.tasks:
-                        store.wait(task)
+                    store.wait(task)
                 except Exception as e:
                     logger.error(
                         f"request {request_id} wait async load task error. "
                         f"{type(e).__name__}: {e}"
                     )
                     failed = True
+            pending.tasks = remaining_tasks
+            pending.failed = failed
+            if pending.tasks:
+                continue
             if failed:
                 self._record_load_error(
                     "connector_load_wait_errors_total", pending.vllm_block_ids
