@@ -99,7 +99,7 @@ def test_config_rejects_duplicate_runner_names(tmp_path):
 
 - [ ] **Step 2: Run tests and verify the expected import failure**
 
-Run: `python -m pytest test/runner-docker/a2_scheduler/tests/test_models.py -q`
+Run: `python -m pytest --confcutdir=test/runner-docker/a2_scheduler/tests test/runner-docker/a2_scheduler/tests/test_models.py -q`
 
 Expected: FAIL because `a2_scheduler.models` does not exist.
 
@@ -139,7 +139,7 @@ The example config must contain the four current configured runner image names, 
 
 - [ ] **Step 4: Run focused tests**
 
-Run: `python -m pytest test/runner-docker/a2_scheduler/tests/test_models.py -q`
+Run: `python -m pytest --confcutdir=test/runner-docker/a2_scheduler/tests test/runner-docker/a2_scheduler/tests/test_models.py -q`
 
 Expected: PASS.
 
@@ -189,7 +189,7 @@ def test_api_error_is_unknown_not_empty():
 
 - [ ] **Step 2: Run tests and verify failure**
 
-Run: `python -m pytest test/runner-docker/a2_scheduler/tests/test_github_client.py -q`
+Run: `python -m pytest --confcutdir=test/runner-docker/a2_scheduler/tests test/runner-docker/a2_scheduler/tests/test_github_client.py -q`
 
 Expected: FAIL because `GitHubClient` does not exist.
 
@@ -207,7 +207,7 @@ Deduplicate run IDs, select only `queued` and `in_progress` jobs, and require th
 
 - [ ] **Step 4: Run focused tests**
 
-Run: `python -m pytest test/runner-docker/a2_scheduler/tests/test_github_client.py -q`
+Run: `python -m pytest --confcutdir=test/runner-docker/a2_scheduler/tests test/runner-docker/a2_scheduler/tests/test_github_client.py -q`
 
 Expected: PASS.
 
@@ -258,7 +258,7 @@ Include fixtures for zero vNPUs, four vNPUs, no process, and card 7 process rows
 
 - [ ] **Step 2: Run tests and verify failure**
 
-Run: `python -m pytest test/runner-docker/a2_scheduler/tests/test_host.py -q`
+Run: `python -m pytest --confcutdir=test/runner-docker/a2_scheduler/tests test/runner-docker/a2_scheduler/tests/test_host.py -q`
 
 Expected: FAIL because host adapters do not exist.
 
@@ -277,7 +277,7 @@ After each create, query inventory and compute the newly added ID from set diffe
 
 - [ ] **Step 4: Run focused tests**
 
-Run: `python -m pytest test/runner-docker/a2_scheduler/tests/test_host.py -q`
+Run: `python -m pytest --confcutdir=test/runner-docker/a2_scheduler/tests test/runner-docker/a2_scheduler/tests/test_host.py -q`
 
 Expected: PASS.
 
@@ -324,7 +324,7 @@ def test_start_all_launches_four_containers_concurrently():
 
 - [ ] **Step 2: Run tests and verify failure**
 
-Run: `python -m pytest test/runner-docker/a2_scheduler/tests/test_runners.py -q`
+Run: `python -m pytest --confcutdir=test/runner-docker/a2_scheduler/tests test/runner-docker/a2_scheduler/tests/test_runners.py -q`
 
 Expected: FAIL because `RunnerManager` does not exist.
 
@@ -343,7 +343,7 @@ Detect active work with `docker exec CONTAINER pgrep -af Runner.Worker`. An idle
 
 - [ ] **Step 4: Run focused tests**
 
-Run: `python -m pytest test/runner-docker/a2_scheduler/tests/test_runners.py -q`
+Run: `python -m pytest --confcutdir=test/runner-docker/a2_scheduler/tests test/runner-docker/a2_scheduler/tests/test_runners.py -q`
 
 Expected: PASS.
 
@@ -398,7 +398,7 @@ Add tests for early empty restoration after two checks, active worker drain, API
 
 - [ ] **Step 2: Run tests and verify failure**
 
-Run: `python -m pytest test/runner-docker/a2_scheduler/tests/test_reconciler.py -q`
+Run: `python -m pytest --confcutdir=test/runner-docker/a2_scheduler/tests test/runner-docker/a2_scheduler/tests/test_reconciler.py -q`
 
 Expected: FAIL because `Reconciler` does not exist.
 
@@ -423,7 +423,7 @@ No transition may infer empty work from `GitHubUnavailable`. Before early restor
 
 - [ ] **Step 4: Run focused and aggregate tests**
 
-Run: `python -m pytest test/runner-docker/a2_scheduler/tests -q`
+Run: `python -m pytest --confcutdir=test/runner-docker/a2_scheduler/tests test/runner-docker/a2_scheduler/tests -q`
 
 Expected: PASS with no skipped scheduler tests.
 
@@ -468,7 +468,7 @@ def test_second_reconcile_cannot_take_lock(configured_cli):
 
 - [ ] **Step 2: Run tests and verify failure**
 
-Run: `python -m pytest test/runner-docker/a2_scheduler/tests/test_cli.py -q`
+Run: `python -m pytest --confcutdir=test/runner-docker/a2_scheduler/tests test/runner-docker/a2_scheduler/tests/test_cli.py -q`
 
 Expected: FAIL because the CLI does not exist.
 
@@ -500,7 +500,7 @@ It is allowed only when the timer is inactive, card 7 has no processes or vNPUs,
 Run:
 
 ```bash
-python -m pytest test/runner-docker/a2_scheduler/tests -q
+python -m pytest --confcutdir=test/runner-docker/a2_scheduler/tests test/runner-docker/a2_scheduler/tests -q
 python -m compileall -q test/runner-docker/a2_scheduler
 git diff --check
 ```
@@ -648,7 +648,7 @@ Disable the timer, drain active workers, stop listeners, destroy scheduler-creat
 Run locally:
 
 ```bash
-python -m pytest test/runner-docker/a2_scheduler/tests -q
+python -m pytest --confcutdir=test/runner-docker/a2_scheduler/tests test/runner-docker/a2_scheduler/tests -q
 python -m compileall -q test/runner-docker/a2_scheduler
 git status --short
 ```
