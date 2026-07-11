@@ -69,14 +69,16 @@ def _selected_table(
     rows = []
     normalized_headers = _normalized_row(headers)
     separator_count = 0
+    separator_pending = False
     for line in lines[header_position + 1 :]:
         stripped = line.strip()
         if not stripped:
             continue
         if _is_separator(stripped):
             separator_count += 1
-            if rows or separator_count > 1:
+            if separator_pending:
                 break
+            separator_pending = True
             continue
         starts_row = stripped.startswith("|")
         ends_row = stripped.endswith("|")
@@ -86,7 +88,10 @@ def _selected_table(
             cells = _table_cells(stripped)
             if _normalized_row(cells) != normalized_headers:
                 rows.append(cells)
+            separator_pending = False
             continue
+        if separator_pending and rows:
+            break
         raise NpuOperationError(error_message)
     if not rows and separator_count == 0:
         raise NpuOperationError(error_message)

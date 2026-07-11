@@ -112,6 +112,21 @@ def test_parse_card_processes_ignores_other_cards():
     ]
 
 
+def test_process_parser_accepts_row_separators_and_deduplicates_pids():
+    output = """\
++----------+----------+-------------+----------------------+-------------+
+| NPU ID   | Chip ID  | Process id  | Process name         | Used Memory |
++----------+----------+-------------+----------------------+-------------+
+| 7        | 0        | 4312        | python3              | 1024        |
++----------+----------+-------------+----------------------+-------------+
+| 7        | 0        | 8765        | python3              | 2048        |
++----------+----------+-------------+----------------------+-------------+
+| 7        | 0        | 4312        | python3              | 1024        |
++----------+----------+-------------+----------------------+-------------+
+"""
+    assert parse_proc_mem(output, card_id=7) == [4312, 8765]
+
+
 def test_parse_actual_no_process_message():
     assert parse_proc_mem(load_fixture("proc-mem-none.txt"), card_id=7) == []
 
@@ -157,6 +172,19 @@ def test_process_parser_keeps_data_row_with_pid_process_name():
 def test_process_parser_skips_only_complete_repeated_header():
     output = load_fixture("proc-mem-repeated-header.txt")
     assert parse_proc_mem(output, card_id=7) == [4312, 8765]
+
+
+def test_vnpu_parser_rejects_malformed_table_after_row_separator():
+    output = (
+        load_fixture("info-vnpu-four.txt")
+        + """\
+| Other | Header |
++-------+--------+
+| unsafe
+"""
+    )
+    with pytest.raises(NpuOperationError, match="parse vNPU"):
+        parse_info_vnpu(output)
 
 
 def test_list_commands_use_card_and_chip_argv():
