@@ -127,16 +127,39 @@ def _selected_table(
     return headers, rows
 
 
+def _is_vnpu_header(cells: Sequence[str]) -> bool:
+    return "vnpu id" in [cell.lower() for cell in cells]
+
+
 def _vnpu_count(output: str) -> int:
-    pattern = re.compile(r"\| Total number of vnpu: (0|[1-9][0-9]*)\s+\|")
+    lines = output.splitlines()
+    header_position = None
+    header_line = None
+    for index, line in enumerate(lines):
+        if line.startswith("|") and line.endswith("|"):
+            cells = _table_cells(line)
+            if _is_vnpu_header(cells):
+                header_position = index
+                header_line = line
+                break
+    if header_position is None or header_line is None or header_position < 2:
+        raise NpuOperationError("could not parse vNPU inventory")
+
+    pattern = re.compile(r"\| Total number of vnpu: (0|[1-9][0-9]*) +\|")
     matches = []
-    for line in output.splitlines():
-        match = pattern.fullmatch(line.strip())
+    for line in lines:
+        match = pattern.fullmatch(line)
         if match is not None:
             matches.append(match)
-    if len(matches) != 1:
+    bound_match = pattern.fullmatch(lines[header_position - 2])
+    if (
+        len(matches) != 1
+        or bound_match is None
+        or len(lines[header_position - 2]) != len(header_line)
+        or len(lines[header_position - 1]) != len(header_line)
+    ):
         raise NpuOperationError("could not parse vNPU inventory")
-    return int(matches[0].group(1))
+    return int(bound_match.group(1))
 
 
 def _header_index(headers: Sequence[str], *names: str) -> int:
@@ -151,7 +174,7 @@ def parse_info_vnpu(output: str) -> List[Vnpu]:
     expected_count = _vnpu_count(output)
     headers, rows = _selected_table(
         output,
-        lambda row: "vnpu id" in [cell.lower() for cell in row],
+        _is_vnpu_header,
         "could not parse vNPU inventory",
         allow_empty=True,
     )

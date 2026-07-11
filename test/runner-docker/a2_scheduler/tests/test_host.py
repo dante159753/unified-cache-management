@@ -34,6 +34,11 @@ def inventory(ids):
         "+----------------+----------------+----------------+----------------+"
         "----------------------+"
     )
+    header = (
+        "| Vnpu ID        | Vgroup ID      | Container ID   | Status         "
+        "| Template Name        |"
+    )
+    marker = "| Total number of vnpu: {}".format(len(ids)).ljust(len(header) - 1) + "|"
     rows = "".join(
         (
             "| {0:<14} | 0              | -              | FREE           "
@@ -42,13 +47,13 @@ def inventory(ids):
         for vnpu_id in ids
     )
     return """\
-| Total number of vnpu: {count:<55} |
+{marker}
 {separator}
-| Vnpu ID        | Vgroup ID      | Container ID   | Status         | Template Name        |
+{header}
 {separator}
 {rows}
 """.format(
-        count=len(ids), rows=rows, separator=separator
+        header=header, marker=marker, rows=rows, separator=separator
     )
 
 
@@ -214,6 +219,14 @@ UNSAFE_VNPU_ROW_LAYOUT_FIXTURES = [
     "info-vnpu-extra-pipe-row.txt",
 ]
 
+UNSAFE_VNPU_COUNT_MARKER_FIXTURES = [
+    "info-vnpu-compact-count-marker.txt",
+    "info-vnpu-detached-count-marker.txt",
+    "info-vnpu-wrong-width-count-marker.txt",
+    "info-vnpu-duplicate-count-marker.txt",
+    "info-vnpu-leading-space-count-marker.txt",
+]
+
 
 @pytest.mark.parametrize("fixture_name", EMPTY_PROCESS_TABLE_FIXTURES)
 def test_process_parser_rejects_selected_table_without_complete_rows(fixture_name):
@@ -269,6 +282,12 @@ def test_vnpu_parser_rejects_row_layout_drift(fixture_name):
     ],
 )
 def test_vnpu_parser_rejects_missing_or_mismatched_count(fixture_name):
+    with pytest.raises(NpuOperationError, match="parse vNPU"):
+        parse_info_vnpu(load_fixture(fixture_name))
+
+
+@pytest.mark.parametrize("fixture_name", UNSAFE_VNPU_COUNT_MARKER_FIXTURES)
+def test_vnpu_parser_rejects_unbound_or_nonliteral_count_marker(fixture_name):
     with pytest.raises(NpuOperationError, match="parse vNPU"):
         parse_info_vnpu(load_fixture(fixture_name))
 
