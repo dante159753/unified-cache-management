@@ -124,7 +124,10 @@ def state_document(phase="WHOLE", original_device_mode=None):
     )
 
 
-@pytest.mark.parametrize("mode", [0, -1, 0o20000])
+@pytest.mark.parametrize(
+    "mode",
+    [0, -1, 0o20000, 0o24000, 0o22000, 0o21000, 0o27000],
+)
 def test_state_rejects_invalid_original_device_mode(mode):
     with pytest.raises(ValueError, match="original_device_mode"):
         SchedulerState.from_json(state_document(original_device_mode=mode))

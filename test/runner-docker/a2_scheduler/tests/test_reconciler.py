@@ -1071,7 +1071,10 @@ def test_allocation_phase_without_original_mode_never_runs_lifecycle(phase):
 
 
 @pytest.mark.parametrize("phase", list(Phase))
-@pytest.mark.parametrize("mode", [0, -1, 0o20000])
+@pytest.mark.parametrize(
+    "mode",
+    [0, -1, 0o20000, 0o24000, 0o22000, 0o21000, 0o27000],
+)
 def test_corrupt_original_mode_never_mutates_host(phase, mode):
     fixture = SchedulerFixture(
         phase=phase,
@@ -1260,7 +1263,10 @@ def test_whole_card_verification_failure_prevents_whole_checkpoint():
     assert not any(state.phase == Phase.WHOLE for state in fixture.checkpoint.states)
 
 
-@pytest.mark.parametrize("readback_mode", [0o20640, 0o20000])
+@pytest.mark.parametrize(
+    "readback_mode",
+    [0o20640, 0o20000, 0o24000, 0o22000, 0o21000, 0o27000],
+)
 def test_restore_readback_must_match_saved_usable_mode(readback_mode):
     fixture = SchedulerFixture(
         phase=Phase.RESTORING,
