@@ -192,8 +192,9 @@ Status LoadQueue::LoadOne(CopyStream& stream, TaskPtr task)
     }
     if (backend_ == nullptr) {
         return Status::Error(fmt::format("YuanRong MGetH2D miss({}/{}) and no backend is "
-                                         "configured: {}",
-                                         missIndexes.size(), keys.size(), rc.ToString()));
+                                         "configured, first miss key({}): {}",
+                                         missIndexes.size(), keys.size(),
+                                         keys[missIndexes.front()], rc.ToString()));
     }
     auto recoverStart = NowTime::Now();
     auto recoverStatus = RecoverFromBackend(stream, task, keys, blobLists, missIndexes);
