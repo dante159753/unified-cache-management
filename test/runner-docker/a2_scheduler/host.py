@@ -39,6 +39,10 @@ def _table_cells(line: str) -> List[str]:
     return [cell.strip() for cell in line[1:-1].split("|")]
 
 
+def _normalized_row(cells: Sequence[str]) -> Tuple[str, ...]:
+    return tuple(" ".join(cell.lower().split()) for cell in cells)
+
+
 def _is_separator(line: str) -> bool:
     return bool(line) and set(line).issubset({"+", "-", "="}) and "+" in line
 
@@ -63,6 +67,7 @@ def _selected_table(
         raise NpuOperationError(error_message)
 
     rows = []
+    normalized_headers = _normalized_row(headers)
     separator_count = 0
     for line in lines[header_position + 1 :]:
         stripped = line.strip()
@@ -79,7 +84,7 @@ def _selected_table(
             raise NpuOperationError(error_message)
         if starts_row:
             cells = _table_cells(stripped)
-            if not is_header(cells):
+            if _normalized_row(cells) != normalized_headers:
                 rows.append(cells)
             continue
         raise NpuOperationError(error_message)

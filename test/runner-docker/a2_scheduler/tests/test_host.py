@@ -140,6 +140,16 @@ def test_process_parser_rejects_truncated_selected_row():
         parse_proc_mem(load_fixture("proc-mem-truncated-row.txt"), card_id=7)
 
 
+def test_process_parser_keeps_data_row_with_pid_process_name():
+    output = load_fixture("proc-mem-process-name-pid.txt")
+    assert parse_proc_mem(output, card_id=7) == [4312]
+
+
+def test_process_parser_skips_only_complete_repeated_header():
+    output = load_fixture("proc-mem-repeated-header.txt")
+    assert parse_proc_mem(output, card_id=7) == [4312, 8765]
+
+
 def test_list_commands_use_card_and_chip_argv():
     runner = ProcRunner(
         [load_fixture("info-vnpu-four.txt"), load_fixture("proc-mem-none.txt")]
