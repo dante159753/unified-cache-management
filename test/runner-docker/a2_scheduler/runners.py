@@ -3,7 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Iterable, List, Sequence
 
 from .host import CommandResult, CommandRunner
-from .models import SchedulerConfig, Vnpu
+from .models import RunnerSlot, SchedulerConfig, Vnpu
 
 RUNNER_COMMAND = (
     "cd /actions-runner\n"
@@ -35,15 +35,20 @@ class RunnerManager:
         if len({vnpu.id for vnpu in discovered}) != 4:
             raise ValueError("vNPU IDs must be unique")
 
-        for slot, vnpu in zip(self.config.runner_slots, discovered):
-            self._require_success(
-                self._run(["docker", "rm", "-f", slot.name]),
-                "remove runner container",
-            )
-            self._require_success(
-                self._run(self._create_argv(slot, vnpu)),
-                "create runner container",
-            )
+        try:
+            for slot, vnpu in zip(self.config.runner_slots, discovered):
+                self._remove_for_prepare(slot.name)
+                self._require_success(
+                    self._run(self._create_argv(slot, vnpu)),
+                    "create runner container",
+                )
+        except RunnerOperationError as error:
+            cleanup_errors = self._cleanup_runner_containers()
+            if cleanup_errors:
+                raise RunnerOperationError(
+                    "{}; cleanup failed: {}".format(error, "; ".join(cleanup_errors))
+                ) from error
+            raise
 
     def start_all(self) -> None:
         self._start([slot.name for slot in self.config.runner_slots])
@@ -63,30 +68,134 @@ class RunnerManager:
 
     def active_workers(self) -> int:
         return sum(
-            self._has_process(slot.name, "Runner.Worker")
-            for slot in self.config.runner_slots
+            self._top_has_worker(name) for name in self._running_container_names()
         )
 
     def stop_idle(self) -> bool:
+        paused = []
         all_idle = True
-        for slot in self.config.runner_slots:
-            if not self._has_process(slot.name, "Runner.Listener"):
-                continue
-            if self._has_process(slot.name, "Runner.Worker"):
-                all_idle = False
-                continue
-            self._require_success(
-                self._run(["docker", "stop", slot.name]),
-                "stop idle runner container",
-            )
+        try:
+            for name in self._running_container_names():
+                self._pause(name)
+                paused.append(name)
+                if self._top_has_worker(name):
+                    all_idle = False
+                    self._unpause(name)
+                    paused.remove(name)
+                    continue
+                self._remove_frozen(name)
+                paused.remove(name)
+        except RunnerOperationError as error:
+            self._raise_after_unpause(error, paused)
         return all_idle
 
     def stop_all_if_idle(self) -> bool:
-        if self.active_workers():
-            return False
-        return self.stop_idle()
+        names = self._running_container_names()
+        paused = []
+        try:
+            for name in names:
+                self._pause(name)
+                paused.append(name)
+            has_worker = any([self._top_has_worker(name) for name in names])
+            if has_worker:
+                cleanup_errors = self._unpause_all(paused)
+                if cleanup_errors:
+                    raise RunnerOperationError(
+                        "unpause runner containers failed: {}".format(
+                            "; ".join(cleanup_errors)
+                        )
+                    )
+                return False
+            for name in names:
+                self._remove_frozen(name)
+                paused.remove(name)
+        except RunnerOperationError as error:
+            self._raise_after_unpause(error, paused)
+        return True
 
-    def _create_argv(self, slot, vnpu: Vnpu) -> List[str]:
+    def _running_container_names(self) -> List[str]:
+        names = []
+        for slot in self.config.runner_slots:
+            result = self._run(
+                ["docker", "inspect", "--format", "{{.State.Running}}", slot.name]
+            )
+            self._require_success(result, "inspect runner container")
+            state = result.stdout.strip().lower()
+            if state == "true":
+                names.append(slot.name)
+            elif state != "false":
+                raise RunnerOperationError(
+                    "inspect runner container returned unknown state"
+                )
+        return names
+
+    def _top_has_worker(self, name: str) -> bool:
+        result = self._run(["docker", "top", name, "-eo", "args"])
+        self._require_success(result, "inspect runner processes")
+        return any("Runner.Worker" in line for line in result.stdout.splitlines()[1:])
+
+    def _pause(self, name: str) -> None:
+        self._require_success(
+            self._run(["docker", "pause", name]), "pause runner container"
+        )
+
+    def _unpause(self, name: str) -> None:
+        self._require_success(
+            self._run(["docker", "unpause", name]), "unpause runner container"
+        )
+
+    def _remove_frozen(self, name: str) -> None:
+        self._require_success(
+            self._run(["docker", "rm", "-f", name]),
+            "remove frozen runner container",
+        )
+
+    def _unpause_all(self, names: List[str]) -> List[str]:
+        errors = []
+        for name in list(names):
+            try:
+                self._unpause(name)
+            except RunnerOperationError as error:
+                errors.append("{}: {}".format(name, error))
+            else:
+                names.remove(name)
+        return errors
+
+    def _raise_after_unpause(
+        self, error: RunnerOperationError, paused: List[str]
+    ) -> None:
+        cleanup_errors = self._unpause_all(paused)
+        if cleanup_errors:
+            raise RunnerOperationError(
+                "{}; unpause failed: {}".format(error, "; ".join(cleanup_errors))
+            ) from error
+        raise error
+
+    def _remove_for_prepare(self, name: str) -> None:
+        result = self._run(["docker", "rm", "-f", name])
+        if result.returncode == 0 or self._is_exact_absence(result, name):
+            return
+        self._require_success(result, "remove runner container")
+
+    def _cleanup_runner_containers(self) -> List[str]:
+        errors = []
+        for slot in self.config.runner_slots:
+            try:
+                self._remove_for_prepare(slot.name)
+            except RunnerOperationError as error:
+                errors.append("{}: {}".format(slot.name, error))
+        return errors
+
+    @staticmethod
+    def _is_exact_absence(result: CommandResult, name: str) -> bool:
+        return (
+            result.returncode == 1
+            and result.stdout == ""
+            and result.stderr.rstrip("\r\n")
+            == "Error response from daemon: No such container: {}".format(name)
+        )
+
+    def _create_argv(self, slot: RunnerSlot, vnpu: Vnpu) -> List[str]:
         host_device = "/dev/vdavinci{}".format(vnpu.id)
         argv = [
             "docker",
@@ -132,15 +241,6 @@ class RunnerManager:
             results = [future.result() for future in futures]
         for result in results:
             self._require_success(result, "start runner container")
-
-    def _has_process(self, name: str, process_name: str) -> bool:
-        result = self._run(["docker", "exec", name, "pgrep", "-af", process_name])
-        if result.returncode == 0:
-            return True
-        if result.returncode == 1:
-            return False
-        self._require_success(result, "inspect runner process")
-        return False
 
     def _run(self, argv: Sequence[str]) -> CommandResult:
         try:
