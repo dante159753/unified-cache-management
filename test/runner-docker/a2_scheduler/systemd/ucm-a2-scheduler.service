@@ -1,0 +1,11 @@
+[Unit]
+Description=UCM A2 on-demand vNPU scheduler
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/ucm-a2-scheduler
+Environment=PYTHONPATH=/opt/ucm-a2-scheduler
+ExecStart=/usr/bin/python3 -m a2_scheduler.cli reconcile --config /etc/ucm-a2-scheduler/config.json

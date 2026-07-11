@@ -67,3 +67,77 @@ get connect token from github, run
 `sudo ./runner-svc.sh status`
 
 or go to `./_diag` to check more log
+
+# A2 on-demand vNPU scheduler
+
+Install the `a2_scheduler` package under `/opt/ucm-a2-scheduler`, place the
+root-owned configuration at `/etc/ucm-a2-scheduler/config.json`, and keep the
+configured GitHub token file mode at `0600`. Install the service and timer from
+`a2_scheduler/systemd/`, then reload systemd. Do not enable the timer until the
+read-only checks and operator validation below have passed.
+
+## Read-only checks
+
+Neither command acquires the scheduler lock, writes state, changes device
+permissions, invokes a Docker lifecycle command, or creates/destroys a vNPU.
+
+```bash
+cd /opt/ucm-a2-scheduler
+sudo /usr/bin/python3 -m a2_scheduler.cli dry-run --config /etc/ucm-a2-scheduler/config.json
+sudo /usr/bin/python3 -m a2_scheduler.cli status --config /etc/ucm-a2-scheduler/config.json
+```
+
+Inspect timer/service state and recent logs with:
+
+```bash
+sudo systemctl status ucm-a2-scheduler.timer ucm-a2-scheduler.service
+sudo journalctl -u ucm-a2-scheduler.service -n 200 --no-pager
+sudo journalctl -u ucm-a2-scheduler.service -f
+```
+
+## Manual reconcile
+
+One reconciliation uses the same nonblocking card lock as the timer service.
+Lock contention exits with status `75` without mutating scheduler state or host
+resources.
+
+```bash
+cd /opt/ucm-a2-scheduler
+sudo /usr/bin/python3 -m a2_scheduler.cli reconcile --config /etc/ucm-a2-scheduler/config.json
+```
+
+## Create/rollback validation
+
+This operator-only validation performs real host actions. Run it only before
+enabling the timer. The command itself requires the timer to report `inactive`,
+card 7 to have no PIDs or vNPUs, and every scheduler runner to be stopped. It
+creates exactly two vNPUs, injects failure before the third create, applies the
+GitHub/runner cleanup policy and per-destroy PID guard, destroys only the two
+discovered IDs, and requires a zero-vNPU result.
+
+```bash
+cd /opt/ucm-a2-scheduler
+sudo /usr/bin/python3 -m a2_scheduler.cli validate-create-rollback --fail-before-create 3 --config /etc/ucm-a2-scheduler/config.json
+```
+
+## Disable and restore the whole card
+
+First disable future timer starts and wait for target GitHub jobs and local
+`Runner.Worker` processes to finish. Confirm `target_jobs.in_progress` is zero
+and every reported runner has `worker: false` before the manual reconcile. The
+reconciler then applies its runner-idle, GitHub policy, checkpoint, and card-PID
+guards while restoring the recorded physical-device mode.
+
+```bash
+sudo systemctl disable --now ucm-a2-scheduler.timer
+cd /opt/ucm-a2-scheduler
+sudo /usr/bin/python3 -m a2_scheduler.cli status --config /etc/ucm-a2-scheduler/config.json
+sudo /usr/bin/python3 -m a2_scheduler.cli reconcile --config /etc/ucm-a2-scheduler/config.json
+sudo /usr/bin/python3 -m a2_scheduler.cli status --config /etc/ucm-a2-scheduler/config.json
+sudo npu-smi info -t info-vnpu -i 7 -c 0
+sudo npu-smi info -t proc-mem -i 7 -c 0
+```
+
+Rollback is complete only when status reports `phase: WHOLE`, the vNPU
+inventory is empty, and card 7 has no scheduler runner process. Leave the timer
+disabled until the cause of the rollback is resolved.

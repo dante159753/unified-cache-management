@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the UCM A2 vNPU scheduler every 30 seconds
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=1s
+Unit=ucm-a2-scheduler.service
+
+[Install]
+WantedBy=timers.target
