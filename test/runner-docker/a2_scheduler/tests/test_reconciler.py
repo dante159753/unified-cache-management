@@ -265,6 +265,7 @@ class SchedulerFixture:
         observations=None,
         checkpoint=False,
         checkpoint_fail_on=None,
+        last_error=None,
     ):
         self.minute = minute
         self.events = []
@@ -295,6 +296,7 @@ class SchedulerFixture:
             phase=phase,
             vnpu_ids=tuple(vnpu_ids),
             original_device_mode=original_mode,
+            last_error=last_error,
         )
 
     @staticmethod
@@ -311,7 +313,7 @@ class SchedulerFixture:
             "sleep": self.clock.sleep,
         }
         kwargs["checkpoint"] = self.checkpoint
-        reconciler = Reconciler(
+        self.reconciler = Reconciler(
             self.config,
             self.state,
             self.github,
@@ -319,7 +321,7 @@ class SchedulerFixture:
             self.runners,
             **kwargs,
         )
-        self.state = reconciler.reconcile(self.clock())
+        self.state = self.reconciler.reconcile(self.clock())
         return self.state
 
     @property
@@ -566,6 +568,33 @@ def test_partial_split_failure_rolls_back_discovered_ids_and_device_mode():
     assert fixture.npu.destroyed_ids == [401, 407]
     assert fixture.npu.restored_modes == [0o20660]
     assert fixture.runners.concurrent_starts == 0
+    assert fixture.reconciler.outcome.failed is True
+    assert "creation failed" in fixture.reconciler.outcome.error
+
+
+def test_healthy_run_ignores_stale_historical_error_for_current_outcome():
+    fixture = SchedulerFixture(last_error="historical failure")
+
+    state = fixture.reconcile()
+
+    assert state.phase == Phase.WHOLE
+    assert state.last_error == "historical failure"
+    assert fixture.reconciler.outcome.failed is False
+    assert fixture.reconciler.outcome.error is None
+
+
+def test_current_outcome_resets_after_prior_handled_failure():
+    fixture = SchedulerFixture(
+        observations=[GitHubUnavailable("unavailable"), SchedulerFixture.jobs(0)]
+    )
+
+    fixture.reconcile()
+    assert fixture.reconciler.outcome.failed is True
+
+    fixture.state = fixture.reconciler.reconcile(fixture.clock())
+
+    assert fixture.reconciler.outcome.failed is False
+    assert fixture.reconciler.outcome.error is None
 
 
 def test_partial_split_failure_does_not_destroy_when_job_became_in_progress():

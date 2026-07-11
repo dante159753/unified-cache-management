@@ -76,6 +76,11 @@ configured GitHub token file mode at `0600`. Install the service and timer from
 `a2_scheduler/systemd/`, then reload systemd. Do not enable the timer until the
 read-only checks and operator validation below have passed.
 
+Set `lock_file` to `/run/ucm-a2-scheduler/card7.lock`. The service creates
+`/run/ucm-a2-scheduler` as a root-owned runtime directory with mode `0700`; the
+lock refuses symlinks, non-root ownership, non-file/non-directory objects, and
+any group/other permissions.
+
 ## Read-only checks
 
 Neither command acquires the scheduler lock, writes state, changes device
@@ -102,9 +107,18 @@ Lock contention exits with status `75` without mutating scheduler state or host
 resources.
 
 ```bash
+sudo install -d -o root -g root -m 0700 /run/ucm-a2-scheduler
 cd /opt/ucm-a2-scheduler
 sudo /usr/bin/python3 -m a2_scheduler.cli reconcile --config /etc/ucm-a2-scheduler/config.json
 ```
+
+The exit status describes the current invocation, not the persisted phase or
+historical `last_error`. A failed allocation that rolls back safely to `WHOLE`
+still exits nonzero; a healthy run carrying old diagnostic text exits zero.
+If the command reports that state replacement completed but directory `fsync`
+failed, the visible state file is new but its crash durability is uncertain.
+Treat that invocation as failed, inspect status and host state, and do not retry
+mutating work until they agree.
 
 ## Create/rollback validation
 
@@ -118,6 +132,29 @@ discovered IDs, and requires a zero-vNPU result.
 ```bash
 cd /opt/ucm-a2-scheduler
 sudo /usr/bin/python3 -m a2_scheduler.cli validate-create-rollback --fail-before-create 3 --config /etc/ucm-a2-scheduler/config.json
+```
+
+Any failure after the first create enters the same guarded cleanup path.
+Cleanup re-discovers IDs, re-checks GitHub policy and stopped runners before
+each batch, and relies on a fresh card-PID guard before every destroy command.
+If policy, runner, PID, inventory, or destroy checks fail, one or more IDs can
+remain. The error preserves both the primary validation failure and cleanup
+failure. Keep the timer disabled and inspect before recovery:
+
+```bash
+sudo systemctl disable --now ucm-a2-scheduler.timer
+sudo /usr/bin/python3 -m a2_scheduler.cli status --config /etc/ucm-a2-scheduler/config.json
+sudo npu-smi info -t info-vnpu -i 7 -c 0
+sudo npu-smi info -t proc-mem -i 7 -c 0
+sudo docker ps --format '{{.Names}}' | grep '^ucm-a2-vnpu-runner-' || true
+```
+
+Only after target jobs, scheduler runners, and card 7 PIDs are all absent,
+destroy each positively identified validation-created ID and verify zero:
+
+```bash
+sudo npu-smi set -t destroy-vnpu -i 7 -c 0 -v <ID>
+sudo npu-smi info -t info-vnpu -i 7 -c 0
 ```
 
 ## Disable and restore the whole card

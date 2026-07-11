@@ -8,4 +8,6 @@ Type=oneshot
 User=root
 WorkingDirectory=/opt/ucm-a2-scheduler
 Environment=PYTHONPATH=/opt/ucm-a2-scheduler
+RuntimeDirectory=ucm-a2-scheduler
+RuntimeDirectoryMode=0700
 ExecStart=/usr/bin/python3 -m a2_scheduler.cli reconcile --config /etc/ucm-a2-scheduler/config.json

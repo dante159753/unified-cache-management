@@ -3,6 +3,7 @@ import errno
 import importlib
 import json
 import os
+import stat
 import tempfile
 from dataclasses import replace
 from datetime import datetime
@@ -11,7 +12,7 @@ from typing import Callable, Dict, List, Optional, Sequence
 
 from .github_client import GitHubClient, GitHubUnavailable
 from .host import CommandRunner, NpuManager
-from .models import Job, Phase, SchedulerConfig, SchedulerState, load_config
+from .models import Job, SchedulerConfig, SchedulerState, load_config
 from .reconciler import Reconciler
 from .runners import RunnerManager
 
@@ -27,48 +28,85 @@ class InjectedCreateFailure(RuntimeError):
     pass
 
 
+class StatePersistenceUncertainError(RuntimeError):
+    pass
+
+
 class LinuxFileLock:
     def __init__(
         self,
         path: Path,
         fcntl_loader: Callable[[], object] = lambda: importlib.import_module("fcntl"),
+        os_module=os,
     ) -> None:
         self.path = Path(path)
         self.fcntl_loader = fcntl_loader
-        self.handle = None
+        self.os = os_module
+        self.descriptor = None
         self.fcntl = None
 
     def acquire(self, blocking: bool = False) -> bool:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        handle = self.path.open("a+")
         try:
-            fcntl = self.fcntl_loader()
-        except Exception:
-            handle.close()
-            raise
-        flags = fcntl.LOCK_EX
-        if not blocking:
-            flags |= fcntl.LOCK_NB
-        try:
-            fcntl.flock(handle.fileno(), flags)
+            directory_info = self.os.lstat(str(self.path.parent))
         except OSError as error:
-            handle.close()
+            raise CliError("lock directory is unavailable") from error
+        self._validate_metadata(directory_info, directory=True)
+        try:
+            path_info = self.os.lstat(str(self.path))
+        except FileNotFoundError:
+            path_info = None
+        except OSError as error:
+            raise CliError("lock file metadata is unavailable") from error
+        if path_info is not None:
+            self._validate_metadata(path_info, directory=False)
+
+        try:
+            flags = self.os.O_NOFOLLOW | self.os.O_CREAT | self.os.O_RDWR
+        except AttributeError as error:
+            raise CliError("secure lock open flags are unavailable") from error
+        flags |= getattr(self.os, "O_CLOEXEC", 0)
+        descriptor = self.os.open(str(self.path), flags, 0o600)
+        try:
+            self._validate_metadata(self.os.fstat(descriptor), directory=False)
+            fcntl = self.fcntl_loader()
+            lock_flags = fcntl.LOCK_EX
+            if not blocking:
+                lock_flags |= fcntl.LOCK_NB
+            fcntl.flock(descriptor, lock_flags)
+        except OSError as error:
+            self.os.close(descriptor)
             if error.errno in (errno.EACCES, errno.EAGAIN):
                 return False
             raise
-        self.handle = handle
+        except Exception:
+            self.os.close(descriptor)
+            raise
+        self.descriptor = descriptor
         self.fcntl = fcntl
         return True
 
     def release(self) -> None:
-        if self.handle is None:
+        if self.descriptor is None:
             return
         try:
-            self.fcntl.flock(self.handle.fileno(), self.fcntl.LOCK_UN)
+            self.fcntl.flock(self.descriptor, self.fcntl.LOCK_UN)
         finally:
-            self.handle.close()
-            self.handle = None
+            self.os.close(self.descriptor)
+            self.descriptor = None
             self.fcntl = None
+
+    @staticmethod
+    def _validate_metadata(info, directory: bool) -> None:
+        correct_type = (
+            stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+        )
+        label = "lock directory" if directory else "lock file"
+        if not correct_type:
+            raise CliError("{} has an invalid type".format(label))
+        if info.st_uid != 0:
+            raise CliError("{} is not root-owned".format(label))
+        if info.st_mode & 0o077:
+            raise CliError("{} permits group or other access".format(label))
 
 
 class AtomicStateStore:
@@ -101,7 +139,13 @@ class AtomicStateStore:
                 os.fsync(handle.fileno())
             os.replace(str(temporary), str(self.path))
             temporary = None
-            self._fsync_directory()
+            try:
+                self._fsync_directory()
+            except Exception as error:
+                raise StatePersistenceUncertainError(
+                    "state replace completed but directory fsync failed; "
+                    "durability is uncertain"
+                ) from error
         finally:
             if temporary is not None:
                 try:
@@ -242,7 +286,7 @@ class SchedulerCli:
         )
         result = reconciler.reconcile(self.dependencies.clock())
         self._print_json(self._state_document(result, "reconcile"))
-        return 1 if result.phase == Phase.ERROR else 0
+        return 1 if reconciler.outcome.failed else 0
 
     def _observe(self, command: str, config: SchedulerConfig) -> int:
         command_runner, github, npu, _ = self._components(config)
@@ -292,15 +336,28 @@ class SchedulerCli:
                 config.vnpu_template,
                 on_created=inject_before_third,
             )
-        except InjectedCreateFailure:
-            pass
-        if len(created) != 2:
-            raise CliError("validation did not stop after exactly two creates")
-        self._require_cleanup_policy(config, command_runner, github)
-        npu.destroy_vnpus([vnpu.id for vnpu in created])
-        remaining = npu.list_vnpus()
-        if remaining:
-            raise CliError("validation cleanup did not restore zero vNPUs")
+        except Exception as error:
+            primary_error = error
+        else:
+            primary_error = CliError("validation fault injection did not occur")
+
+        try:
+            cleaned_ids = self._cleanup_validation_vnpus(
+                config,
+                command_runner,
+                github,
+                npu,
+                [vnpu.id for vnpu in created],
+            )
+        except Exception as cleanup_error:
+            raise CliError(
+                "{}; cleanup failed: {}".format(primary_error, cleanup_error)
+            ) from primary_error
+
+        if not isinstance(primary_error, InjectedCreateFailure):
+            raise CliError(str(primary_error)) from primary_error
+        if len(cleaned_ids) != 2:
+            raise CliError("validation did not create and clean exactly two vNPUs")
         self._print_json(
             {
                 "command": "validate-create-rollback",
@@ -310,6 +367,28 @@ class SchedulerCli:
             }
         )
         return 0
+
+    def _cleanup_validation_vnpus(self, config, command_runner, github, npu, known_ids):
+        pending = set(known_ids)
+        cleaned = set()
+        for _ in range(config.vnpu_count + 1):
+            try:
+                pending.update(vnpu.id for vnpu in npu.list_vnpus())
+            except Exception as error:
+                if not pending:
+                    raise CliError(
+                        "could not discover remaining validation vNPUs: {}".format(
+                            error
+                        )
+                    ) from error
+            if not pending:
+                return tuple(sorted(cleaned))
+            self._require_cleanup_policy(config, command_runner, github)
+            batch = tuple(sorted(pending))
+            npu.destroy_vnpus(batch)
+            cleaned.update(batch)
+            pending.clear()
+        raise CliError("validation cleanup could not prove zero vNPUs")
 
     def _require_validation_preconditions(
         self, config, command_runner, npu, github

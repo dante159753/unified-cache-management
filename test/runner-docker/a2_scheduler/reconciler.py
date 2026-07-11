@@ -1,5 +1,5 @@
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from threading import Lock
 from typing import Callable, List, Optional, Sequence, Tuple
@@ -15,6 +15,20 @@ class StateCheckpointError(RuntimeError):
     def __init__(self, message: str, state: SchedulerState) -> None:
         super().__init__(message)
         self.state = state
+
+
+@dataclass(frozen=True)
+class ReconcileOutcome:
+    failed: bool
+    error: Optional[str] = None
+
+    @classmethod
+    def success(cls) -> "ReconcileOutcome":
+        return cls(failed=False)
+
+    @classmethod
+    def failed_run(cls, error: str) -> "ReconcileOutcome":
+        return cls(failed=True, error=error)
 
 
 class Reconciler:
@@ -39,8 +53,10 @@ class Reconciler:
         self.sleep = sleep
         self._time_lock = Lock()
         self.now = clock()
+        self.outcome = ReconcileOutcome.success()
 
     def reconcile(self, now: datetime) -> SchedulerState:
+        self.outcome = ReconcileOutcome.success()
         self._record_time(now)
         if not self._state_mode_is_valid():
             return self._corrupt_state("original device mode is invalid")
@@ -225,6 +241,7 @@ class Reconciler:
             try:
                 self.runners.restart_exited(allow_start=self._allow_start)
             except RunnerOperationError as error:
+                self._record_failure(error)
                 if self._after_cutoff(self._latest_time()):
                     return self._drain_or_restore()
                 return self._error(error)
@@ -290,6 +307,7 @@ class Reconciler:
         return self._restore_allocation()
 
     def _rollback(self, cause: Exception) -> SchedulerState:
+        self._record_failure(cause)
         jobs = self._jobs()
         if jobs is None and not self._after_cutoff(self._latest_time()):
             return self._error(
@@ -309,6 +327,8 @@ class Reconciler:
         runners_stopped: bool = False,
         initial_checkpoint: bool = True,
     ) -> SchedulerState:
+        if cause is not None:
+            self._record_failure(cause)
         try:
             inventory = self.npu.list_vnpus()
         except NpuOperationError as error:
@@ -369,6 +389,7 @@ class Reconciler:
     def _restore_mode_only(
         self, original_mode: int, cause: Exception
     ) -> SchedulerState:
+        self._record_failure(cause)
         try:
             self.npu.restore_device(original_mode)
         except NpuOperationError as error:
@@ -440,6 +461,7 @@ class Reconciler:
         return not models.device_mode_is_usable(mode)
 
     def _corrupt_state(self, message: str) -> SchedulerState:
+        self._record_failure(RuntimeError(message))
         return replace(
             self.state,
             transition_timestamp=self._latest_time().isoformat(),
@@ -464,7 +486,8 @@ class Reconciler:
     def _jobs(self) -> Optional[List[Job]]:
         try:
             return self.github.list_target_jobs()
-        except GitHubUnavailable:
+        except GitHubUnavailable as error:
+            self._record_failure(error)
             return None
 
     @staticmethod
@@ -482,13 +505,15 @@ class Reconciler:
     def _observed_ids(self) -> Tuple[int, ...]:
         try:
             return self._ids(self.npu.list_vnpus())
-        except NpuOperationError:
+        except NpuOperationError as error:
+            self._record_failure(error)
             return self.state.vnpu_ids
 
     def _checkpoint(self, state: SchedulerState) -> SchedulerState:
         try:
             self.checkpoint(state)
         except Exception as error:
+            self._record_failure(error)
             raise StateCheckpointError(
                 "state checkpoint failed: {}".format(error), state
             ) from error
@@ -519,6 +544,7 @@ class Reconciler:
         original_device_mode: Optional[int] = None,
         persist: bool = True,
     ) -> SchedulerState:
+        self._record_failure(error)
         effective_mode = (
             self.state.original_device_mode
             if original_device_mode is None
@@ -545,11 +571,16 @@ class Reconciler:
             return state
 
     def _whole_with_error(self, error: Exception) -> SchedulerState:
+        self._record_failure(error)
         return SchedulerState(
             phase=Phase.WHOLE,
             transition_timestamp=self._latest_time().isoformat(),
             last_error=str(error),
         )
+
+    def _record_failure(self, error: Exception) -> None:
+        if not self.outcome.failed:
+            self.outcome = ReconcileOutcome.failed_run(str(error))
 
     @staticmethod
     def _combined(first: Optional[Exception], second: Exception) -> Exception:
