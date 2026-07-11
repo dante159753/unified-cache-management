@@ -61,13 +61,16 @@ class ScriptedRunner:
         if "info-vnpu" in argv:
             return ok(inventory(self.inventory_ids))
         result = self.results.pop(0)
+        if "destroy-vnpu" in argv:
+            vnpu_id = int(argv[argv.index("-v") + 1])
+            self.destroyed_ids.append(vnpu_id)
+        if isinstance(result, BaseException):
+            raise result
         if "create-vnpu" in argv and result.returncode == 0:
             new_id = 212 + len(self.created_ids)
             self.created_ids.append(new_id)
             self.inventory_ids.append(new_id)
         if "destroy-vnpu" in argv:
-            vnpu_id = int(argv[argv.index("-v") + 1])
-            self.destroyed_ids.append(vnpu_id)
             if result.returncode == 0:
                 self.inventory_ids.remove(vnpu_id)
         return result
@@ -93,7 +96,7 @@ def test_parse_empty_vnpu_inventory():
     assert parse_info_vnpu(load_fixture("info-vnpu-zero.txt")) == []
 
 
-def test_parse_card_processes_ignores_other_cards_and_nonpositive_pids():
+def test_parse_card_processes_ignores_other_cards():
     assert parse_proc_mem(load_fixture("proc-mem-card7.txt"), card_id=7) == [
         4312,
         8765,
@@ -102,6 +105,29 @@ def test_parse_card_processes_ignores_other_cards_and_nonpositive_pids():
 
 def test_parse_actual_no_process_message():
     assert parse_proc_mem(load_fixture("proc-mem-none.txt"), card_id=7) == []
+
+
+def test_process_parser_accepts_no_process_marker_only_as_exact_output():
+    with pytest.raises(NpuOperationError, match="parse NPU process"):
+        parse_proc_mem(load_fixture("proc-mem-no-process-with-row.txt"), card_id=7)
+
+
+@pytest.mark.parametrize(
+    "fixture_name",
+    ["info-vnpu-malformed-id.txt", "info-vnpu-short-row.txt"],
+)
+def test_vnpu_parser_rejects_malformed_selected_rows(fixture_name):
+    with pytest.raises(NpuOperationError, match="parse vNPU"):
+        parse_info_vnpu(load_fixture(fixture_name))
+
+
+@pytest.mark.parametrize(
+    "fixture_name",
+    ["proc-mem-malformed-pid.txt", "proc-mem-short-row.txt"],
+)
+def test_process_parser_rejects_malformed_selected_rows(fixture_name):
+    with pytest.raises(NpuOperationError, match="parse NPU process"):
+        parse_proc_mem(load_fixture(fixture_name), card_id=7)
 
 
 def test_list_commands_use_card_and_chip_argv():
@@ -134,6 +160,26 @@ def test_partial_create_rolls_back_discovered_ids():
     with pytest.raises(NpuOperationError, match="create failed"):
         manager.create_vnpus(4, "vir05_1c_16g")
 
+    assert runner.destroyed_ids == [212, 213]
+
+
+def test_partial_create_continues_rollback_after_destroy_exception():
+    runner = ScriptedRunner(
+        [
+            ok("Create vnpu success"),
+            ok("Create vnpu success"),
+            failed("create failed"),
+            OSError("destroy 212 exploded"),
+            ok("destroy 213"),
+        ]
+    )
+    manager = NpuManager(runner, card_id=7, chip_id=0)
+
+    with pytest.raises(NpuOperationError) as caught:
+        manager.create_vnpus(4, "vir05_1c_16g")
+
+    assert "create failed" in str(caught.value)
+    assert "destroy 212 exploded" in str(caught.value)
     assert runner.destroyed_ids == [212, 213]
 
 
@@ -185,6 +231,7 @@ def test_evict_terms_waits_kills_remaining_and_requires_clean_samples():
             load_fixture("proc-mem-none.txt"),
             load_fixture("proc-mem-none.txt"),
             load_fixture("proc-mem-none.txt"),
+            load_fixture("proc-mem-none.txt"),
         ]
     )
     signals = []
@@ -213,7 +260,7 @@ def test_evict_rejects_processes_that_survive_kill():
         "| NPU ID | Chip ID | Process id | Process name | Used Memory |\n"
         "| 7 | 0 | 8765 | python3 | 2048 |\n"
     )
-    runner = ProcRunner([row, row, row])
+    runner = ProcRunner([row] * 7)
     manager = NpuManager(
         runner,
         card_id=7,
@@ -224,6 +271,47 @@ def test_evict_rejects_processes_that_survive_kill():
 
     with pytest.raises(NpuOperationError, match="remain"):
         manager.evict_card_pids()
+
+
+def test_evict_gives_new_pid_its_own_term_grace_before_kill():
+    def rows(*pids):
+        return (
+            "| NPU ID | Chip ID | Process id | Process name | Used Memory |\n"
+            + "".join("| 7 | 0 | {} | python3 | 1024 |\n".format(pid) for pid in pids)
+        )
+
+    runner = ProcRunner(
+        [
+            rows(10),
+            rows(10, 20),
+            rows(20),
+            rows(20),
+            load_fixture("proc-mem-none.txt"),
+            load_fixture("proc-mem-none.txt"),
+            load_fixture("proc-mem-none.txt"),
+            load_fixture("proc-mem-none.txt"),
+        ]
+    )
+    events = []
+    manager = NpuManager(
+        runner,
+        card_id=7,
+        chip_id=0,
+        eviction_grace_seconds=30,
+        kill=lambda pid, sig: events.append(("signal", pid, sig)),
+        sleep=lambda seconds: events.append(("sleep", seconds)),
+    )
+
+    manager.evict_card_pids()
+
+    assert events[:6] == [
+        ("signal", 10, SIGTERM),
+        ("sleep", 30),
+        ("signal", 10, SIGKILL),
+        ("signal", 20, SIGTERM),
+        ("sleep", 30),
+        ("signal", 20, SIGKILL),
+    ]
 
 
 def test_restrict_and_restore_device_preserve_exact_stat_mode():

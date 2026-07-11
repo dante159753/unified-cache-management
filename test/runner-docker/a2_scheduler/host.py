@@ -9,6 +9,7 @@ from .models import Vnpu
 
 SIGTERM = getattr(signal, "SIGTERM", 15)
 SIGKILL = getattr(signal, "SIGKILL", 9)
+MAX_EVICTION_ROUNDS = 3
 
 
 @dataclass(frozen=True)
@@ -62,8 +63,6 @@ def parse_info_vnpu(output: str) -> List[Vnpu]:
         None,
     )
     if header_position is None:
-        if not output.strip():
-            return []
         raise NpuOperationError("could not parse vNPU inventory")
     headers = rows[header_position]
     try:
@@ -73,19 +72,20 @@ def parse_info_vnpu(output: str) -> List[Vnpu]:
         raise NpuOperationError("could not parse vNPU inventory") from error
     vnpus = []
     for row in rows[header_position + 1 :]:
-        if len(row) <= max(id_index, template_index):
-            continue
+        if len(row) != len(headers):
+            raise NpuOperationError("could not parse vNPU inventory row")
         try:
             vnpu_id = int(row[id_index])
-        except ValueError:
-            continue
-        if vnpu_id >= 0 and row[template_index]:
-            vnpus.append(Vnpu(vnpu_id, row[template_index]))
+        except ValueError as error:
+            raise NpuOperationError("could not parse vNPU inventory row") from error
+        if vnpu_id <= 0 or not row[template_index]:
+            raise NpuOperationError("could not parse vNPU inventory row")
+        vnpus.append(Vnpu(vnpu_id, row[template_index]))
     return vnpus
 
 
 def parse_proc_mem(output: str, card_id: int) -> List[int]:
-    if "No process in device." in output:
+    if output.strip() == "No process in device.":
         return []
     rows = _table_rows(output)
     header_position = next(
@@ -108,14 +108,18 @@ def parse_proc_mem(output: str, card_id: int) -> List[int]:
         raise NpuOperationError("could not parse NPU process inventory") from error
     pids = []
     for row in rows[header_position + 1 :]:
-        if len(row) <= max(card_index, pid_index):
-            continue
+        if len(row) != len(headers):
+            raise NpuOperationError("could not parse NPU process inventory row")
         try:
             row_card_id = int(row[card_index])
             pid = int(row[pid_index])
-        except ValueError:
-            continue
-        if row_card_id == card_id and pid > 0 and pid not in pids:
+        except ValueError as error:
+            raise NpuOperationError(
+                "could not parse NPU process inventory row"
+            ) from error
+        if row_card_id < 0 or pid <= 0:
+            raise NpuOperationError("could not parse NPU process inventory row")
+        if row_card_id == card_id and pid not in pids:
             pids.append(pid)
     return pids
 
@@ -186,11 +190,23 @@ class NpuManager:
         return parse_proc_mem(result.stdout, self.card_id)
 
     def evict_card_pids(self) -> None:
-        for pid in self.list_card_pids():
-            self._signal(pid, SIGTERM)
-        self.sleep(self.eviction_grace_seconds)
-        for pid in self.list_card_pids():
-            self._signal(pid, SIGKILL)
+        current = set(self.list_card_pids())
+        for _ in range(MAX_EVICTION_ROUNDS):
+            if not current:
+                break
+            terminated = current
+            for pid in sorted(terminated):
+                self._signal(pid, SIGTERM)
+            self.sleep(self.eviction_grace_seconds)
+            survivors = set(self.list_card_pids())
+            for pid in sorted(terminated.intersection(survivors)):
+                self._signal(pid, SIGKILL)
+            current = set(self.list_card_pids())
+        if current:
+            raise NpuOperationError(
+                "NPU processes remain because churn did not clear after {} eviction "
+                "rounds".format(MAX_EVICTION_ROUNDS)
+            )
         for _ in range(3):
             self.sleep(1)
             remaining = self.list_card_pids()
@@ -231,11 +247,16 @@ class NpuManager:
     def _destroy_all(self, vnpu_ids: Iterable[int]) -> List[str]:
         errors = []
         for vnpu_id in vnpu_ids:
-            result = self._run(self._set_argv("destroy-vnpu") + ["-v", str(vnpu_id)])
-            if result.returncode != 0:
-                errors.append(
-                    self._error_message(result, "destroy vNPU {}".format(vnpu_id))
+            operation = "destroy vNPU {}".format(vnpu_id)
+            try:
+                result = self._run(
+                    self._set_argv("destroy-vnpu") + ["-v", str(vnpu_id)]
                 )
+            except NpuOperationError as error:
+                errors.append("{} failed: {}".format(operation, error))
+                continue
+            if result.returncode != 0:
+                errors.append(self._error_message(result, operation))
         return errors
 
     def restrict_device(self) -> int:
