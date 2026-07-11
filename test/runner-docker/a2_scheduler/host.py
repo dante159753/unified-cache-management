@@ -1,4 +1,5 @@
 import os
+import re
 import signal
 import subprocess
 import time
@@ -43,14 +44,16 @@ def _normalized_row(cells: Sequence[str]) -> Tuple[str, ...]:
     return tuple(" ".join(cell.lower().split()) for cell in cells)
 
 
-def _is_separator(line: str) -> bool:
+def _separator_geometry(line: str) -> Optional[Tuple[str, Tuple[int, ...]]]:
     if len(line) < 5 or not line.startswith("+") or not line.endswith("+"):
-        return False
+        return None
     segments = line[1:-1].split("+")
-    return all(
-        len(segment) >= 3 and len(set(segment)) == 1 and segment[0] in "-="
-        for segment in segments
-    )
+    if not segments or any(len(segment) < 3 for segment in segments):
+        return None
+    styles = {character for segment in segments for character in set(segment)}
+    if len(styles) != 1 or not styles.issubset({"-", "="}):
+        return None
+    return next(iter(styles)), tuple(len(segment) for segment in segments)
 
 
 def _selected_table(
@@ -59,13 +62,12 @@ def _selected_table(
     error_message: str,
     allow_empty: bool = False,
 ) -> Tuple[List[str], List[List[str]]]:
-    lines = output.splitlines()
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
     header_position = None
     headers = None
     for index, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith("|") and stripped.endswith("|"):
-            cells = _table_cells(stripped)
+        if line.startswith("|") and line.endswith("|"):
+            cells = _table_cells(line)
             if is_header(cells):
                 header_position = index
                 headers = cells
@@ -73,35 +75,47 @@ def _selected_table(
     if header_position is None or headers is None:
         raise NpuOperationError(error_message)
 
+    if header_position == 0 or header_position + 1 >= len(lines):
+        raise NpuOperationError(error_message)
+    geometry = _separator_geometry(lines[header_position - 1])
+    if geometry is None or _separator_geometry(lines[header_position + 1]) != geometry:
+        raise NpuOperationError(error_message)
+    _, widths = geometry
+    if len(widths) != len(headers) or any(
+        width < len(header) + 2 for width, header in zip(widths, headers)
+    ):
+        raise NpuOperationError(error_message)
+
     rows = []
     normalized_headers = _normalized_row(headers)
-    separator_count = 0
-    separator_pending = False
-    for line in lines[header_position + 1 :]:
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if _is_separator(stripped):
-            separator_count += 1
-            if separator_pending:
-                raise NpuOperationError(error_message)
-            separator_pending = True
-            continue
-        starts_row = stripped.startswith("|")
-        ends_row = stripped.endswith("|")
-        if starts_row != ends_row or "|" in stripped and not starts_row:
+    position = header_position + 2
+    while position < len(lines):
+        line = lines[position]
+        if not line.startswith("|") or not line.endswith("|"):
             raise NpuOperationError(error_message)
-        if starts_row:
-            cells = _table_cells(stripped)
-            if _normalized_row(cells) == normalized_headers:
-                raise NpuOperationError(error_message)
-            rows.append(cells)
-            separator_pending = False
-            continue
-        raise NpuOperationError(error_message)
-    if not rows and (separator_count == 0 or not allow_empty):
+        cells = _table_cells(line)
+        if len(cells) != len(headers) or _normalized_row(cells) == normalized_headers:
+            raise NpuOperationError(error_message)
+        rows.append(cells)
+        position += 1
+        if position >= len(lines) or _separator_geometry(lines[position]) != geometry:
+            raise NpuOperationError(error_message)
+        position += 1
+    if not rows and not allow_empty:
         raise NpuOperationError(error_message)
     return headers, rows
+
+
+def _vnpu_count(output: str) -> int:
+    pattern = re.compile(r"\| Total number of vnpu: (0|[1-9][0-9]*)\s+\|")
+    matches = []
+    for line in output.splitlines():
+        match = pattern.fullmatch(line.strip())
+        if match is not None:
+            matches.append(match)
+    if len(matches) != 1:
+        raise NpuOperationError("could not parse vNPU inventory")
+    return int(matches[0].group(1))
 
 
 def _header_index(headers: Sequence[str], *names: str) -> int:
@@ -113,12 +127,15 @@ def _header_index(headers: Sequence[str], *names: str) -> int:
 
 
 def parse_info_vnpu(output: str) -> List[Vnpu]:
+    expected_count = _vnpu_count(output)
     headers, rows = _selected_table(
         output,
         lambda row: "vnpu id" in [cell.lower() for cell in row],
         "could not parse vNPU inventory",
         allow_empty=True,
     )
+    if len(rows) != expected_count:
+        raise NpuOperationError("could not parse vNPU inventory")
     try:
         id_index = _header_index(headers, "vnpu id")
         template_index = _header_index(headers, "template name")

@@ -42,11 +42,30 @@ def inventory(ids):
         for vnpu_id in ids
     )
     return """\
+| Total number of vnpu: {count:<55} |
 {separator}
 | Vnpu ID        | Vgroup ID      | Container ID   | Status         | Template Name        |
 {separator}
 {rows}
 """.format(
+        count=len(ids), rows=rows, separator=separator
+    )
+
+
+def process_inventory(*pids):
+    separator = (
+        "+----------+----------+-------------+----------------------+-------------+"
+    )
+    rows = "".join(
+        "| 7        | 0        | {0:<11} | python3              | 1024        |\n"
+        "{1}\n".format(pid, separator)
+        for pid in pids
+    )
+    return """\
+{separator}
+| NPU ID   | Chip ID  | Process id  | Process name         | Used Memory |
+{separator}
+{rows}""".format(
         rows=rows, separator=separator
     )
 
@@ -148,9 +167,30 @@ EMPTY_PROCESS_TABLE_FIXTURES = [
     "proc-mem-truncated-row.txt",
 ]
 
+UNSAFE_PROCESS_GEOMETRY_FIXTURES = [
+    "proc-mem-off-card-row-eof.txt",
+    "proc-mem-target-row-eof.txt",
+    "proc-mem-degenerate-closing-border.txt",
+    "proc-mem-mixed-closing-border.txt",
+    "proc-mem-wrong-geometry-closing-border.txt",
+]
+
+UNSAFE_VNPU_GEOMETRY_FIXTURES = [
+    "info-vnpu-row-eof.txt",
+    "info-vnpu-degenerate-closing-border.txt",
+    "info-vnpu-mixed-closing-border.txt",
+    "info-vnpu-wrong-geometry-closing-border.txt",
+]
+
 
 @pytest.mark.parametrize("fixture_name", EMPTY_PROCESS_TABLE_FIXTURES)
 def test_process_parser_rejects_selected_table_without_complete_rows(fixture_name):
+    with pytest.raises(NpuOperationError, match="parse NPU process"):
+        parse_proc_mem(load_fixture(fixture_name), card_id=7)
+
+
+@pytest.mark.parametrize("fixture_name", UNSAFE_PROCESS_GEOMETRY_FIXTURES)
+def test_process_parser_rejects_incomplete_or_mismatched_geometry(fixture_name):
     with pytest.raises(NpuOperationError, match="parse NPU process"):
         parse_proc_mem(load_fixture(fixture_name), card_id=7)
 
@@ -167,6 +207,26 @@ def test_vnpu_parser_rejects_malformed_selected_rows(fixture_name):
 def test_vnpu_parser_rejects_truncated_selected_row():
     with pytest.raises(NpuOperationError, match="parse vNPU"):
         parse_info_vnpu(load_fixture("info-vnpu-truncated-row.txt"))
+
+
+@pytest.mark.parametrize("fixture_name", UNSAFE_VNPU_GEOMETRY_FIXTURES)
+def test_vnpu_parser_rejects_incomplete_or_mismatched_geometry(fixture_name):
+    with pytest.raises(NpuOperationError, match="parse vNPU"):
+        parse_info_vnpu(load_fixture(fixture_name))
+
+
+@pytest.mark.parametrize(
+    "fixture_name",
+    [
+        "info-vnpu-count-too-high.txt",
+        "info-vnpu-count-zero-with-row.txt",
+        "info-vnpu-count-one-with-empty-table.txt",
+        "info-vnpu-zero-no-count.txt",
+    ],
+)
+def test_vnpu_parser_rejects_missing_or_mismatched_count(fixture_name):
+    with pytest.raises(NpuOperationError, match="parse vNPU"):
+        parse_info_vnpu(load_fixture(fixture_name))
 
 
 @pytest.mark.parametrize(
@@ -338,6 +398,22 @@ def test_destroy_issues_no_command_for_empty_or_truncated_process_table(fixture_
     assert not any("destroy-vnpu" in argv for argv, _ in runner.commands)
 
 
+@pytest.mark.parametrize("fixture_name", UNSAFE_PROCESS_GEOMETRY_FIXTURES)
+def test_destroy_issues_no_command_for_incomplete_or_mismatched_geometry(fixture_name):
+    runner = ScriptedRunner(
+        [],
+        initial_ids=(212,),
+        pid_results=[ok(load_fixture(fixture_name))],
+    )
+    manager = NpuManager(runner, card_id=7, chip_id=0)
+
+    with pytest.raises(NpuOperationError, match="parse NPU process"):
+        manager.destroy_vnpus([212])
+
+    assert runner.destroyed_ids == []
+    assert not any("destroy-vnpu" in argv for argv, _ in runner.commands)
+
+
 def test_create_callback_failure_retains_discoverable_ids_without_destroy():
     class PersistenceFailure(RuntimeError):
         pass
@@ -385,8 +461,7 @@ def test_evict_terms_waits_kills_remaining_and_requires_clean_samples():
     runner = ProcRunner(
         [
             load_fixture("proc-mem-card7.txt"),
-            "| NPU ID | Chip ID | Process id | Process name | Used Memory |\n"
-            "| 7 | 0 | 8765 | python3 | 2048 |\n",
+            process_inventory(8765),
             load_fixture("proc-mem-none.txt"),
             load_fixture("proc-mem-none.txt"),
             load_fixture("proc-mem-none.txt"),
@@ -415,10 +490,7 @@ def test_evict_terms_waits_kills_remaining_and_requires_clean_samples():
 
 
 def test_evict_rejects_processes_that_survive_kill():
-    row = (
-        "| NPU ID | Chip ID | Process id | Process name | Used Memory |\n"
-        "| 7 | 0 | 8765 | python3 | 2048 |\n"
-    )
+    row = process_inventory(8765)
     runner = ProcRunner([row] * 7)
     manager = NpuManager(
         runner,
@@ -433,18 +505,12 @@ def test_evict_rejects_processes_that_survive_kill():
 
 
 def test_evict_gives_new_pid_its_own_term_grace_before_kill():
-    def rows(*pids):
-        return (
-            "| NPU ID | Chip ID | Process id | Process name | Used Memory |\n"
-            + "".join("| 7 | 0 | {} | python3 | 1024 |\n".format(pid) for pid in pids)
-        )
-
     runner = ProcRunner(
         [
-            rows(10),
-            rows(10, 20),
-            rows(20),
-            rows(20),
+            process_inventory(10),
+            process_inventory(10, 20),
+            process_inventory(20),
+            process_inventory(20),
             load_fixture("proc-mem-none.txt"),
             load_fixture("proc-mem-none.txt"),
             load_fixture("proc-mem-none.txt"),
