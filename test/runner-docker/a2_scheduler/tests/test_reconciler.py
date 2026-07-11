@@ -82,6 +82,7 @@ class FakeNpu:
         self.partial_create = ()
         self.verify_failure = False
         self.restore_completed = False
+        self.restore_readback_mode = None
         self.device_mode = 0o20660
 
     @property
@@ -142,6 +143,9 @@ class FakeNpu:
         self.restored_modes.append(mode)
         if self.fail == "restore":
             raise NpuOperationError("restore failed")
+        self.device_mode = (
+            mode if self.restore_readback_mode is None else self.restore_readback_mode
+        )
         self.restore_completed = True
 
 
@@ -1004,8 +1008,8 @@ def test_allocation_phase_without_original_mode_never_runs_lifecycle(phase):
 
 
 @pytest.mark.parametrize("phase", list(Phase))
-@pytest.mark.parametrize("mode", [0, -1])
-def test_corrupt_nonpositive_original_mode_never_mutates_host(phase, mode):
+@pytest.mark.parametrize("mode", [0, -1, 0o20000])
+def test_corrupt_original_mode_never_mutates_host(phase, mode):
     fixture = SchedulerFixture(
         phase=phase,
         queued=1,
@@ -1190,4 +1194,23 @@ def test_whole_card_verification_failure_prevents_whole_checkpoint():
     assert state.phase == Phase.ERROR
     assert fixture.npu.restored_modes == [0o20660]
     assert fixture.checkpoint.states[-1].phase == Phase.ERROR
+    assert not any(state.phase == Phase.WHOLE for state in fixture.checkpoint.states)
+
+
+@pytest.mark.parametrize("readback_mode", [0o20640, 0o20000])
+def test_restore_readback_must_match_saved_usable_mode(readback_mode):
+    fixture = SchedulerFixture(
+        phase=Phase.RESTORING,
+        vnpu_ids=(),
+        inventory=[],
+        original_mode=0o20660,
+        checkpoint=True,
+    )
+    fixture.npu.restore_readback_mode = readback_mode
+
+    state = fixture.reconcile()
+
+    assert state.phase == Phase.ERROR
+    assert state.original_device_mode == 0o20660
+    assert fixture.events.index("restore") < fixture.events.index("read_mode")
     assert not any(state.phase == Phase.WHOLE for state in fixture.checkpoint.states)

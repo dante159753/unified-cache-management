@@ -4,6 +4,7 @@ from datetime import datetime
 from threading import Lock
 from typing import Callable, List, Optional, Sequence, Tuple
 
+from . import models
 from .github_client import GitHubUnavailable
 from .host import NpuOperationError
 from .models import Job, Phase, SchedulerConfig, SchedulerState, Vnpu
@@ -350,7 +351,7 @@ class Reconciler:
                     original_device_mode=original_mode,
                 )
 
-        verification_error = self._verify_whole_inventory(cause)
+        verification_error = self._verify_whole_card(cause, original_mode)
         if verification_error is not None:
             return verification_error
 
@@ -369,14 +370,28 @@ class Reconciler:
                 vnpu_ids=(),
                 original_device_mode=original_mode,
             )
-        verification_error = self._verify_whole_inventory(cause)
+        verification_error = self._verify_whole_card(cause, original_mode)
         if verification_error is not None:
             return verification_error
         return self._checkpoint(self._whole_with_error(cause))
 
-    def _verify_whole_inventory(
-        self, cause: Optional[Exception]
+    def _verify_whole_card(
+        self, cause: Optional[Exception], expected_mode: int
     ) -> Optional[SchedulerState]:
+        try:
+            actual_mode = self.npu.read_device_mode()
+        except NpuOperationError as error:
+            return self._error(self._combined(cause, error), vnpu_ids=())
+        if actual_mode != expected_mode or not models.device_mode_is_usable(
+            actual_mode
+        ):
+            return self._error(
+                self._combined(
+                    cause,
+                    RuntimeError("physical device mode was not restored"),
+                ),
+                vnpu_ids=(),
+            )
         try:
             inventory = self.npu.list_vnpus()
         except NpuOperationError as error:
@@ -408,13 +423,13 @@ class Reconciler:
 
     def _state_mode_is_valid(self) -> bool:
         mode = self.state.original_device_mode
-        if mode is not None and mode <= 0:
+        if mode is not None and not models.device_mode_is_usable(mode):
             return False
         return self.state.phase == Phase.WHOLE or mode is not None
 
     @staticmethod
     def _mode_is_restricted(mode: int) -> bool:
-        return mode <= 0 or mode & 0o7777 == 0
+        return not models.device_mode_is_usable(mode)
 
     def _corrupt_state(self, message: str) -> SchedulerState:
         return replace(
@@ -501,7 +516,7 @@ class Reconciler:
             if original_device_mode is None
             else original_device_mode
         )
-        if effective_mode is None or effective_mode <= 0:
+        if effective_mode is None or not models.device_mode_is_usable(effective_mode):
             return self._corrupt_state(str(error))
         state = SchedulerState(
             phase=Phase.ERROR,

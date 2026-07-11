@@ -26,6 +26,10 @@ class Phase(str, Enum):
     ERROR = "ERROR"
 
 
+def device_mode_is_usable(mode: int) -> bool:
+    return mode > 0 and mode & 0o7777 != 0
+
+
 @dataclass(frozen=True)
 class Job:
     id: int
@@ -106,6 +110,10 @@ class SchedulerState:
         original_device_mode = _optional_integer(
             data["original_device_mode"], "state.original_device_mode", minimum=1
         )
+        if original_device_mode is not None and not device_mode_is_usable(
+            original_device_mode
+        ):
+            raise ValueError("state.original_device_mode must include permission bits")
         if phase != Phase.WHOLE and original_device_mode is None:
             raise ValueError(
                 "state phase {} requires original_device_mode".format(phase.value)
