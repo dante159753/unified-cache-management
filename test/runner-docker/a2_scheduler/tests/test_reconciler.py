@@ -12,8 +12,13 @@ class FakeClock:
     def __init__(self, minute):
         self.current = datetime(2026, 7, 11, 10, minute)
         self.sleeps = []
+        self.calls = 0
+        self.cutoff_on_call = None
 
     def __call__(self):
+        self.calls += 1
+        if self.cutoff_on_call is not None and self.calls >= self.cutoff_on_call:
+            self.current = self.current.replace(minute=20)
         return self.current
 
     def sleep(self, seconds):
@@ -43,6 +48,23 @@ class FakeSignal:
 
     def __call__(self, pid):
         self.pids.append(pid)
+
+
+class FakeCheckpoint:
+    def __init__(self, events, fail_on=None):
+        self.events = events
+        self.fail_on = fail_on
+        self.states = []
+        self.on_state = None
+
+    def __call__(self, state):
+        self.states.append(state)
+        if self.events is not None:
+            self.events.append("checkpoint")
+        if self.on_state is not None:
+            self.on_state(state)
+        if len(self.states) == self.fail_on:
+            raise OSError("checkpoint failed")
 
 
 class FakeNpu:
@@ -155,7 +177,10 @@ class FakeRunners:
             sum(event == "workers" for event in self.events) - 1,
             len(self.worker_observations) - 1,
         )
-        return self.worker_observations[index]
+        observation = self.worker_observations[index]
+        if isinstance(observation, Exception):
+            raise observation
+        return observation
 
     def stop_idle(self):
         self.events.append("stop_idle")
@@ -185,6 +210,8 @@ class SchedulerFixture:
         inventory=None,
         original_mode=None,
         observations=None,
+        checkpoint=False,
+        checkpoint_fail_on=None,
     ):
         self.minute = minute
         self.events = []
@@ -201,6 +228,10 @@ class SchedulerFixture:
         self.npu = FakeNpu(inventory, card_pids, self.signal, self.events)
         worker_observations = workers if isinstance(workers, list) else [workers]
         self.runners = FakeRunners(worker_observations, self.events, minute)
+        self.checkpoint = FakeCheckpoint(
+            self.events if checkpoint else None,
+            checkpoint_fail_on,
+        )
         self.config = SimpleNamespace(
             window_start_minute=0,
             window_end_minute=20,
@@ -222,14 +253,18 @@ class SchedulerFixture:
     def reconcile(self):
         from a2_scheduler.reconciler import Reconciler
 
+        kwargs = {
+            "clock": self.clock,
+            "sleep": self.clock.sleep,
+        }
+        kwargs["checkpoint"] = self.checkpoint
         reconciler = Reconciler(
             self.config,
             self.state,
             self.github,
             self.npu,
             self.runners,
-            clock=self.clock,
-            sleep=self.clock.sleep,
+            **kwargs,
         )
         self.state = reconciler.reconcile(self.clock())
         return self.state
@@ -253,6 +288,8 @@ def test_whole_with_queue_inside_window_allocates_and_starts_four():
     assert fixture.runners.concurrent_starts == 4
     assert fixture.events == [
         "recover",
+        "list_vnpus",
+        "workers",
         "github",
         "restrict",
         "evict",
@@ -275,7 +312,7 @@ def test_whole_with_api_failure_does_not_preempt():
 
     assert state.phase == Phase.WHOLE
     assert fixture.killed_pids == []
-    assert fixture.events == ["recover", "github"]
+    assert fixture.events == ["recover", "list_vnpus", "workers", "github"]
 
 
 def test_cutoff_leaves_queued_jobs_for_next_window():
@@ -613,3 +650,254 @@ def test_restoring_never_destroys_with_in_progress_target_job():
 
     assert state.phase == Phase.RESTORING
     assert fixture.npu.destroyed_count == 0
+
+
+def test_reserving_checkpoint_records_original_mode_before_pid_eviction():
+    fixture = SchedulerFixture(
+        queued=1,
+        card_pids=[123],
+        checkpoint=True,
+    )
+
+    fixture.reconcile()
+
+    reserving = fixture.checkpoint.states[0]
+    assert reserving.phase == Phase.RESERVING
+    assert reserving.original_device_mode == 0o20660
+    assert fixture.events.index("checkpoint") < fixture.events.index("evict")
+
+
+def test_reserving_checkpoint_failure_restores_mode_and_prevents_eviction():
+    fixture = SchedulerFixture(
+        queued=1,
+        card_pids=[123],
+        checkpoint=True,
+        checkpoint_fail_on=1,
+    )
+
+    state = fixture.reconcile()
+
+    assert state.phase == Phase.ERROR
+    assert fixture.killed_pids == []
+    assert fixture.npu.created_count == 0
+    assert fixture.npu.restored_modes == [0o20660]
+
+
+def test_actual_ids_are_checkpointed_before_runner_preparation_and_start():
+    fixture = SchedulerFixture(queued=1, checkpoint=True)
+
+    fixture.reconcile()
+
+    split = next(
+        state
+        for state in fixture.checkpoint.states
+        if state.phase == Phase.SPLITTING and state.vnpu_ids
+    )
+    assert split.vnpu_ids == (307, 310, 313, 316)
+    split_checkpoint = next(
+        index
+        for index, event in enumerate(fixture.events)
+        if event == "checkpoint"
+        and fixture.checkpoint.states[
+            sum(item == "checkpoint" for item in fixture.events[: index + 1]) - 1
+        ]
+        == split
+    )
+    assert split_checkpoint < fixture.events.index("prepare")
+    assert split_checkpoint < fixture.events.index("start")
+
+
+def test_actual_id_checkpoint_failure_prevents_runner_and_destroy_actions():
+    fixture = SchedulerFixture(
+        queued=1,
+        checkpoint=True,
+        checkpoint_fail_on=2,
+    )
+
+    state = fixture.reconcile()
+
+    assert state.phase == Phase.ERROR
+    assert state.vnpu_ids == (307, 310, 313, 316)
+    assert fixture.runners.prepared_ids == ()
+    assert fixture.runners.concurrent_starts == 0
+    assert fixture.npu.destroyed_count == 0
+
+
+def test_restoring_checkpoint_failure_prevents_runner_stop_and_vnpu_destroy():
+    fixture = SchedulerFixture(
+        phase=Phase.RESTORING,
+        vnpu_ids=(11, 12, 13, 14),
+        original_mode=0o20660,
+        checkpoint=True,
+        checkpoint_fail_on=1,
+    )
+
+    state = fixture.reconcile()
+
+    assert state.phase == Phase.ERROR
+    assert fixture.runners.stop_all_calls == 0
+    assert fixture.npu.destroyed_count == 0
+
+
+def test_empty_inventory_checkpoint_failure_prevents_device_restore():
+    fixture = SchedulerFixture(
+        phase=Phase.RESTORING,
+        vnpu_ids=(11, 12, 13, 14),
+        original_mode=0o20660,
+        checkpoint=True,
+        checkpoint_fail_on=2,
+    )
+
+    state = fixture.reconcile()
+
+    assert state.phase == Phase.ERROR
+    assert state.vnpu_ids == ()
+    assert fixture.npu.destroyed_count == 4
+    assert fixture.npu.restored_modes == []
+
+
+def test_cutoff_crossing_immediately_before_start_rolls_back_without_starting():
+    fixture = SchedulerFixture(minute=19, queued=1, checkpoint=True)
+    fixture.clock.cutoff_on_call = 3
+
+    state = fixture.reconcile()
+
+    assert state.phase == Phase.WHOLE
+    assert fixture.runners.concurrent_starts == 0
+    assert fixture.npu.destroyed_count == 4
+
+
+def test_cutoff_is_rechecked_after_serving_checkpoint_before_start():
+    fixture = SchedulerFixture(minute=19, queued=1, checkpoint=True)
+
+    def cross_cutoff(state):
+        if state.phase == Phase.SERVING:
+            fixture.clock.current = fixture.clock.current.replace(minute=20)
+
+    fixture.checkpoint.on_state = cross_cutoff
+
+    state = fixture.reconcile()
+
+    assert state.phase == Phase.WHOLE
+    assert fixture.runners.concurrent_starts == 0
+    assert fixture.npu.destroyed_count == 4
+
+
+def test_cutoff_crossing_immediately_before_restart_does_not_restart():
+    fixture = SchedulerFixture(
+        phase=Phase.SERVING,
+        minute=19,
+        queued=1,
+        workers=0,
+        vnpu_ids=(11, 12, 13, 14),
+        original_mode=0o20660,
+        checkpoint=True,
+    )
+    fixture.clock.cutoff_on_call = 3
+
+    state = fixture.reconcile()
+
+    assert state.phase == Phase.WHOLE
+    assert fixture.runners.restart_calls == 0
+    assert fixture.npu.destroyed_count == 4
+
+
+def test_whole_with_mixed_queued_and_in_progress_jobs_never_preempts():
+    fixture = SchedulerFixture(
+        queued=1,
+        in_progress=1,
+        card_pids=[123],
+        checkpoint=True,
+    )
+
+    state = fixture.reconcile()
+
+    assert state.phase == Phase.WHOLE
+    assert fixture.killed_pids == []
+    assert fixture.npu.created_count == 0
+
+
+def test_stale_whole_with_known_mode_restores_orphaned_vnpus_before_allocating():
+    fixture = SchedulerFixture(
+        queued=1,
+        vnpu_ids=(11, 12, 13, 14),
+        original_mode=0o20660,
+        checkpoint=True,
+    )
+
+    state = fixture.reconcile()
+
+    assert state.phase == Phase.WHOLE
+    assert fixture.npu.destroyed_ids == [11, 12, 13, 14]
+    assert fixture.npu.restored_modes == [0o20660]
+    assert fixture.npu.created_count == 0
+
+
+def test_stale_whole_with_unknown_mode_preserves_orphaned_vnpus():
+    fixture = SchedulerFixture(
+        queued=1,
+        vnpu_ids=(11, 12, 13, 14),
+        original_mode=None,
+        checkpoint=True,
+    )
+
+    state = fixture.reconcile()
+
+    assert state.phase == Phase.ERROR
+    assert state.vnpu_ids == (11, 12, 13, 14)
+    assert fixture.npu.destroyed_count == 0
+    assert fixture.npu.created_count == 0
+
+
+def test_stale_whole_with_in_progress_job_preserves_orphaned_vnpus():
+    fixture = SchedulerFixture(
+        queued=1,
+        in_progress=1,
+        vnpu_ids=(11, 12, 13, 14),
+        original_mode=0o20660,
+        checkpoint=True,
+    )
+
+    state = fixture.reconcile()
+
+    assert state.phase == Phase.ERROR
+    assert state.vnpu_ids == (11, 12, 13, 14)
+    assert state.original_device_mode == 0o20660
+    assert fixture.npu.destroyed_count == 0
+
+
+def test_whole_with_local_worker_never_preempts():
+    fixture = SchedulerFixture(queued=1, workers=1, checkpoint=True)
+
+    state = fixture.reconcile()
+
+    assert state.phase == Phase.ERROR
+    assert fixture.npu.restricted_modes == []
+    assert fixture.npu.created_count == 0
+
+
+def test_whole_with_unknown_worker_snapshot_never_preempts():
+    fixture = SchedulerFixture(
+        queued=1,
+        workers=RunnerOperationError("unknown worker snapshot"),
+        checkpoint=True,
+    )
+
+    state = fixture.reconcile()
+
+    assert state.phase == Phase.ERROR
+    assert fixture.npu.restricted_modes == []
+    assert fixture.npu.created_count == 0
+
+
+def test_pause_recovery_remains_first_runner_operation_with_checkpointing():
+    fixture = SchedulerFixture(queued=1, checkpoint=True)
+
+    fixture.reconcile()
+
+    runner_events = [
+        event
+        for event in fixture.events
+        if event in {"recover", "workers", "prepare", "start", "stop_all"}
+    ]
+    assert runner_events[0] == "recover"
