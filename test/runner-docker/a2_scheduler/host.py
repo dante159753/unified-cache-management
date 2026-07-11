@@ -77,7 +77,7 @@ def _selected_table(
         if _is_separator(stripped):
             separator_count += 1
             if separator_pending:
-                break
+                raise NpuOperationError(error_message)
             separator_pending = True
             continue
         starts_row = stripped.startswith("|")
@@ -86,12 +86,11 @@ def _selected_table(
             raise NpuOperationError(error_message)
         if starts_row:
             cells = _table_cells(stripped)
-            if _normalized_row(cells) != normalized_headers:
-                rows.append(cells)
+            if _normalized_row(cells) == normalized_headers:
+                raise NpuOperationError(error_message)
+            rows.append(cells)
             separator_pending = False
             continue
-        if separator_pending and rows:
-            break
         raise NpuOperationError(error_message)
     if not rows and separator_count == 0:
         raise NpuOperationError(error_message)

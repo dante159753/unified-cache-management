@@ -30,21 +30,24 @@ def failed(stderr="command failed"):
 
 
 def inventory(ids):
-    rows = "\n".join(
+    separator = (
+        "+----------------+----------------+----------------+----------------+"
+        "----------------------+"
+    )
+    rows = "".join(
         (
             "| {0:<14} | 0              | -              | FREE           "
-            "| vir05_1c_16g         |"
-        ).format(vnpu_id)
+            "| vir05_1c_16g         |\n{1}\n"
+        ).format(vnpu_id, separator)
         for vnpu_id in ids
     )
     return """\
-+----------------+----------------+----------------+----------------+----------------------+
+{separator}
 | Vnpu ID        | Vgroup ID      | Container ID   | Status         | Template Name        |
-+----------------+----------------+----------------+----------------+----------------------+
+{separator}
 {rows}
-+----------------+----------------+----------------+----------------+----------------------+
 """.format(
-        rows=rows
+        rows=rows, separator=separator
     )
 
 
@@ -164,14 +167,34 @@ def test_process_parser_rejects_truncated_selected_row():
         parse_proc_mem(load_fixture("proc-mem-truncated-row.txt"), card_id=7)
 
 
+def test_process_parser_rejects_truncated_target_row_after_other_card_row():
+    with pytest.raises(NpuOperationError, match="parse NPU process"):
+        parse_proc_mem(
+            load_fixture("proc-mem-other-card-then-truncated-target.txt"), card_id=7
+        )
+
+
 def test_process_parser_keeps_data_row_with_pid_process_name():
     output = load_fixture("proc-mem-process-name-pid.txt")
     assert parse_proc_mem(output, card_id=7) == [4312]
 
 
-def test_process_parser_skips_only_complete_repeated_header():
-    output = load_fixture("proc-mem-repeated-header.txt")
-    assert parse_proc_mem(output, card_id=7) == [4312, 8765]
+@pytest.mark.parametrize(
+    "fixture_name",
+    ["proc-mem-repeated-header.txt", "proc-mem-adjacent-same-schema.txt"],
+)
+def test_process_parser_rejects_repeated_same_schema_header(fixture_name):
+    with pytest.raises(NpuOperationError, match="parse NPU process"):
+        parse_proc_mem(load_fixture(fixture_name), card_id=7)
+
+
+@pytest.mark.parametrize(
+    "fixture_name",
+    ["info-vnpu-adjacent-same-schema.txt", "info-vnpu-non-pipe-continuation.txt"],
+)
+def test_vnpu_parser_rejects_ambiguous_continuation(fixture_name):
+    with pytest.raises(NpuOperationError, match="parse vNPU"):
+        parse_info_vnpu(load_fixture(fixture_name))
 
 
 def test_vnpu_parser_rejects_malformed_table_after_row_separator():
