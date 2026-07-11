@@ -79,6 +79,9 @@ class FakeNpu:
         self.restored_modes = []
         self.fail = None
         self.partial_create = ()
+        self.verify_failure = False
+        self.restore_completed = False
+        self.device_mode = 0o20660
 
     @property
     def destroyed_count(self):
@@ -86,6 +89,8 @@ class FakeNpu:
 
     def list_vnpus(self):
         self.events.append("list_vnpus")
+        if self.verify_failure and self.restore_completed:
+            raise NpuOperationError("whole-card verification failed")
         return list(self.inventory)
 
     def evict_card_pids(self):
@@ -117,6 +122,12 @@ class FakeNpu:
         self.destroyed_ids.extend(ids)
         self.inventory = [vnpu for vnpu in self.inventory if vnpu.id not in ids]
 
+    def read_device_mode(self):
+        self.events.append("read_mode")
+        if self.fail == "read_mode":
+            raise NpuOperationError("mode read failed")
+        return self.device_mode
+
     def restrict_device(self):
         self.events.append("restrict")
         if self.fail == "restrict":
@@ -130,6 +141,7 @@ class FakeNpu:
         self.restored_modes.append(mode)
         if self.fail == "restore":
             raise NpuOperationError("restore failed")
+        self.restore_completed = True
 
 
 class FakeRunners:
@@ -145,6 +157,7 @@ class FakeRunners:
         self.stop_all_calls = 0
         self.stop_all_results = [True]
         self.fail = None
+        self.start_guard_supplied = False
 
     def recover_paused(self):
         self.events.append("recover")
@@ -157,16 +170,22 @@ class FakeRunners:
         if self.fail == "prepare":
             raise RunnerOperationError("prepare failed")
 
-    def start_all(self):
+    def start_all(self, allow_start=None):
         self.events.append("start")
+        self.start_guard_supplied = allow_start is not None
+        if allow_start is not None and not allow_start():
+            raise RunnerOperationError("runner start deadline expired")
         if self.minute >= 20:
             self.started_after_cutoff += 4
         if self.fail == "start":
             raise RunnerOperationError("start failed")
         self.concurrent_starts = 4
 
-    def restart_exited(self):
+    def restart_exited(self, allow_start=None):
         self.events.append("restart")
+        self.start_guard_supplied = allow_start is not None
+        if allow_start is not None and not allow_start():
+            raise RunnerOperationError("runner start deadline expired")
         if self.minute >= 20:
             self.started_after_cutoff += 1
         self.restart_calls += 1
@@ -291,6 +310,7 @@ def test_whole_with_queue_inside_window_allocates_and_starts_four():
         "list_vnpus",
         "workers",
         "github",
+        "read_mode",
         "restrict",
         "evict",
         "create",
@@ -680,7 +700,8 @@ def test_reserving_checkpoint_failure_restores_mode_and_prevents_eviction():
     assert state.phase == Phase.ERROR
     assert fixture.killed_pids == []
     assert fixture.npu.created_count == 0
-    assert fixture.npu.restored_modes == [0o20660]
+    assert fixture.npu.restricted_modes == []
+    assert fixture.npu.restored_modes == []
 
 
 def test_actual_ids_are_checkpointed_before_runner_preparation_and_start():
@@ -901,3 +922,90 @@ def test_pause_recovery_remains_first_runner_operation_with_checkpointing():
         if event in {"recover", "workers", "prepare", "start", "stop_all"}
     ]
     assert runner_events[0] == "recover"
+
+
+def test_mode_is_read_and_checkpointed_before_device_restriction():
+    fixture = SchedulerFixture(queued=1, checkpoint=True)
+
+    fixture.reconcile()
+
+    reserving = fixture.checkpoint.states[0]
+    assert reserving.phase == Phase.RESERVING
+    assert reserving.original_device_mode == 0o20660
+    assert fixture.events.index("read_mode") < fixture.events.index("checkpoint")
+    assert fixture.events.index("checkpoint") < fixture.events.index("restrict")
+
+
+def test_mode_read_failure_prevents_checkpoint_and_restriction():
+    fixture = SchedulerFixture(queued=1, checkpoint=True)
+    fixture.npu.fail = "read_mode"
+
+    state = fixture.reconcile()
+
+    assert state.phase == Phase.ERROR
+    assert fixture.npu.restricted_modes == []
+    assert not any(
+        state.phase == Phase.RESERVING for state in fixture.checkpoint.states
+    )
+
+
+def test_already_restricted_mode_is_never_recorded_as_original():
+    fixture = SchedulerFixture(queued=1, checkpoint=True)
+    fixture.npu.device_mode = 0
+
+    state = fixture.reconcile()
+
+    assert state.phase == Phase.ERROR
+    assert fixture.npu.restricted_modes == []
+    assert not any(
+        state.phase == Phase.RESERVING for state in fixture.checkpoint.states
+    )
+    assert not any(
+        state.original_device_mode == 0 for state in fixture.checkpoint.states
+    )
+
+
+@pytest.mark.parametrize("phase", [Phase.RESERVING, Phase.SPLITTING, Phase.SERVING])
+def test_allocation_phase_without_original_mode_never_runs_lifecycle(phase):
+    fixture = SchedulerFixture(
+        phase=phase,
+        queued=1,
+        vnpu_ids=(11, 12, 13, 14),
+        original_mode=None,
+        checkpoint=True,
+    )
+
+    state = fixture.reconcile()
+
+    assert state.phase == Phase.ERROR
+    assert fixture.runners.prepared_ids == ()
+    assert fixture.runners.concurrent_starts == 0
+    assert fixture.runners.restart_calls == 0
+    assert fixture.runners.stop_all_calls == 0
+    assert fixture.npu.destroyed_count == 0
+
+
+def test_reconciler_supplies_start_guard_to_runner_manager():
+    fixture = SchedulerFixture(queued=1, checkpoint=True)
+
+    state = fixture.reconcile()
+
+    assert state.phase == Phase.SERVING
+    assert fixture.runners.start_guard_supplied is True
+
+
+def test_whole_card_verification_failure_prevents_whole_checkpoint():
+    fixture = SchedulerFixture(
+        phase=Phase.RESTORING,
+        vnpu_ids=(11, 12, 13, 14),
+        original_mode=0o20660,
+        checkpoint=True,
+    )
+    fixture.npu.verify_failure = True
+
+    state = fixture.reconcile()
+
+    assert state.phase == Phase.ERROR
+    assert fixture.npu.restored_modes == [0o20660]
+    assert fixture.checkpoint.states[-1].phase == Phase.ERROR
+    assert not any(state.phase == Phase.WHOLE for state in fixture.checkpoint.states)

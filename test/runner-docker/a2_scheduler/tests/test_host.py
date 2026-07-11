@@ -334,21 +334,50 @@ def test_evict_gives_new_pid_its_own_term_grace_before_kill():
     ]
 
 
-def test_restrict_and_restore_device_preserve_exact_stat_mode():
-    chmod_calls = []
+def test_read_restrict_and_restore_device_are_separate_operations():
+    events = []
     manager = NpuManager(
         ProcRunner([]),
         card_id=7,
         chip_id=0,
-        stat_fn=lambda path: SimpleNamespace(st_mode=0o20660),
-        chmod_fn=lambda path, mode: chmod_calls.append((path, mode)),
+        stat_fn=lambda path: (
+            events.append(("stat", path)) or SimpleNamespace(st_mode=0o20660)
+        ),
+        chmod_fn=lambda path, mode: events.append(("chmod", path, mode)),
     )
 
-    original_mode = manager.restrict_device()
+    original_mode = manager.read_device_mode()
+    assert events == [("stat", "/dev/davinci7")]
+
+    manager.restrict_device()
     manager.restore_device(original_mode)
 
     assert original_mode == 0o20660
-    assert chmod_calls == [("/dev/davinci7", 0), ("/dev/davinci7", 0o20660)]
+    assert events == [
+        ("stat", "/dev/davinci7"),
+        ("chmod", "/dev/davinci7", 0),
+        ("chmod", "/dev/davinci7", 0o20660),
+    ]
+
+
+def test_read_device_mode_failure_never_changes_permissions():
+    chmod_calls = []
+
+    def fail_stat(path):
+        raise OSError("stat failed")
+
+    manager = NpuManager(
+        ProcRunner([]),
+        card_id=7,
+        chip_id=0,
+        stat_fn=fail_stat,
+        chmod_fn=lambda path, mode: chmod_calls.append((path, mode)),
+    )
+
+    with pytest.raises(NpuOperationError, match="read physical NPU mode"):
+        manager.read_device_mode()
+
+    assert chmod_calls == []
 
 
 def test_command_runner_invokes_subprocess_with_argv_and_no_shell(monkeypatch):

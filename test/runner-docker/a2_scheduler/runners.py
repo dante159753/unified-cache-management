@@ -1,6 +1,6 @@
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
-from typing import Iterable, List, Optional, Sequence
+from typing import Callable, Iterable, List, Optional, Sequence
 
 from .host import CommandResult, CommandRunner
 from .models import RunnerSlot, SchedulerConfig, Vnpu
@@ -51,11 +51,11 @@ class RunnerManager:
                 ) from error
             raise
 
-    def start_all(self) -> None:
+    def start_all(self, allow_start: Callable[[], bool] = lambda: True) -> None:
         self.recover_paused()
-        self._start([slot.name for slot in self.config.runner_slots])
+        self._start([slot.name for slot in self.config.runner_slots], allow_start)
 
-    def restart_exited(self) -> None:
+    def restart_exited(self, allow_start: Callable[[], bool] = lambda: True) -> None:
         self.recover_paused()
         exited = []
         for slot in self.config.runner_slots:
@@ -67,7 +67,7 @@ class RunnerManager:
             if result.returncode != 0:
                 self._require_success(result, "inspect runner container")
             exited.append(slot.name)
-        self._start(exited)
+        self._start(exited, allow_start)
 
     def active_workers(self) -> int:
         self.recover_paused()
@@ -327,16 +327,25 @@ class RunnerManager:
         )
         return argv
 
-    def _start(self, names: Sequence[str]) -> None:
+    def _start(self, names: Sequence[str], allow_start: Callable[[], bool]) -> None:
         if not names:
             return
         with ThreadPoolExecutor(max_workers=4) as executor:
             futures = [
-                executor.submit(self._run, ["docker", "start", name]) for name in names
+                executor.submit(self._start_one, name, allow_start) for name in names
             ]
             results = [future.result() for future in futures]
         for result in results:
             self._require_success(result, "start runner container")
+
+    def _start_one(self, name: str, allow_start: Callable[[], bool]) -> CommandResult:
+        try:
+            allowed = allow_start()
+        except Exception as error:
+            raise RunnerOperationError("runner start guard failed") from error
+        if not allowed:
+            raise RunnerOperationError("runner start deadline expired")
+        return self._run(["docker", "start", name])
 
     def _run(self, argv: Sequence[str]) -> CommandResult:
         try:

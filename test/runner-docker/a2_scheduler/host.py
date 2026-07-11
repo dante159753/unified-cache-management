@@ -294,15 +294,21 @@ class NpuManager:
                 errors.append(self._error_message(result, operation))
         return errors
 
-    def restrict_device(self) -> int:
+    def read_device_mode(self) -> int:
         try:
-            original_mode = self.stat_fn(self.device_path).st_mode
+            return self.stat_fn(self.device_path).st_mode
+        except OSError as error:
+            raise NpuOperationError(
+                "could not read physical NPU mode: {}".format(error)
+            ) from error
+
+    def restrict_device(self) -> None:
+        try:
             self.chmod_fn(self.device_path, 0)
         except OSError as error:
             raise NpuOperationError(
                 "could not restrict physical NPU: {}".format(error)
             ) from error
-        return original_mode
 
     def restore_device(self, original_mode: int) -> None:
         try:

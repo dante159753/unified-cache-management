@@ -138,6 +138,32 @@ class BlockingRecordingRunner(RecordingRunner):
         return ok()
 
 
+class StartGuard:
+    def __init__(self, allowed_calls):
+        self.allowed_calls = allowed_calls
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def __call__(self):
+        with self._lock:
+            self.calls += 1
+            return self.calls <= self.allowed_calls
+
+
+class ExpiringInspectionRunner(RecordingRunner):
+    def __init__(self, guard, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.guard = guard
+        self.inspect_calls = 0
+
+    def run(self, argv, timeout):
+        if list(argv)[:2] == ["docker", "inspect"]:
+            self.inspect_calls += 1
+            if self.inspect_calls >= 5:
+                self.guard.allowed_calls = 0
+        return super().run(argv, timeout)
+
+
 class StatefulPrepareRunner:
     def __init__(
         self,
@@ -359,6 +385,17 @@ def test_start_all_launches_four_containers_concurrently(config):
     ) == sorted(slot.name for slot in config.runner_slots)
 
 
+def test_start_all_checks_guard_before_each_docker_start(config):
+    runner = RecordingRunner()
+    guard = StartGuard(allowed_calls=2)
+
+    with pytest.raises(RunnerOperationError, match="start deadline"):
+        RunnerManager(config, runner).start_all(allow_start=guard)
+
+    assert len(docker_commands(runner, "start")) == 2
+    assert guard.calls == 4
+
+
 def test_restart_exited_starts_only_non_running_containers(config):
     running = {
         config.runner_slots[0].name: True,
@@ -374,6 +411,18 @@ def test_restart_exited_starts_only_non_running_containers(config):
         config.runner_slots[1].name,
         config.runner_slots[3].name,
     ]
+
+
+def test_restart_rechecks_guard_after_internal_inspection(config):
+    guard = StartGuard(allowed_calls=4)
+    running = {slot.name: False for slot in config.runner_slots}
+    runner = ExpiringInspectionRunner(guard, running=running)
+
+    with pytest.raises(RunnerOperationError, match="start deadline"):
+        RunnerManager(config, runner).restart_exited(allow_start=guard)
+
+    assert runner.inspect_calls >= 5
+    assert docker_commands(runner, "start") == []
 
 
 def test_start_all_recovers_paused_slots_before_starting(config):

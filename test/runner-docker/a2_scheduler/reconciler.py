@@ -49,6 +49,12 @@ class Reconciler:
                 refresh_error = self._refresh_actual_ids()
                 if refresh_error is not None:
                     return refresh_error
+                if (
+                    self.state.phase
+                    in (Phase.RESERVING, Phase.SPLITTING, Phase.SERVING)
+                    and self.state.original_device_mode is None
+                ):
+                    return self._error(RuntimeError("original device mode is unknown"))
 
             after_cutoff = self._after_cutoff(now)
             if self.state.phase == Phase.WHOLE:
@@ -123,28 +129,21 @@ class Reconciler:
 
     def _allocate_when_queued(self) -> SchedulerState:
         try:
-            original_mode = self.npu.restrict_device()
+            original_mode = self.npu.read_device_mode()
         except NpuOperationError as error:
-            return self._whole_with_error(error)
+            return self._error(error)
+        if original_mode & 0o7777 == 0:
+            return self._error(RuntimeError("physical NPU is already restricted"))
 
         reserving = self._transition(
             Phase.RESERVING,
             vnpu_ids=(),
             original_mode=original_mode,
         )
-        try:
-            self._checkpoint(reserving)
-        except StateCheckpointError as error:
-            try:
-                self.npu.restore_device(original_mode)
-            except NpuOperationError as restore_error:
-                error = StateCheckpointError(
-                    "{}; mode recovery failed: {}".format(error, restore_error),
-                    error.state,
-                )
-            return self._error(error, persist=False)
+        self._checkpoint(reserving)
 
         try:
+            self.npu.restrict_device()
             self.npu.evict_card_pids()
         except NpuOperationError as error:
             return self._restore_mode_only(original_mode, error)
@@ -185,12 +184,8 @@ class Reconciler:
             return self._rollback(error)
 
         self._checkpoint(self._transition(Phase.SERVING, vnpu_ids=ids))
-        current = self.clock()
-        self.now = current
-        if self._after_cutoff(current):
-            return self._rollback(RuntimeError("allocation cutoff reached"))
         try:
-            self.runners.start_all()
+            self.runners.start_all(allow_start=self._allow_start)
         except RunnerOperationError as error:
             return self._rollback(error)
         return self.state
@@ -200,13 +195,11 @@ class Reconciler:
         if jobs is None:
             return self.state
         if self._queued(jobs):
-            current = self.clock()
-            self.now = current
-            if self._after_cutoff(current):
-                return self._drain_or_restore()
             try:
-                self.runners.restart_exited()
+                self.runners.restart_exited(allow_start=self._allow_start)
             except RunnerOperationError as error:
+                if self._after_cutoff(self.now):
+                    return self._drain_or_restore()
                 return self._error(error)
             return self.state
         if self._in_progress(jobs):
@@ -335,6 +328,10 @@ class Reconciler:
                     original_device_mode=original_mode,
                 )
 
+        verification_error = self._verify_whole_inventory(cause)
+        if verification_error is not None:
+            return verification_error
+
         if cause is None:
             return self._checkpoint(SchedulerState(phase=Phase.WHOLE))
         return self._checkpoint(self._whole_with_error(cause))
@@ -350,7 +347,31 @@ class Reconciler:
                 vnpu_ids=(),
                 original_device_mode=original_mode,
             )
+        verification_error = self._verify_whole_inventory(cause)
+        if verification_error is not None:
+            return verification_error
         return self._checkpoint(self._whole_with_error(cause))
+
+    def _verify_whole_inventory(
+        self, cause: Optional[Exception]
+    ) -> Optional[SchedulerState]:
+        try:
+            inventory = self.npu.list_vnpus()
+        except NpuOperationError as error:
+            return self._error(self._combined(cause, error), vnpu_ids=())
+        if inventory:
+            return self._error(
+                self._combined(
+                    cause,
+                    RuntimeError("physical whole-card verification found vNPUs"),
+                ),
+                vnpu_ids=self._ids(inventory),
+            )
+        return None
+
+    def _allow_start(self) -> bool:
+        self.now = self.clock()
+        return not self._after_cutoff(self.now)
 
     def _validated_inventory(self, allow_empty: bool) -> List[Vnpu]:
         inventory = sorted(self.npu.list_vnpus(), key=lambda vnpu: vnpu.id)
