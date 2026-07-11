@@ -328,6 +328,22 @@ class Reconciler:
             except RunnerOperationError as error:
                 return self._error(self._combined(cause, error))
 
+        try:
+            card_pids = self.npu.list_card_pids()
+        except NpuOperationError as error:
+            return self._error(
+                self._combined(cause, error),
+                vnpu_ids=ids,
+            )
+        if card_pids:
+            return self._error(
+                self._combined(
+                    cause,
+                    RuntimeError("NPU card processes are active"),
+                ),
+                vnpu_ids=ids,
+            )
+
         if ids:
             try:
                 self.npu.destroy_vnpus(ids)
@@ -408,9 +424,10 @@ class Reconciler:
 
     def _allow_start(self) -> bool:
         sample = self.clock()
-        allowed = not self._after_cutoff(sample)
-        self._record_time(sample)
-        return allowed
+        with self._time_lock:
+            if sample > self.now:
+                self.now = sample
+            return not self._after_cutoff(self.now)
 
     def _record_time(self, sample: datetime) -> None:
         with self._time_lock:

@@ -103,6 +103,12 @@ class FakeNpu:
             self.signal(pid)
         self.card_pids = []
 
+    def list_card_pids(self):
+        self.events.append("list_pids")
+        if self.fail == "list_pids":
+            raise NpuOperationError("PID inventory failed")
+        return list(self.card_pids)
+
     def create_vnpus(self, count, template):
         self.events.append("create")
         if self.fail == "create":
@@ -163,6 +169,7 @@ class FakeRunners:
         self.stop_all_results = [True]
         self.fail = None
         self.start_guard_supplied = False
+        self.on_start = None
 
     def recover_paused(self):
         self.events.append("recover")
@@ -182,6 +189,8 @@ class FakeRunners:
             raise RunnerOperationError("runner start deadline expired")
         if self.minute >= 20:
             self.started_after_cutoff += 4
+        if self.on_start is not None:
+            self.on_start()
         if self.fail == "start":
             raise RunnerOperationError("start failed")
         self.concurrent_starts = 4
@@ -1119,7 +1128,7 @@ def test_reserving_resume_unknown_or_mismatched_mode_fails_closed(current_mode):
     assert fixture.npu.created_count == 0
 
 
-def test_concurrent_start_guards_keep_latest_time_monotonic():
+def test_concurrent_start_guards_reject_older_sample_after_cutoff_observed():
     from a2_scheduler.reconciler import Reconciler
 
     fixture = SchedulerFixture(
@@ -1167,7 +1176,7 @@ def test_concurrent_start_guards_keep_latest_time_monotonic():
     release_older.set()
     old_thread.join(timeout=2)
 
-    assert results == {"newer": False, "older": True}
+    assert results == {"newer": False, "older": False}
     assert reconciler.now == newer
 
 
@@ -1214,3 +1223,65 @@ def test_restore_readback_must_match_saved_usable_mode(readback_mode):
     assert state.original_device_mode == 0o20660
     assert fixture.events.index("restore") < fixture.events.index("read_mode")
     assert not any(state.phase == Phase.WHOLE for state in fixture.checkpoint.states)
+
+
+def test_reconstructed_restoring_orphan_card_pid_blocks_destroy():
+    fixture = SchedulerFixture(
+        phase=Phase.RESTORING,
+        card_pids=[9123],
+        vnpu_ids=(11, 12, 13, 14),
+        original_mode=0o20660,
+        checkpoint=True,
+    )
+
+    state = fixture.reconcile()
+
+    assert state.phase == Phase.ERROR
+    assert fixture.runners.stop_all_calls == 1
+    assert fixture.npu.destroyed_count == 0
+    assert fixture.npu.restored_modes == []
+    assert fixture.events.index("stop_all") < fixture.events.index("list_pids")
+
+
+def test_reconstructed_restoring_unknown_pid_inventory_blocks_destroy():
+    fixture = SchedulerFixture(
+        phase=Phase.RESTORING,
+        vnpu_ids=(11, 12, 13, 14),
+        original_mode=0o20660,
+        checkpoint=True,
+    )
+    fixture.npu.fail = "list_pids"
+
+    state = fixture.reconcile()
+
+    assert state.phase == Phase.ERROR
+    assert fixture.npu.destroyed_count == 0
+    assert fixture.npu.restored_modes == []
+
+
+def test_rollback_orphan_card_pid_blocks_destroy():
+    fixture = SchedulerFixture(phase=Phase.WHOLE, queued=1, checkpoint=True)
+    fixture.runners.fail = "start"
+    fixture.runners.on_start = lambda: fixture.npu.card_pids.append(9123)
+
+    state = fixture.reconcile()
+
+    assert state.phase == Phase.ERROR
+    assert len(state.vnpu_ids) == 4
+    assert fixture.npu.destroyed_count == 0
+    assert fixture.npu.restored_modes == []
+
+
+def test_restore_pid_guard_is_immediately_before_destroy():
+    fixture = SchedulerFixture(
+        phase=Phase.RESTORING,
+        vnpu_ids=(11, 12, 13, 14),
+        original_mode=0o20660,
+        checkpoint=True,
+    )
+
+    state = fixture.reconcile()
+
+    assert state.phase == Phase.WHOLE
+    destroy_index = fixture.events.index("destroy")
+    assert fixture.events[destroy_index - 1] == "list_pids"
