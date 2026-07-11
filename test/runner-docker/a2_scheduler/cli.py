@@ -18,6 +18,11 @@ from .runners import RunnerManager
 
 LOCK_BUSY_EXIT = 75
 TIMER_UNIT = "ucm-a2-scheduler.timer"
+VALIDATION_RECOVERY_GUIDANCE = (
+    "leave the timer disabled; inspect status, vNPU inventory, card PIDs, "
+    "runners, and target jobs; destroy only callback-attributed IDs after all "
+    "guards are clear"
+)
 
 
 class CliError(RuntimeError):
@@ -340,11 +345,13 @@ class SchedulerCli:
             raise CliError("validation requires --fail-before-create 3")
         command_runner, github, npu, _ = self._components(config)
         self._require_validation_preconditions(config, command_runner, npu, github)
-        created = []
+        attributed_ids = []
 
         def inject_before_third(discovered) -> None:
-            created[:] = list(discovered)
-            if len(created) == fail_before_create - 1:
+            for vnpu in discovered:
+                if vnpu.id not in attributed_ids:
+                    attributed_ids.append(vnpu.id)
+            if len(attributed_ids) == fail_before_create - 1:
                 raise InjectedCreateFailure("injected failure before create 3")
 
         try:
@@ -364,12 +371,13 @@ class SchedulerCli:
                 command_runner,
                 github,
                 npu,
-                [vnpu.id for vnpu in created],
+                attributed_ids,
             )
         except Exception as cleanup_error:
-            raise CliError(
-                "{}; cleanup failed: {}".format(primary_error, cleanup_error)
-            ) from primary_error
+            message = "{}; cleanup failed: {}".format(primary_error, cleanup_error)
+            if VALIDATION_RECOVERY_GUIDANCE not in message:
+                message = "{}; {}".format(message, VALIDATION_RECOVERY_GUIDANCE)
+            raise CliError(message) from primary_error
 
         if not isinstance(primary_error, InjectedCreateFailure):
             raise CliError(str(primary_error)) from primary_error
@@ -386,26 +394,47 @@ class SchedulerCli:
         return 0
 
     def _cleanup_validation_vnpus(self, config, command_runner, github, npu, known_ids):
-        pending = set(known_ids)
-        cleaned = set()
-        for _ in range(config.vnpu_count + 1):
-            try:
-                pending.update(vnpu.id for vnpu in npu.list_vnpus())
-            except Exception as error:
-                if not pending:
-                    raise CliError(
-                        "could not discover remaining validation vNPUs: {}".format(
-                            error
-                        )
-                    ) from error
-            if not pending:
-                return tuple(sorted(cleaned))
-            self._require_cleanup_policy(config, command_runner, github)
-            batch = tuple(sorted(pending))
-            npu.destroy_vnpus(batch)
-            cleaned.update(batch)
-            pending.clear()
-        raise CliError("validation cleanup could not prove zero vNPUs")
+        attributed = tuple(known_ids)
+        if len(attributed) != len(set(attributed)):
+            raise CliError(
+                "validation callback attribution is invalid; {}".format(
+                    VALIDATION_RECOVERY_GUIDANCE
+                )
+            )
+        attributed_set = set(attributed)
+        try:
+            inventory_ids = {vnpu.id for vnpu in npu.list_vnpus()}
+        except Exception as error:
+            raise CliError(
+                "validation cleanup could not verify inventory; {}".format(
+                    VALIDATION_RECOVERY_GUIDANCE
+                )
+            ) from error
+        if inventory_ids != attributed_set:
+            raise CliError(
+                "validation inventory is not exactly the callback-attributed set; "
+                "no vNPUs were destroyed; {}".format(VALIDATION_RECOVERY_GUIDANCE)
+            )
+        if not attributed:
+            return ()
+
+        self._require_cleanup_policy(config, command_runner, github)
+        npu.destroy_vnpus(tuple(sorted(attributed_set)))
+        try:
+            remaining = {vnpu.id for vnpu in npu.list_vnpus()}
+        except Exception as error:
+            raise CliError(
+                "validation cleanup could not verify the final inventory; {}".format(
+                    VALIDATION_RECOVERY_GUIDANCE
+                )
+            ) from error
+        if remaining:
+            raise CliError(
+                "validation cleanup did not reach zero vNPUs; {}".format(
+                    VALIDATION_RECOVERY_GUIDANCE
+                )
+            )
+        return tuple(sorted(attributed_set))
 
     def _require_validation_preconditions(
         self, config, command_runner, npu, github

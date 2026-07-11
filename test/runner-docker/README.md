@@ -137,11 +137,15 @@ sudo /usr/bin/python3 -m a2_scheduler.cli validate-create-rollback --fail-before
 ```
 
 Any failure after the first create enters the same guarded cleanup path.
-Cleanup re-discovers IDs, re-checks GitHub policy and stopped runners before
-each batch, and relies on a fresh card-PID guard before every destroy command.
-If policy, runner, PID, inventory, or destroy checks fail, one or more IDs can
-remain. The error preserves both the primary validation failure and cleanup
-failure. Keep the timer disabled and inspect before recovery:
+Cleanup may destroy only IDs attributed by the per-create callback. Current
+inventory must exactly match that attributed set before destruction; inventory
+failure or any extra/missing ID fails closed before cleanup. GitHub policy and
+stopped runners are re-checked, and the host applies a fresh card-PID guard
+before every destroy command. If any check fails, one or more IDs can remain.
+The error preserves both the primary validation failure and cleanup failure.
+Leave the timer disabled; inspect status, vNPU inventory, card PIDs, runners,
+and target jobs; destroy only callback-attributed IDs after all guards are
+clear:
 
 ```bash
 sudo systemctl disable --now ucm-a2-scheduler.timer
@@ -152,7 +156,7 @@ sudo docker ps --format '{{.Names}}' | grep '^ucm-a2-vnpu-runner-' || true
 ```
 
 Only after target jobs, scheduler runners, and card 7 PIDs are all absent,
-destroy each positively identified validation-created ID and verify zero:
+destroy each callback-attributed validation ID and verify zero:
 
 ```bash
 sudo npu-smi set -t destroy-vnpu -i 7 -c 0 -v <ID>

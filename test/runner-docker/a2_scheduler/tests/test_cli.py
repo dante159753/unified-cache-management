@@ -20,6 +20,11 @@ from a2_scheduler.models import Job, Phase, SchedulerState, Vnpu, load_config
 from a2_scheduler.reconciler import ReconcileOutcome
 
 TOKEN = "TOKEN_SENTINEL"
+VALIDATION_RECOVERY_GUIDANCE = (
+    "leave the timer disabled; inspect status, vNPU inventory, card PIDs, "
+    "runners, and target jobs; destroy only callback-attributed IDs after all "
+    "guards are clear"
+)
 
 
 class FakeSecureOs:
@@ -118,8 +123,19 @@ class FakeNpu:
         self.mutations = []
         self.create_failure = None
         self.destroy_error = None
+        self.list_vnpu_calls = 0
+        self.external_vnpu_on_call = None
+        self.inventory_error_on_call = None
+        self.inventory_error = None
 
     def list_vnpus(self):
+        self.list_vnpu_calls += 1
+        if self.external_vnpu_on_call == self.list_vnpu_calls:
+            self.inventory.append(Vnpu(999, "vir05_1c_16g"))
+        if self.inventory_error_on_call == self.list_vnpu_calls:
+            raise self.inventory_error or NpuOperationError(
+                "inventory failed {}".format(TOKEN)
+            )
         return list(self.inventory)
 
     def list_card_pids(self):
@@ -668,15 +684,15 @@ def test_validate_create_rollback_creates_two_then_cleans_up(capsys, configured_
 
 
 @pytest.mark.parametrize(
-    "failure,created_ids",
+    "failure,created_ids,destroyed_ids",
     [
-        ("second_create", [300]),
-        ("second_inventory", [300, 301]),
-        ("progress_callback", [300]),
+        ("second_create", [300], [300]),
+        ("second_inventory", [300, 301], []),
+        ("progress_callback", [300], []),
     ],
 )
-def test_validation_unexpected_post_create_failure_cleans_discovered_ids(
-    capsys, configured_cli, failure, created_ids
+def test_validation_unexpected_post_create_failure_cleans_only_attributed_ids(
+    capsys, configured_cli, failure, created_ids, destroyed_ids
 ):
     configured_cli.npu.create_failure = failure
 
@@ -693,10 +709,68 @@ def test_validation_unexpected_post_create_failure_cleans_discovered_ids(
         == 1
     )
 
-    assert failure.replace("_", " ") in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert failure.replace("_", " ") in error
     assert configured_cli.npu.created_ids == created_ids
-    assert configured_cli.npu.destroyed_ids == created_ids
-    assert configured_cli.npu.inventory == []
+    assert configured_cli.npu.destroyed_ids == destroyed_ids
+    if destroyed_ids != created_ids:
+        assert VALIDATION_RECOVERY_GUIDANCE in error
+
+
+def test_validation_external_vnpu_before_cleanup_is_never_destroyed(
+    capsys, configured_cli
+):
+    configured_cli.npu.external_vnpu_on_call = 2
+
+    assert (
+        configured_cli.run(
+            [
+                "validate-create-rollback",
+                "--fail-before-create",
+                "3",
+                "--config",
+                str(configured_cli.config_path),
+            ]
+        )
+        == 1
+    )
+
+    error = capsys.readouterr().err
+    assert VALIDATION_RECOVERY_GUIDANCE in error
+    assert TOKEN not in error
+    assert str(configured_cli.token_path) not in error
+    assert configured_cli.npu.destroyed_ids == []
+    assert [vnpu.id for vnpu in configured_cli.npu.inventory] == [300, 301, 999]
+
+
+def test_validation_inventory_failure_with_external_vnpu_destroys_nothing(
+    capsys, configured_cli
+):
+    configured_cli.npu.external_vnpu_on_call = 2
+    configured_cli.npu.inventory_error_on_call = 2
+    configured_cli.npu.inventory_error = NpuOperationError(
+        "inventory failed {} {}".format(TOKEN, configured_cli.token_path)
+    )
+
+    assert (
+        configured_cli.run(
+            [
+                "validate-create-rollback",
+                "--fail-before-create",
+                "3",
+                "--config",
+                str(configured_cli.config_path),
+            ]
+        )
+        == 1
+    )
+
+    error = capsys.readouterr().err
+    assert VALIDATION_RECOVERY_GUIDANCE in error
+    assert TOKEN not in error
+    assert str(configured_cli.token_path) not in error
+    assert configured_cli.npu.destroyed_ids == []
+    assert [vnpu.id for vnpu in configured_cli.npu.inventory] == [300, 301, 999]
 
 
 @pytest.mark.parametrize("unsafe", ["timer", "pids", "vnpus", "runners"])
