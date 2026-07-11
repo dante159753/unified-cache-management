@@ -1,6 +1,7 @@
 import time
 from dataclasses import replace
 from datetime import datetime
+from threading import Lock
 from typing import Callable, List, Optional, Sequence, Tuple
 
 from .github_client import GitHubUnavailable
@@ -35,10 +36,13 @@ class Reconciler:
         self.checkpoint = checkpoint
         self.clock = clock
         self.sleep = sleep
+        self._time_lock = Lock()
         self.now = clock()
 
     def reconcile(self, now: datetime) -> SchedulerState:
-        self.now = now
+        self._record_time(now)
+        if not self._state_mode_is_valid():
+            return self._corrupt_state("original device mode is invalid")
         try:
             self.runners.recover_paused()
         except RunnerOperationError as error:
@@ -49,12 +53,6 @@ class Reconciler:
                 refresh_error = self._refresh_actual_ids()
                 if refresh_error is not None:
                     return refresh_error
-                if (
-                    self.state.phase
-                    in (Phase.RESERVING, Phase.SPLITTING, Phase.SERVING)
-                    and self.state.original_device_mode is None
-                ):
-                    return self._error(RuntimeError("original device mode is unknown"))
 
             after_cutoff = self._after_cutoff(now)
             if self.state.phase == Phase.WHOLE:
@@ -94,16 +92,29 @@ class Reconciler:
     def _reconcile_whole(self, allow_allocation: bool) -> SchedulerState:
         try:
             inventory = self.npu.list_vnpus()
-            workers = self.runners.active_workers()
-        except (NpuOperationError, RunnerOperationError) as error:
+        except NpuOperationError as error:
             return self._error(error)
-        jobs = self._jobs()
         ids = self._ids(inventory)
 
         if ids != self.state.vnpu_ids:
             self._checkpoint(replace(self.state, vnpu_ids=ids))
+        host_mode = None
+        if not ids and self.state.original_device_mode is None:
+            try:
+                host_mode = self.npu.read_device_mode()
+            except NpuOperationError as error:
+                return self._error(error)
+            if self._mode_is_restricted(host_mode):
+                return self._corrupt_state("physical NPU is not usable as a whole card")
+
+        try:
+            workers = self.runners.active_workers()
+        except RunnerOperationError as error:
+            return self._error(error)
         if workers:
             return self._error(RuntimeError("local runner worker is active"))
+
+        jobs = self._jobs()
         if self._in_progress(jobs or ()):
             if ids or self.state.original_device_mode is not None:
                 return self._error(RuntimeError("target job is in progress"))
@@ -119,7 +130,7 @@ class Reconciler:
 
         if not allow_allocation or jobs is None or not self._queued(jobs):
             return self.state
-        return self._allocate_when_queued()
+        return self._allocate_when_queued(host_mode)
 
     def _after_cutoff(self, now: datetime) -> bool:
         minute = now.minute
@@ -127,14 +138,7 @@ class Reconciler:
         end = self.config.window_end_minute
         return not start <= minute < end
 
-    def _allocate_when_queued(self) -> SchedulerState:
-        try:
-            original_mode = self.npu.read_device_mode()
-        except NpuOperationError as error:
-            return self._error(error)
-        if original_mode & 0o7777 == 0:
-            return self._error(RuntimeError("physical NPU is already restricted"))
-
+    def _allocate_when_queued(self, original_mode: int) -> SchedulerState:
         reserving = self._transition(
             Phase.RESERVING,
             vnpu_ids=(),
@@ -158,6 +162,24 @@ class Reconciler:
             return self._prepare_and_start(inventory)
         if self.state.original_device_mode is None:
             return self._error(ValueError("original device mode is unknown"))
+        if self.state.phase == Phase.RESERVING:
+            return self._resume_reserving()
+        return self._error(RuntimeError("SPLITTING state has no vNPU inventory"))
+
+    def _resume_reserving(self) -> SchedulerState:
+        original_mode = self.state.original_device_mode
+        try:
+            current_mode = self.npu.read_device_mode()
+        except NpuOperationError as error:
+            return self._error(error)
+        if current_mode == original_mode:
+            self._checkpoint(self.state)
+            try:
+                self.npu.restrict_device()
+            except NpuOperationError as error:
+                return self._restore_mode_only(original_mode, error)
+        elif not self._mode_is_restricted(current_mode):
+            return self._error(RuntimeError("physical NPU mode does not match state"))
         try:
             self.npu.evict_card_pids()
         except NpuOperationError as error:
@@ -198,7 +220,7 @@ class Reconciler:
             try:
                 self.runners.restart_exited(allow_start=self._allow_start)
             except RunnerOperationError as error:
-                if self._after_cutoff(self.now):
+                if self._after_cutoff(self._latest_time()):
                     return self._drain_or_restore()
                 return self._error(error)
             return self.state
@@ -264,7 +286,7 @@ class Reconciler:
 
     def _rollback(self, cause: Exception) -> SchedulerState:
         jobs = self._jobs()
-        if jobs is None and not self._after_cutoff(self.now):
+        if jobs is None and not self._after_cutoff(self._latest_time()):
             return self._error(
                 self._combined(cause, GitHubUnavailable("GitHub state is unknown")),
                 vnpu_ids=self._observed_ids(),
@@ -370,8 +392,36 @@ class Reconciler:
         return None
 
     def _allow_start(self) -> bool:
-        self.now = self.clock()
-        return not self._after_cutoff(self.now)
+        sample = self.clock()
+        allowed = not self._after_cutoff(sample)
+        self._record_time(sample)
+        return allowed
+
+    def _record_time(self, sample: datetime) -> None:
+        with self._time_lock:
+            if sample > self.now:
+                self.now = sample
+
+    def _latest_time(self) -> datetime:
+        with self._time_lock:
+            return self.now
+
+    def _state_mode_is_valid(self) -> bool:
+        mode = self.state.original_device_mode
+        if mode is not None and mode <= 0:
+            return False
+        return self.state.phase == Phase.WHOLE or mode is not None
+
+    @staticmethod
+    def _mode_is_restricted(mode: int) -> bool:
+        return mode <= 0 or mode & 0o7777 == 0
+
+    def _corrupt_state(self, message: str) -> SchedulerState:
+        return replace(
+            self.state,
+            transition_timestamp=self._latest_time().isoformat(),
+            last_error=message,
+        )
 
     def _validated_inventory(self, allow_empty: bool) -> List[Vnpu]:
         inventory = sorted(self.npu.list_vnpus(), key=lambda vnpu: vnpu.id)
@@ -436,7 +486,7 @@ class Reconciler:
                 if original_mode is None
                 else original_mode
             ),
-            transition_timestamp=self.now.isoformat(),
+            transition_timestamp=self._latest_time().isoformat(),
         )
 
     def _error(
@@ -446,6 +496,13 @@ class Reconciler:
         original_device_mode: Optional[int] = None,
         persist: bool = True,
     ) -> SchedulerState:
+        effective_mode = (
+            self.state.original_device_mode
+            if original_device_mode is None
+            else original_device_mode
+        )
+        if effective_mode is None or effective_mode <= 0:
+            return self._corrupt_state(str(error))
         state = SchedulerState(
             phase=Phase.ERROR,
             vnpu_ids=self.state.vnpu_ids if vnpu_ids is None else vnpu_ids,
@@ -454,7 +511,7 @@ class Reconciler:
                 if original_device_mode is None
                 else original_device_mode
             ),
-            transition_timestamp=self.now.isoformat(),
+            transition_timestamp=self._latest_time().isoformat(),
             last_error=str(error),
         )
         if not persist:
@@ -467,7 +524,7 @@ class Reconciler:
     def _whole_with_error(self, error: Exception) -> SchedulerState:
         return SchedulerState(
             phase=Phase.WHOLE,
-            transition_timestamp=self.now.isoformat(),
+            transition_timestamp=self._latest_time().isoformat(),
             last_error=str(error),
         )
 

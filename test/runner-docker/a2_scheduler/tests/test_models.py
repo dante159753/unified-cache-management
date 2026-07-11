@@ -110,3 +110,37 @@ def test_state_json_redacts_github_token_shaped_error_text():
     assert json.loads(state.to_json())["last_error"] == (
         "GitHub request failed for [REDACTED]"
     )
+
+
+def state_document(phase="WHOLE", original_device_mode=None):
+    return json.dumps(
+        {
+            "phase": phase,
+            "vnpu_ids": [],
+            "original_device_mode": original_device_mode,
+            "transition_timestamp": None,
+            "last_error": None,
+        }
+    )
+
+
+@pytest.mark.parametrize("mode", [0, -1])
+def test_state_rejects_nonpositive_original_device_mode(mode):
+    with pytest.raises(ValueError, match="original_device_mode"):
+        SchedulerState.from_json(state_document(original_device_mode=mode))
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        Phase.RESERVING,
+        Phase.SPLITTING,
+        Phase.SERVING,
+        Phase.DRAINING,
+        Phase.RESTORING,
+        Phase.ERROR,
+    ],
+)
+def test_lifecycle_state_requires_original_device_mode(phase):
+    with pytest.raises(ValueError, match="requires original_device_mode"):
+        SchedulerState.from_json(state_document(phase=phase.value))

@@ -104,8 +104,12 @@ class SchedulerState:
         phase = _phase(data["phase"])
         vnpu_ids = _integer_tuple(data["vnpu_ids"], "state.vnpu_ids", minimum=0)
         original_device_mode = _optional_integer(
-            data["original_device_mode"], "state.original_device_mode", minimum=0
+            data["original_device_mode"], "state.original_device_mode", minimum=1
         )
+        if phase != Phase.WHOLE and original_device_mode is None:
+            raise ValueError(
+                "state phase {} requires original_device_mode".format(phase.value)
+            )
         transition_timestamp = _optional_string(
             data["transition_timestamp"], "state.transition_timestamp"
         )

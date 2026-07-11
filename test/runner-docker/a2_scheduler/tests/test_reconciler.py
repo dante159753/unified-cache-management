@@ -1,3 +1,4 @@
+import threading
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
@@ -308,9 +309,9 @@ def test_whole_with_queue_inside_window_allocates_and_starts_four():
     assert fixture.events == [
         "recover",
         "list_vnpus",
+        "read_mode",
         "workers",
         "github",
-        "read_mode",
         "restrict",
         "evict",
         "create",
@@ -332,7 +333,13 @@ def test_whole_with_api_failure_does_not_preempt():
 
     assert state.phase == Phase.WHOLE
     assert fixture.killed_pids == []
-    assert fixture.events == ["recover", "list_vnpus", "workers", "github"]
+    assert fixture.events == [
+        "recover",
+        "list_vnpus",
+        "read_mode",
+        "workers",
+        "github",
+    ]
 
 
 def test_cutoff_leaves_queued_jobs_for_next_window():
@@ -635,7 +642,7 @@ def test_pause_recovery_failure_is_error_and_blocks_all_progress(phase):
 
     state = fixture.reconcile()
 
-    assert state.phase == Phase.ERROR
+    assert state.phase == (Phase.WHOLE if phase == Phase.WHOLE else Phase.ERROR)
     assert state.vnpu_ids == ids
     assert fixture.events == ["recover"]
 
@@ -864,7 +871,7 @@ def test_stale_whole_with_unknown_mode_preserves_orphaned_vnpus():
 
     state = fixture.reconcile()
 
-    assert state.phase == Phase.ERROR
+    assert state.phase == Phase.WHOLE
     assert state.vnpu_ids == (11, 12, 13, 14)
     assert fixture.npu.destroyed_count == 0
     assert fixture.npu.created_count == 0
@@ -892,7 +899,7 @@ def test_whole_with_local_worker_never_preempts():
 
     state = fixture.reconcile()
 
-    assert state.phase == Phase.ERROR
+    assert state.phase == Phase.WHOLE
     assert fixture.npu.restricted_modes == []
     assert fixture.npu.created_count == 0
 
@@ -906,7 +913,7 @@ def test_whole_with_unknown_worker_snapshot_never_preempts():
 
     state = fixture.reconcile()
 
-    assert state.phase == Phase.ERROR
+    assert state.phase == Phase.WHOLE
     assert fixture.npu.restricted_modes == []
     assert fixture.npu.created_count == 0
 
@@ -942,7 +949,7 @@ def test_mode_read_failure_prevents_checkpoint_and_restriction():
 
     state = fixture.reconcile()
 
-    assert state.phase == Phase.ERROR
+    assert state.phase == Phase.WHOLE
     assert fixture.npu.restricted_modes == []
     assert not any(
         state.phase == Phase.RESERVING for state in fixture.checkpoint.states
@@ -955,7 +962,7 @@ def test_already_restricted_mode_is_never_recorded_as_original():
 
     state = fixture.reconcile()
 
-    assert state.phase == Phase.ERROR
+    assert state.phase == Phase.WHOLE
     assert fixture.npu.restricted_modes == []
     assert not any(
         state.phase == Phase.RESERVING for state in fixture.checkpoint.states
@@ -965,7 +972,17 @@ def test_already_restricted_mode_is_never_recorded_as_original():
     )
 
 
-@pytest.mark.parametrize("phase", [Phase.RESERVING, Phase.SPLITTING, Phase.SERVING])
+@pytest.mark.parametrize(
+    "phase",
+    [
+        Phase.RESERVING,
+        Phase.SPLITTING,
+        Phase.SERVING,
+        Phase.DRAINING,
+        Phase.RESTORING,
+        Phase.ERROR,
+    ],
+)
 def test_allocation_phase_without_original_mode_never_runs_lifecycle(phase):
     fixture = SchedulerFixture(
         phase=phase,
@@ -977,12 +994,177 @@ def test_allocation_phase_without_original_mode_never_runs_lifecycle(phase):
 
     state = fixture.reconcile()
 
-    assert state.phase == Phase.ERROR
+    assert state.phase != Phase.WHOLE
     assert fixture.runners.prepared_ids == ()
     assert fixture.runners.concurrent_starts == 0
     assert fixture.runners.restart_calls == 0
     assert fixture.runners.stop_all_calls == 0
     assert fixture.npu.destroyed_count == 0
+    assert fixture.events == []
+
+
+@pytest.mark.parametrize("phase", list(Phase))
+@pytest.mark.parametrize("mode", [0, -1])
+def test_corrupt_nonpositive_original_mode_never_mutates_host(phase, mode):
+    fixture = SchedulerFixture(
+        phase=phase,
+        queued=1,
+        vnpu_ids=(11, 12, 13, 14),
+        original_mode=mode,
+        checkpoint=True,
+    )
+
+    state = fixture.reconcile()
+
+    assert state.phase == phase
+    assert fixture.runners.prepared_ids == ()
+    assert fixture.runners.concurrent_starts == 0
+    assert fixture.runners.restart_calls == 0
+    assert fixture.runners.stop_idle_calls == 0
+    assert fixture.runners.stop_all_calls == 0
+    assert fixture.npu.destroyed_count == 0
+    assert fixture.npu.restored_modes == []
+    assert fixture.events == []
+
+
+def test_whole_without_saved_mode_requires_usable_physical_mode():
+    fixture = SchedulerFixture(phase=Phase.WHOLE, queued=1, checkpoint=True)
+    fixture.npu.device_mode = 0o20000
+
+    state = fixture.reconcile()
+
+    assert state.phase == Phase.WHOLE
+    assert fixture.npu.restricted_modes == []
+    assert fixture.npu.created_count == 0
+    assert fixture.runners.concurrent_starts == 0
+
+
+def test_reserving_resume_restricts_open_device_before_eviction():
+    fixture = SchedulerFixture(
+        phase=Phase.RESERVING,
+        queued=1,
+        original_mode=0o20660,
+        inventory=[],
+        checkpoint=True,
+    )
+    fixture.npu.device_mode = 0o20660
+
+    state = fixture.reconcile()
+
+    assert state.phase == Phase.SERVING
+    read_index = fixture.events.index("read_mode")
+    checkpoint_index = fixture.events.index("checkpoint", read_index)
+    restrict_index = fixture.events.index("restrict", checkpoint_index)
+    evict_index = fixture.events.index("evict", restrict_index)
+    assert read_index < checkpoint_index < restrict_index < evict_index
+
+
+def test_reserving_resume_accepts_already_restricted_device():
+    fixture = SchedulerFixture(
+        phase=Phase.RESERVING,
+        queued=1,
+        original_mode=0o20660,
+        inventory=[],
+        checkpoint=True,
+    )
+    fixture.npu.device_mode = 0o20000
+
+    state = fixture.reconcile()
+
+    assert state.phase == Phase.SERVING
+    assert fixture.npu.restricted_modes == []
+    assert fixture.npu.created_count == 4
+
+
+def test_splitting_without_inventory_never_evicts_or_resplits():
+    fixture = SchedulerFixture(
+        phase=Phase.SPLITTING,
+        queued=1,
+        original_mode=0o20660,
+        inventory=[],
+        checkpoint=True,
+    )
+    fixture.npu.device_mode = 0o20660
+
+    state = fixture.reconcile()
+
+    assert state.phase != Phase.WHOLE
+    assert fixture.killed_pids == []
+    assert fixture.npu.created_count == 0
+
+
+@pytest.mark.parametrize("current_mode", [0o20640, None])
+def test_reserving_resume_unknown_or_mismatched_mode_fails_closed(current_mode):
+    fixture = SchedulerFixture(
+        phase=Phase.RESERVING,
+        queued=1,
+        original_mode=0o20660,
+        inventory=[],
+        checkpoint=True,
+    )
+    if current_mode is None:
+        fixture.npu.fail = "read_mode"
+    else:
+        fixture.npu.device_mode = current_mode
+
+    state = fixture.reconcile()
+
+    assert state.phase != Phase.WHOLE
+    assert fixture.killed_pids == []
+    assert fixture.npu.restricted_modes == []
+    assert fixture.npu.created_count == 0
+
+
+def test_concurrent_start_guards_keep_latest_time_monotonic():
+    from a2_scheduler.reconciler import Reconciler
+
+    fixture = SchedulerFixture(
+        phase=Phase.SERVING,
+        vnpu_ids=(11, 12, 13, 14),
+        original_mode=0o20660,
+    )
+    reconciler = Reconciler(
+        fixture.config,
+        fixture.state,
+        fixture.github,
+        fixture.npu,
+        fixture.runners,
+        checkpoint=fixture.checkpoint,
+        clock=fixture.clock,
+        sleep=fixture.clock.sleep,
+    )
+    older_started = threading.Event()
+    release_older = threading.Event()
+    older = datetime(2026, 7, 11, 10, 19, 59)
+    newer = datetime(2026, 7, 11, 10, 20, 0)
+
+    def adversarial_clock():
+        if threading.current_thread().name == "older-sample":
+            older_started.set()
+            release_older.wait(timeout=2)
+            return older
+        return newer
+
+    reconciler.clock = adversarial_clock
+    results = {}
+    old_thread = threading.Thread(
+        target=lambda: results.setdefault("older", reconciler._allow_start()),
+        name="older-sample",
+    )
+    new_thread = threading.Thread(
+        target=lambda: results.setdefault("newer", reconciler._allow_start()),
+        name="newer-sample",
+    )
+
+    old_thread.start()
+    assert older_started.wait(timeout=2)
+    new_thread.start()
+    new_thread.join(timeout=2)
+    release_older.set()
+    old_thread.join(timeout=2)
+
+    assert results == {"newer": False, "older": True}
+    assert reconciler.now == newer
 
 
 def test_reconciler_supplies_start_guard_to_runner_manager():
