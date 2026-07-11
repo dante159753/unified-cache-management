@@ -3,7 +3,7 @@ import signal
 import subprocess
 import time
 from dataclasses import dataclass
-from typing import Callable, Iterable, List, Sequence
+from typing import Callable, Iterable, List, Sequence, Tuple
 
 from .models import Vnpu
 
@@ -35,13 +35,57 @@ class NpuOperationError(RuntimeError):
     pass
 
 
-def _table_rows(output: str) -> List[List[str]]:
-    rows = []
-    for line in output.splitlines():
+def _table_cells(line: str) -> List[str]:
+    return [cell.strip() for cell in line[1:-1].split("|")]
+
+
+def _is_separator(line: str) -> bool:
+    return bool(line) and set(line).issubset({"+", "-", "="}) and "+" in line
+
+
+def _selected_table(
+    output: str,
+    is_header: Callable[[Sequence[str]], bool],
+    error_message: str,
+) -> Tuple[List[str], List[List[str]]]:
+    lines = output.splitlines()
+    header_position = None
+    headers = None
+    for index, line in enumerate(lines):
         stripped = line.strip()
         if stripped.startswith("|") and stripped.endswith("|"):
-            rows.append([cell.strip() for cell in stripped[1:-1].split("|")])
-    return rows
+            cells = _table_cells(stripped)
+            if is_header(cells):
+                header_position = index
+                headers = cells
+                break
+    if header_position is None or headers is None:
+        raise NpuOperationError(error_message)
+
+    rows = []
+    separator_count = 0
+    for line in lines[header_position + 1 :]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _is_separator(stripped):
+            separator_count += 1
+            if rows or separator_count > 1:
+                break
+            continue
+        starts_row = stripped.startswith("|")
+        ends_row = stripped.endswith("|")
+        if starts_row != ends_row or "|" in stripped and not starts_row:
+            raise NpuOperationError(error_message)
+        if starts_row:
+            cells = _table_cells(stripped)
+            if not is_header(cells):
+                rows.append(cells)
+            continue
+        raise NpuOperationError(error_message)
+    if not rows and separator_count == 0:
+        raise NpuOperationError(error_message)
+    return headers, rows
 
 
 def _header_index(headers: Sequence[str], *names: str) -> int:
@@ -53,25 +97,18 @@ def _header_index(headers: Sequence[str], *names: str) -> int:
 
 
 def parse_info_vnpu(output: str) -> List[Vnpu]:
-    rows = _table_rows(output)
-    header_position = next(
-        (
-            index
-            for index, row in enumerate(rows)
-            if "vnpu id" in [cell.lower() for cell in row]
-        ),
-        None,
+    headers, rows = _selected_table(
+        output,
+        lambda row: "vnpu id" in [cell.lower() for cell in row],
+        "could not parse vNPU inventory",
     )
-    if header_position is None:
-        raise NpuOperationError("could not parse vNPU inventory")
-    headers = rows[header_position]
     try:
         id_index = _header_index(headers, "vnpu id")
         template_index = _header_index(headers, "template name")
     except ValueError as error:
         raise NpuOperationError("could not parse vNPU inventory") from error
     vnpus = []
-    for row in rows[header_position + 1 :]:
+    for row in rows:
         if len(row) != len(headers):
             raise NpuOperationError("could not parse vNPU inventory row")
         try:
@@ -87,27 +124,20 @@ def parse_info_vnpu(output: str) -> List[Vnpu]:
 def parse_proc_mem(output: str, card_id: int) -> List[int]:
     if output.strip() == "No process in device.":
         return []
-    rows = _table_rows(output)
-    header_position = next(
-        (
-            index
-            for index, row in enumerate(rows)
-            if any(
-                " ".join(cell.lower().split()) in ("process id", "pid") for cell in row
-            )
+    headers, rows = _selected_table(
+        output,
+        lambda row: any(
+            " ".join(cell.lower().split()) in ("process id", "pid") for cell in row
         ),
-        None,
+        "could not parse NPU process inventory",
     )
-    if header_position is None:
-        raise NpuOperationError("could not parse NPU process inventory")
-    headers = rows[header_position]
     try:
         card_index = _header_index(headers, "npu id", "card id")
         pid_index = _header_index(headers, "process id", "pid")
     except ValueError as error:
         raise NpuOperationError("could not parse NPU process inventory") from error
     pids = []
-    for row in rows[header_position + 1 :]:
+    for row in rows:
         if len(row) != len(headers):
             raise NpuOperationError("could not parse NPU process inventory row")
         try:

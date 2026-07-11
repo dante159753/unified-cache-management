@@ -121,6 +121,11 @@ def test_vnpu_parser_rejects_malformed_selected_rows(fixture_name):
         parse_info_vnpu(load_fixture(fixture_name))
 
 
+def test_vnpu_parser_rejects_truncated_selected_row():
+    with pytest.raises(NpuOperationError, match="parse vNPU"):
+        parse_info_vnpu(load_fixture("info-vnpu-truncated-row.txt"))
+
+
 @pytest.mark.parametrize(
     "fixture_name",
     ["proc-mem-malformed-pid.txt", "proc-mem-short-row.txt"],
@@ -128,6 +133,11 @@ def test_vnpu_parser_rejects_malformed_selected_rows(fixture_name):
 def test_process_parser_rejects_malformed_selected_rows(fixture_name):
     with pytest.raises(NpuOperationError, match="parse NPU process"):
         parse_proc_mem(load_fixture(fixture_name), card_id=7)
+
+
+def test_process_parser_rejects_truncated_selected_row():
+    with pytest.raises(NpuOperationError, match="parse NPU process"):
+        parse_proc_mem(load_fixture("proc-mem-truncated-row.txt"), card_id=7)
 
 
 def test_list_commands_use_card_and_chip_argv():
