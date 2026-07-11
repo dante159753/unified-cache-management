@@ -174,14 +174,12 @@ def test_list_commands_use_card_and_chip_argv():
     ]
 
 
-def test_partial_create_rolls_back_discovered_ids():
+def test_partial_create_preserves_checkpointed_ids_without_destroying():
     runner = ScriptedRunner(
         [
             ok("Create vnpu success"),
             ok("Create vnpu success"),
             failed("create failed"),
-            ok("destroy 212"),
-            ok("destroy 213"),
         ]
     )
     manager = NpuManager(runner, card_id=7, chip_id=0)
@@ -197,27 +195,9 @@ def test_partial_create_rolls_back_discovered_ids():
         )
 
     assert checkpoints == [(212,), (212, 213)]
-    assert runner.destroyed_ids == [212, 213]
-
-
-def test_partial_create_continues_rollback_after_destroy_exception():
-    runner = ScriptedRunner(
-        [
-            ok("Create vnpu success"),
-            ok("Create vnpu success"),
-            failed("create failed"),
-            OSError("destroy 212 exploded"),
-            ok("destroy 213"),
-        ]
-    )
-    manager = NpuManager(runner, card_id=7, chip_id=0)
-
-    with pytest.raises(NpuOperationError) as caught:
-        manager.create_vnpus(4, "vir05_1c_16g", on_created=lambda created: None)
-
-    assert "create failed" in str(caught.value)
-    assert "destroy 212 exploded" in str(caught.value)
-    assert runner.destroyed_ids == [212, 213]
+    assert runner.inventory_ids == [212, 213]
+    assert not any("proc-mem" in argv for argv, _ in runner.commands)
+    assert not any("destroy-vnpu" in argv for argv, _ in runner.commands)
 
 
 def test_create_discovers_each_auto_assigned_id_by_inventory_difference():
@@ -257,36 +237,7 @@ def test_destroy_uses_each_supplied_vnpu_id():
     manager.destroy_vnpus([212, 215])
 
     assert runner.destroyed_ids == [212, 215]
-
-
-def test_partial_create_pid_blocks_internal_rollback_without_destroy_command():
-    runner = ScriptedRunner([ok(), ok(), failed("create failed")])
-    manager = NpuManager(runner, card_id=7, chip_id=0)
-
-    def checkpoint(created):
-        if len(created) == 2:
-            runner.pid_results.append(ok(load_fixture("proc-mem-card7.txt")))
-
-    with pytest.raises(NpuOperationError, match="rollback failed"):
-        manager.create_vnpus(4, "vir05_1c_16g", on_created=checkpoint)
-
-    assert runner.inventory_ids == [212, 213]
-    assert not any("destroy-vnpu" in argv for argv, _ in runner.commands)
-
-
-def test_partial_create_pid_query_error_blocks_internal_rollback():
-    runner = ScriptedRunner([ok(), ok(), failed("create failed")])
-    manager = NpuManager(runner, card_id=7, chip_id=0)
-
-    def checkpoint(created):
-        if len(created) == 2:
-            runner.pid_results.append(failed("PID query failed"))
-
-    with pytest.raises(NpuOperationError, match="rollback failed"):
-        manager.create_vnpus(4, "vir05_1c_16g", on_created=checkpoint)
-
-    assert runner.inventory_ids == [212, 213]
-    assert not any("destroy-vnpu" in argv for argv, _ in runner.commands)
+    assert sum("proc-mem" in argv for argv, _ in runner.commands) == 2
 
 
 @pytest.mark.parametrize(
@@ -324,6 +275,27 @@ def test_create_callback_failure_retains_discoverable_ids_without_destroy():
     assert checkpoints == [(212,), (212, 213)]
     assert runner.inventory_ids == [212, 213]
     assert not any("destroy-vnpu" in argv for argv, _ in runner.commands)
+
+
+@pytest.mark.parametrize(
+    "second_pid_result",
+    [ok(load_fixture("proc-mem-card7.txt")), failed("PID query failed")],
+)
+def test_destroy_stops_remaining_ids_when_later_pid_guard_fails(second_pid_result):
+    runner = ScriptedRunner(
+        [ok("destroy 212")],
+        initial_ids=(212, 213, 214),
+        pid_results=[ok(load_fixture("proc-mem-none.txt")), second_pid_result],
+    )
+    manager = NpuManager(runner, card_id=7, chip_id=0)
+
+    with pytest.raises(NpuOperationError, match=r"remaining vNPU IDs: \[213, 214\]"):
+        manager.destroy_vnpus([212, 213, 214])
+
+    assert runner.destroyed_ids == [212]
+    assert runner.inventory_ids == [213, 214]
+    destroy_commands = [argv for argv, _ in runner.commands if "destroy-vnpu" in argv]
+    assert len(destroy_commands) == 1
 
 
 def test_evict_terms_waits_kills_remaining_and_requires_clean_samples():

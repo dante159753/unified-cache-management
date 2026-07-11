@@ -258,33 +258,19 @@ class NpuManager:
     ) -> List[Vnpu]:
         known_ids = {vnpu.id for vnpu in self.list_vnpus()}
         created = []
-        checkpointed_count = 0
-        try:
-            for _ in range(count):
-                result = self._run(self._set_argv("create-vnpu") + ["-f", template])
-                self._require_success(result, "create vNPU")
-                inventory = self.list_vnpus()
-                new_vnpus = [vnpu for vnpu in inventory if vnpu.id not in known_ids]
-                if len(new_vnpus) != 1:
-                    raise NpuOperationError(
-                        "create vNPU did not add exactly one inventory ID"
-                    )
-                created.append(new_vnpus[0])
-                known_ids = {vnpu.id for vnpu in inventory}
-                if on_created is not None:
-                    on_created(tuple(created))
-                    checkpointed_count = len(created)
-        except Exception as error:
-            rollback_errors = []
-            if created and checkpointed_count != len(created):
-                rollback_errors.append("created IDs were not durably checkpointed")
-            elif created:
-                rollback_errors = self._destroy_all(vnpu.id for vnpu in created)
-            if rollback_errors and isinstance(error, NpuOperationError):
+        for _ in range(count):
+            result = self._run(self._set_argv("create-vnpu") + ["-f", template])
+            self._require_success(result, "create vNPU")
+            inventory = self.list_vnpus()
+            new_vnpus = [vnpu for vnpu in inventory if vnpu.id not in known_ids]
+            if len(new_vnpus) != 1:
                 raise NpuOperationError(
-                    "{}; rollback failed: {}".format(error, "; ".join(rollback_errors))
-                ) from error
-            raise
+                    "create vNPU did not add exactly one inventory ID"
+                )
+            created.append(new_vnpus[0])
+            known_ids = {vnpu.id for vnpu in inventory}
+            if on_created is not None:
+                on_created(tuple(created))
         return created
 
     def destroy_vnpus(self, vnpu_ids: Iterable[int]) -> None:
@@ -296,15 +282,24 @@ class NpuManager:
         ids = tuple(vnpu_ids)
         if not ids:
             return []
-        try:
-            card_pids = self.list_card_pids()
-        except NpuOperationError as error:
-            return ["could not prove NPU card PID inventory empty: {}".format(error)]
-        if card_pids:
-            return ["NPU card processes are active: {}".format(card_pids)]
-
         errors = []
-        for vnpu_id in ids:
+        for index, vnpu_id in enumerate(ids):
+            remaining_ids = list(ids[index:])
+            try:
+                card_pids = self.list_card_pids()
+            except NpuOperationError as error:
+                errors.append(
+                    "could not prove NPU card PID inventory empty before destroy: {}; "
+                    "remaining vNPU IDs: {}".format(error, remaining_ids)
+                )
+                break
+            if card_pids:
+                errors.append(
+                    "NPU card processes are active: {}; remaining vNPU IDs: {}".format(
+                        card_pids, remaining_ids
+                    )
+                )
+                break
             operation = "destroy vNPU {}".format(vnpu_id)
             try:
                 result = self._run(

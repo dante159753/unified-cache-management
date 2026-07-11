@@ -84,6 +84,7 @@ class FakeNpu:
         self.restore_completed = False
         self.restore_readback_mode = None
         self.device_mode = 0o20660
+        self.pid_observations = None
 
     @property
     def destroyed_count(self):
@@ -107,6 +108,11 @@ class FakeNpu:
         self.events.append("list_pids")
         if self.fail == "list_pids":
             raise NpuOperationError("PID inventory failed")
+        if self.pid_observations is not None:
+            observation = self.pid_observations.pop(0)
+            if isinstance(observation, Exception):
+                raise observation
+            return list(observation)
         return list(self.card_pids)
 
     def create_vnpus(self, count, template, on_created=None):
@@ -134,14 +140,15 @@ class FakeNpu:
 
     def destroy_vnpus(self, vnpu_ids):
         ids = tuple(vnpu_ids)
-        card_pids = self.list_card_pids()
-        if card_pids:
-            raise NpuOperationError("NPU card processes are active")
-        self.events.append("destroy")
-        if self.fail == "destroy":
-            raise NpuOperationError("destroy failed")
-        self.destroyed_ids.extend(ids)
-        self.inventory = [vnpu for vnpu in self.inventory if vnpu.id not in ids]
+        for vnpu_id in ids:
+            card_pids = self.list_card_pids()
+            if card_pids:
+                raise NpuOperationError("NPU card processes are active")
+            self.events.append("destroy")
+            if self.fail == "destroy":
+                raise NpuOperationError("destroy failed")
+            self.destroyed_ids.append(vnpu_id)
+            self.inventory = [vnpu for vnpu in self.inventory if vnpu.id != vnpu_id]
 
     def read_device_mode(self):
         self.events.append("read_mode")
@@ -578,6 +585,28 @@ def test_partial_split_failure_does_not_destroy_when_job_became_in_progress():
     assert state.vnpu_ids == (401, 407)
     assert fixture.npu.destroyed_count == 0
     assert fixture.npu.restored_modes == []
+    assert "destroy" not in fixture.events
+
+
+@pytest.mark.parametrize(
+    "second_observation",
+    [[9123], NpuOperationError("PID inventory failed")],
+)
+def test_partial_destroy_failure_rediscovers_remaining_inventory(second_observation):
+    fixture = SchedulerFixture(
+        phase=Phase.RESTORING,
+        vnpu_ids=(11, 12, 13, 14),
+        original_mode=0o20660,
+        checkpoint=True,
+    )
+    fixture.npu.pid_observations = [[], second_observation]
+
+    state = fixture.reconcile()
+
+    assert state.phase == Phase.ERROR
+    assert state.vnpu_ids == (12, 13, 14)
+    assert fixture.npu.destroyed_ids == [11]
+    assert tuple(vnpu.id for vnpu in fixture.npu.inventory) == (12, 13, 14)
 
 
 @pytest.mark.parametrize("failure", ["prepare", "start"])

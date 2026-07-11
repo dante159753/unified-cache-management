@@ -337,7 +337,10 @@ class Reconciler:
                 self.npu.destroy_vnpus(ids)
                 remaining = self.npu.list_vnpus()
             except NpuOperationError as error:
-                return self._error(self._combined(cause, error), vnpu_ids=ids)
+                return self._error(
+                    self._combined(cause, error),
+                    vnpu_ids=self._observed_ids(),
+                )
             if remaining:
                 return self._error(
                     self._combined(cause, RuntimeError("vNPU inventory is not empty")),
