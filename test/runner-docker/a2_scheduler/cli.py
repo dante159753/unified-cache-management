@@ -403,13 +403,16 @@ class SchedulerCli:
             )
         attributed_set = set(attributed)
         try:
-            inventory_ids = {vnpu.id for vnpu in npu.list_vnpus()}
+            inventory = npu.list_vnpus()
         except Exception as error:
             raise CliError(
                 "validation cleanup could not verify inventory; {}".format(
                     VALIDATION_RECOVERY_GUIDANCE
                 )
             ) from error
+        inventory_ids = self._validated_inventory_ids(
+            inventory, len(attributed), "inventory"
+        )
         if inventory_ids != attributed_set:
             raise CliError(
                 "validation inventory is not exactly the callback-attributed set; "
@@ -421,13 +424,14 @@ class SchedulerCli:
         self._require_cleanup_policy(config, command_runner, github)
         npu.destroy_vnpus(tuple(sorted(attributed_set)))
         try:
-            remaining = {vnpu.id for vnpu in npu.list_vnpus()}
+            final_inventory = npu.list_vnpus()
         except Exception as error:
             raise CliError(
                 "validation cleanup could not verify the final inventory; {}".format(
                     VALIDATION_RECOVERY_GUIDANCE
                 )
             ) from error
+        remaining = self._validated_inventory_ids(final_inventory, 0, "final inventory")
         if remaining:
             raise CliError(
                 "validation cleanup did not reach zero vNPUs; {}".format(
@@ -435,6 +439,31 @@ class SchedulerCli:
                 )
             )
         return tuple(sorted(attributed_set))
+
+    def _validated_inventory_ids(self, inventory, expected_count, label):
+        raw_ids = []
+        for vnpu in inventory:
+            vnpu_id = getattr(vnpu, "id", None)
+            if type(vnpu_id) is not int or vnpu_id < 0:
+                raise CliError(
+                    "validation {} has invalid shape; {}".format(
+                        label, VALIDATION_RECOVERY_GUIDANCE
+                    )
+                )
+            raw_ids.append(vnpu_id)
+        if len(raw_ids) != len(set(raw_ids)):
+            raise CliError(
+                "validation {} is ambiguous; {}".format(
+                    label, VALIDATION_RECOVERY_GUIDANCE
+                )
+            )
+        if len(raw_ids) != expected_count:
+            raise CliError(
+                "validation {} has an unexpected count; {}".format(
+                    label, VALIDATION_RECOVERY_GUIDANCE
+                )
+            )
+        return set(raw_ids)
 
     def _require_validation_preconditions(
         self, config, command_runner, npu, github

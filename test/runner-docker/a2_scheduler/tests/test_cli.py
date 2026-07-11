@@ -127,6 +127,7 @@ class FakeNpu:
         self.external_vnpu_on_call = None
         self.inventory_error_on_call = None
         self.inventory_error = None
+        self.inventory_overrides = {}
 
     def list_vnpus(self):
         self.list_vnpu_calls += 1
@@ -136,6 +137,8 @@ class FakeNpu:
             raise self.inventory_error or NpuOperationError(
                 "inventory failed {}".format(TOKEN)
             )
+        if self.list_vnpu_calls in self.inventory_overrides:
+            return list(self.inventory_overrides[self.list_vnpu_calls])
         return list(self.inventory)
 
     def list_card_pids(self):
@@ -771,6 +774,110 @@ def test_validation_inventory_failure_with_external_vnpu_destroys_nothing(
     assert str(configured_cli.token_path) not in error
     assert configured_cli.npu.destroyed_ids == []
     assert [vnpu.id for vnpu in configured_cli.npu.inventory] == [300, 301, 999]
+
+
+def test_validation_duplicate_initial_inventory_destroys_nothing(
+    capsys, configured_cli
+):
+    duplicate = Vnpu(212, "vir05_1c_16g")
+    configured_cli.npu.inventory_overrides[1] = [duplicate, duplicate]
+
+    assert (
+        configured_cli.run(
+            [
+                "validate-create-rollback",
+                "--fail-before-create",
+                "3",
+                "--config",
+                str(configured_cli.config_path),
+            ]
+        )
+        == 1
+    )
+
+    assert "validation precondition failed" in capsys.readouterr().err
+    assert configured_cli.npu.created_ids == []
+    assert configured_cli.npu.destroyed_ids == []
+
+
+def test_validation_duplicate_pre_cleanup_inventory_destroys_nothing(
+    capsys, configured_cli
+):
+    configured_cli.npu.inventory_overrides[2] = [
+        Vnpu(300, "vir05_1c_16g"),
+        Vnpu(301, "vir05_1c_16g"),
+        Vnpu(300, "vir05_1c_16g"),
+    ]
+
+    assert (
+        configured_cli.run(
+            [
+                "validate-create-rollback",
+                "--fail-before-create",
+                "3",
+                "--config",
+                str(configured_cli.config_path),
+            ]
+        )
+        == 1
+    )
+
+    error = capsys.readouterr().err
+    assert "inventory is ambiguous" in error
+    assert VALIDATION_RECOVERY_GUIDANCE in error
+    assert configured_cli.npu.destroyed_ids == []
+
+
+def test_validation_malformed_pre_cleanup_inventory_destroys_nothing(
+    capsys, configured_cli
+):
+    configured_cli.npu.inventory_overrides[2] = [
+        Vnpu(300, "vir05_1c_16g"),
+        Vnpu("301", "vir05_1c_16g"),
+    ]
+
+    assert (
+        configured_cli.run(
+            [
+                "validate-create-rollback",
+                "--fail-before-create",
+                "3",
+                "--config",
+                str(configured_cli.config_path),
+            ]
+        )
+        == 1
+    )
+
+    error = capsys.readouterr().err
+    assert "inventory has invalid shape" in error
+    assert VALIDATION_RECOVERY_GUIDANCE in error
+    assert configured_cli.npu.destroyed_ids == []
+
+
+def test_validation_duplicate_post_cleanup_inventory_issues_no_further_destroy(
+    capsys, configured_cli
+):
+    duplicate = Vnpu(300, "vir05_1c_16g")
+    configured_cli.npu.inventory_overrides[3] = [duplicate, duplicate]
+
+    assert (
+        configured_cli.run(
+            [
+                "validate-create-rollback",
+                "--fail-before-create",
+                "3",
+                "--config",
+                str(configured_cli.config_path),
+            ]
+        )
+        == 1
+    )
+
+    error = capsys.readouterr().err
+    assert "final inventory is ambiguous" in error
+    assert VALIDATION_RECOVERY_GUIDANCE in error
+    assert configured_cli.npu.destroyed_ids == [300, 301]
 
 
 @pytest.mark.parametrize("unsafe", ["timer", "pids", "vnpus", "runners"])
