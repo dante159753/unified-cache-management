@@ -2,7 +2,9 @@ import json
 from http.client import HTTPException
 from io import BytesIO
 from urllib.error import HTTPError
+from urllib.request import Request
 
+import a2_scheduler.github_client as github_client
 import pytest
 from a2_scheduler.github_client import GitHubClient, GitHubUnavailable
 
@@ -79,6 +81,38 @@ class PageOpener:
         return FakeResponse(payload, link)
 
 
+class RedirectTarget:
+    url = "https://attacker.example/capture"
+
+    def __init__(self):
+        self.authorization_headers = []
+
+    def open(self, request, timeout):
+        self.authorization_headers.append(request.get_header("Authorization"))
+        return FakeResponse({"workflow_runs": []})
+
+
+class RedirectingOpener:
+    def __init__(self, redirect_handler, target):
+        self._redirect_handler = redirect_handler
+        self._target = target
+
+    def open(self, request, timeout):
+        if self._redirect_handler is None:
+            redirected_request = Request(
+                self._target.url, headers=dict(request.header_items())
+            )
+            return self._target.open(redirected_request, timeout)
+        self._redirect_handler.add_parent(self._target)
+        return self._redirect_handler.http_error_302(
+            request,
+            None,
+            302,
+            "Found",
+            {"Location": self._target.url},
+        )
+
+
 def test_finds_queued_a2_job_inside_in_progress_run():
     opener = FakeOpener(
         runs={"queued": [], "in_progress": [{"id": 42}]},
@@ -107,6 +141,21 @@ def test_http_exception_is_unknown_not_empty():
     client = GitHubClient(REPOSITORY, TOKEN, HttpExceptionOpener())
     with pytest.raises(GitHubUnavailable):
         client.list_target_jobs()
+
+
+def test_default_opener_rejects_redirect_before_sending_authorization(monkeypatch):
+    target = RedirectTarget()
+
+    def fake_build_opener(*handlers):
+        redirect_handler = handlers[0] if handlers else None
+        return RedirectingOpener(redirect_handler, target)
+
+    monkeypatch.setattr(github_client, "build_opener", fake_build_opener)
+
+    with pytest.raises(GitHubUnavailable):
+        GitHubClient(REPOSITORY, TOKEN).list_target_jobs()
+
+    assert target.authorization_headers == []
 
 
 def test_rejects_unsafe_pagination_url_without_sending_request():

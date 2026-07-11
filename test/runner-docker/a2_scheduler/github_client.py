@@ -4,7 +4,7 @@ from http.client import HTTPException
 from typing import FrozenSet, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
-from urllib.request import Request, build_opener
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .models import Job
 
@@ -18,6 +18,16 @@ class GitHubUnavailable(RuntimeError):
     pass
 
 
+class _RejectRedirectHandler(HTTPRedirectHandler):
+    def http_error_302(self, request, response, code, message, headers):
+        raise HTTPError(request.full_url, code, message, headers, response)
+
+    http_error_301 = http_error_302
+    http_error_303 = http_error_302
+    http_error_307 = http_error_302
+    http_error_308 = http_error_302
+
+
 class GitHubClient:
     def __init__(
         self,
@@ -28,7 +38,7 @@ class GitHubClient:
     ) -> None:
         self._repository = repository
         self._token = token
-        self._opener = opener or build_opener()
+        self._opener = opener or build_opener(_RejectRedirectHandler())
         self._required_labels = frozenset(required_labels)
 
     def list_target_jobs(self) -> List[Job]:
