@@ -44,13 +44,20 @@ def _normalized_row(cells: Sequence[str]) -> Tuple[str, ...]:
 
 
 def _is_separator(line: str) -> bool:
-    return bool(line) and set(line).issubset({"+", "-", "="}) and "+" in line
+    if len(line) < 5 or not line.startswith("+") or not line.endswith("+"):
+        return False
+    segments = line[1:-1].split("+")
+    return all(
+        len(segment) >= 3 and len(set(segment)) == 1 and segment[0] in "-="
+        for segment in segments
+    )
 
 
 def _selected_table(
     output: str,
     is_header: Callable[[Sequence[str]], bool],
     error_message: str,
+    allow_empty: bool = False,
 ) -> Tuple[List[str], List[List[str]]]:
     lines = output.splitlines()
     header_position = None
@@ -92,7 +99,7 @@ def _selected_table(
             separator_pending = False
             continue
         raise NpuOperationError(error_message)
-    if not rows and separator_count == 0:
+    if not rows and (separator_count == 0 or not allow_empty):
         raise NpuOperationError(error_message)
     return headers, rows
 
@@ -110,6 +117,7 @@ def parse_info_vnpu(output: str) -> List[Vnpu]:
         output,
         lambda row: "vnpu id" in [cell.lower() for cell in row],
         "could not parse vNPU inventory",
+        allow_empty=True,
     )
     try:
         id_index = _header_index(headers, "vnpu id")

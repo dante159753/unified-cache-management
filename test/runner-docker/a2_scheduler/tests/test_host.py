@@ -139,6 +139,22 @@ def test_process_parser_accepts_no_process_marker_only_as_exact_output():
         parse_proc_mem(load_fixture("proc-mem-no-process-with-row.txt"), card_id=7)
 
 
+EMPTY_PROCESS_TABLE_FIXTURES = [
+    "proc-mem-empty-header-only.txt",
+    "proc-mem-empty-segmented-border.txt",
+    "proc-mem-empty-full-border.txt",
+    "proc-mem-empty-truncated-border.txt",
+    "proc-mem-empty-lone-plus.txt",
+    "proc-mem-truncated-row.txt",
+]
+
+
+@pytest.mark.parametrize("fixture_name", EMPTY_PROCESS_TABLE_FIXTURES)
+def test_process_parser_rejects_selected_table_without_complete_rows(fixture_name):
+    with pytest.raises(NpuOperationError, match="parse NPU process"):
+        parse_proc_mem(load_fixture(fixture_name), card_id=7)
+
+
 @pytest.mark.parametrize(
     "fixture_name",
     ["info-vnpu-malformed-id.txt", "info-vnpu-short-row.txt"],
@@ -303,6 +319,22 @@ def test_public_destroy_refuses_active_or_unknown_card_pids(pid_result):
         manager.destroy_vnpus([212])
 
     assert runner.inventory_ids == [212]
+    assert not any("destroy-vnpu" in argv for argv, _ in runner.commands)
+
+
+@pytest.mark.parametrize("fixture_name", EMPTY_PROCESS_TABLE_FIXTURES)
+def test_destroy_issues_no_command_for_empty_or_truncated_process_table(fixture_name):
+    runner = ScriptedRunner(
+        [],
+        initial_ids=(212,),
+        pid_results=[ok(load_fixture(fixture_name))],
+    )
+    manager = NpuManager(runner, card_id=7, chip_id=0)
+
+    with pytest.raises(NpuOperationError, match="parse NPU process"):
+        manager.destroy_vnpus([212])
+
+    assert runner.destroyed_ids == []
     assert not any("destroy-vnpu" in argv for argv, _ in runner.commands)
 
 
