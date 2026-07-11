@@ -9,6 +9,11 @@ _CREDENTIAL_PATTERN = re.compile(
     r"\b(token|authorization)\b(?:\s*[:=]\s*|\s+)(?:bearer\s+)?[^\s,;]+",
     re.IGNORECASE,
 )
+_GITHUB_TOKEN_PATTERN = re.compile(
+    r"\b(?:gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,})\b"
+)
+_REPOSITORY = "ModelEngine-Group/unified-cache-management"
+_REQUIRED_LABELS = frozenset(("self-hosted", "npu", "a2"))
 
 
 class Phase(str, Enum):
@@ -142,31 +147,45 @@ def load_config(path: Path) -> SchedulerConfig:
         },
         "configuration",
     )
+    repository = _string(data["repository"], "repository")
     required_labels = frozenset(
         _string_list(data["required_labels"], "required_labels")
     )
     if not required_labels:
         raise ValueError("required_labels must not be empty")
-    runner_slots = _runner_slots(data["runner_slots"])
-    vnpu_count = _integer(data["vnpu_count"], "vnpu_count", minimum=1)
-    if len(runner_slots) != vnpu_count:
-        raise ValueError("runner slot count must match vnpu_count")
+    card_id = _integer(data["card_id"], "card_id", minimum=0)
+    chip_id = _integer(data["chip_id"], "chip_id", minimum=0)
     window_start_minute = _minute(data["window_start_minute"], "window_start_minute")
     window_end_minute = _minute(data["window_end_minute"], "window_end_minute")
-    if window_start_minute >= window_end_minute:
-        raise ValueError("window_start_minute must be before window_end_minute")
+    eviction_grace_seconds = _integer(
+        data["eviction_grace_seconds"], "eviction_grace_seconds", minimum=0
+    )
+    vnpu_count = _integer(data["vnpu_count"], "vnpu_count", minimum=1)
+    vnpu_template = _string(data["vnpu_template"], "vnpu_template")
+    _validate_pinned_bindings(
+        repository,
+        required_labels,
+        card_id,
+        chip_id,
+        window_start_minute,
+        window_end_minute,
+        eviction_grace_seconds,
+        vnpu_count,
+        vnpu_template,
+    )
+    runner_slots = _runner_slots(data["runner_slots"])
+    if len(runner_slots) != vnpu_count:
+        raise ValueError("runner slot count must match vnpu_count")
     return SchedulerConfig(
-        repository=_string(data["repository"], "repository"),
+        repository=repository,
         required_labels=required_labels,
-        card_id=_integer(data["card_id"], "card_id", minimum=0),
-        chip_id=_integer(data["chip_id"], "chip_id", minimum=0),
+        card_id=card_id,
+        chip_id=chip_id,
         window_start_minute=window_start_minute,
         window_end_minute=window_end_minute,
-        eviction_grace_seconds=_integer(
-            data["eviction_grace_seconds"], "eviction_grace_seconds", minimum=0
-        ),
+        eviction_grace_seconds=eviction_grace_seconds,
         vnpu_count=vnpu_count,
-        vnpu_template=_string(data["vnpu_template"], "vnpu_template"),
+        vnpu_template=vnpu_template,
         token_file=_absolute_path(data["token_file"], "token_file"),
         state_file=_absolute_path(data["state_file"], "state_file"),
         lock_file=_absolute_path(data["lock_file"], "lock_file"),
@@ -283,7 +302,10 @@ def _environment(value: Any) -> Tuple[Tuple[str, str], ...]:
         key = _string(key, "environment key")
         if "token" in key.lower() or "authorization" in key.lower():
             raise ValueError("environment must not contain credentials")
-        environment.append((key, _string(item, "environment value")))
+        item = _string(item, "environment value")
+        if _GITHUB_TOKEN_PATTERN.search(item):
+            raise ValueError("environment must not contain GitHub token-shaped values")
+        environment.append((key, item))
     return tuple(sorted(environment))
 
 
@@ -297,4 +319,36 @@ def _phase(value: Any) -> Phase:
 def _redact_credentials(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
-    return _CREDENTIAL_PATTERN.sub(r"\1 [REDACTED]", value)
+    value = _CREDENTIAL_PATTERN.sub(r"\1 [REDACTED]", value)
+    return _GITHUB_TOKEN_PATTERN.sub("[REDACTED]", value)
+
+
+def _validate_pinned_bindings(
+    repository: str,
+    required_labels: FrozenSet[str],
+    card_id: int,
+    chip_id: int,
+    window_start_minute: int,
+    window_end_minute: int,
+    eviction_grace_seconds: int,
+    vnpu_count: int,
+    vnpu_template: str,
+) -> None:
+    if repository != _REPOSITORY:
+        raise ValueError("repository must be {}".format(_REPOSITORY))
+    if required_labels != _REQUIRED_LABELS:
+        raise ValueError("required_labels must be exactly self-hosted,npu,a2")
+    if card_id != 7:
+        raise ValueError("card_id must be 7")
+    if chip_id != 0:
+        raise ValueError("chip_id must be 0")
+    if window_start_minute != 0:
+        raise ValueError("window_start_minute must be 0")
+    if window_end_minute != 20:
+        raise ValueError("window_end_minute must be 20")
+    if eviction_grace_seconds != 30:
+        raise ValueError("eviction_grace_seconds must be 30")
+    if vnpu_count != 4:
+        raise ValueError("vnpu_count must be 4")
+    if vnpu_template != "vir05_1c_16g":
+        raise ValueError("vnpu_template must be vir05_1c_16g")
