@@ -3,12 +3,13 @@ import socket
 from http.client import HTTPException
 from typing import FrozenSet, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from urllib.request import Request, build_opener
 
 from .models import Job
 
 _API_URL = "https://api.github.com"
+_ACTIONS_PATH = "/repos/ModelEngine-Group/unified-cache-management/actions/"
 _DEFAULT_REQUIRED_LABELS = frozenset(("self-hosted", "npu", "a2"))
 _TIMEOUT_SECONDS = 30
 
@@ -143,5 +144,13 @@ class GitHubClient:
             ):
                 raise ValueError("invalid pagination link")
             if 'rel="next"' in fields[1:]:
-                return urljoin(_API_URL, fields[0][1:-1])
+                next_url = urljoin(_API_URL, fields[0][1:-1])
+                parsed_url = urlparse(next_url)
+                if (
+                    parsed_url.scheme != "https"
+                    or parsed_url.hostname != "api.github.com"
+                    or not parsed_url.path.startswith(_ACTIONS_PATH)
+                ):
+                    raise ValueError("unsafe pagination link")
+                return next_url
         return None
