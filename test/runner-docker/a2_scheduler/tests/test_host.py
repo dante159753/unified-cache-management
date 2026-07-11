@@ -123,6 +123,24 @@ def test_parse_vnpu_inventory_discovers_actual_ids():
     assert {v.template for v in parse_info_vnpu(output)} == {"vir05_1c_16g"}
 
 
+def test_live_vnpu_fixture_preserves_exact_full_width_layout():
+    lines = load_fixture("info-vnpu-four.txt").splitlines()
+    header_position = lines.index(
+        "|  Vnpu ID  |  Vgroup ID     |  Container ID  |  Status  |  Template Name       |"
+    )
+    table = lines[header_position - 1 :]
+    border = "+-------------------------------------------------------------------------------+"
+
+    assert all(len(line) == 81 for line in table)
+    assert table[::2] == [border] * 6
+    assert table[3::2] == [
+        "|  212      |  0             |  000000000000  |  0       |  vir05_1c_16g        |",
+        "|  213      |  1             |  000000000000  |  0       |  vir05_1c_16g        |",
+        "|  214      |  2             |  000000000000  |  0       |  vir05_1c_16g        |",
+        "|  215      |  3             |  000000000000  |  0       |  vir05_1c_16g        |",
+    ]
+
+
 def test_parse_empty_vnpu_inventory():
     assert parse_info_vnpu(load_fixture("info-vnpu-zero.txt")) == []
 
@@ -182,6 +200,20 @@ UNSAFE_VNPU_GEOMETRY_FIXTURES = [
     "info-vnpu-wrong-geometry-closing-border.txt",
 ]
 
+UNSAFE_PROCESS_ROW_LAYOUT_FIXTURES = [
+    "proc-mem-compact-row.txt",
+    "proc-mem-over-wide-row.txt",
+    "proc-mem-shifted-pipe-row.txt",
+    "proc-mem-extra-pipe-row.txt",
+]
+
+UNSAFE_VNPU_ROW_LAYOUT_FIXTURES = [
+    "info-vnpu-compact-row.txt",
+    "info-vnpu-over-wide-row.txt",
+    "info-vnpu-shifted-pipe-row.txt",
+    "info-vnpu-extra-pipe-row.txt",
+]
+
 
 @pytest.mark.parametrize("fixture_name", EMPTY_PROCESS_TABLE_FIXTURES)
 def test_process_parser_rejects_selected_table_without_complete_rows(fixture_name):
@@ -191,6 +223,12 @@ def test_process_parser_rejects_selected_table_without_complete_rows(fixture_nam
 
 @pytest.mark.parametrize("fixture_name", UNSAFE_PROCESS_GEOMETRY_FIXTURES)
 def test_process_parser_rejects_incomplete_or_mismatched_geometry(fixture_name):
+    with pytest.raises(NpuOperationError, match="parse NPU process"):
+        parse_proc_mem(load_fixture(fixture_name), card_id=7)
+
+
+@pytest.mark.parametrize("fixture_name", UNSAFE_PROCESS_ROW_LAYOUT_FIXTURES)
+def test_process_parser_rejects_row_layout_drift(fixture_name):
     with pytest.raises(NpuOperationError, match="parse NPU process"):
         parse_proc_mem(load_fixture(fixture_name), card_id=7)
 
@@ -211,6 +249,12 @@ def test_vnpu_parser_rejects_truncated_selected_row():
 
 @pytest.mark.parametrize("fixture_name", UNSAFE_VNPU_GEOMETRY_FIXTURES)
 def test_vnpu_parser_rejects_incomplete_or_mismatched_geometry(fixture_name):
+    with pytest.raises(NpuOperationError, match="parse vNPU"):
+        parse_info_vnpu(load_fixture(fixture_name))
+
+
+@pytest.mark.parametrize("fixture_name", UNSAFE_VNPU_ROW_LAYOUT_FIXTURES)
+def test_vnpu_parser_rejects_row_layout_drift(fixture_name):
     with pytest.raises(NpuOperationError, match="parse vNPU"):
         parse_info_vnpu(load_fixture(fixture_name))
 
@@ -400,6 +444,22 @@ def test_destroy_issues_no_command_for_empty_or_truncated_process_table(fixture_
 
 @pytest.mark.parametrize("fixture_name", UNSAFE_PROCESS_GEOMETRY_FIXTURES)
 def test_destroy_issues_no_command_for_incomplete_or_mismatched_geometry(fixture_name):
+    runner = ScriptedRunner(
+        [],
+        initial_ids=(212,),
+        pid_results=[ok(load_fixture(fixture_name))],
+    )
+    manager = NpuManager(runner, card_id=7, chip_id=0)
+
+    with pytest.raises(NpuOperationError, match="parse NPU process"):
+        manager.destroy_vnpus([212])
+
+    assert runner.destroyed_ids == []
+    assert not any("destroy-vnpu" in argv for argv, _ in runner.commands)
+
+
+@pytest.mark.parametrize("fixture_name", UNSAFE_PROCESS_ROW_LAYOUT_FIXTURES)
+def test_destroy_issues_no_command_for_row_layout_drift(fixture_name):
     runner = ScriptedRunner(
         [],
         initial_ids=(212,),

@@ -44,16 +44,32 @@ def _normalized_row(cells: Sequence[str]) -> Tuple[str, ...]:
     return tuple(" ".join(cell.lower().split()) for cell in cells)
 
 
-def _separator_geometry(line: str) -> Optional[Tuple[str, Tuple[int, ...]]]:
-    if len(line) < 5 or not line.startswith("+") or not line.endswith("+"):
+def _pipe_positions(line: str) -> Tuple[int, ...]:
+    return tuple(index for index, character in enumerate(line) if character == "|")
+
+
+def _separator_geometry(
+    line: str, header_line: str
+) -> Optional[Tuple[str, Tuple[int, ...]]]:
+    if (
+        len(line) != len(header_line)
+        or len(line) < 5
+        or not line.startswith("+")
+        or not line.endswith("+")
+    ):
         return None
-    segments = line[1:-1].split("+")
-    if not segments or any(len(segment) < 3 for segment in segments):
+    plus_positions = tuple(
+        index for index, character in enumerate(line) if character == "+"
+    )
+    header_positions = _pipe_positions(header_line)
+    if plus_positions not in ((0, len(line) - 1), header_positions):
         return None
-    styles = {character for segment in segments for character in set(segment)}
+    if any(right - left < 4 for left, right in zip(plus_positions, plus_positions[1:])):
+        return None
+    styles = set(line) - {"+"}
     if len(styles) != 1 or not styles.issubset({"-", "="}):
         return None
-    return next(iter(styles)), tuple(len(segment) for segment in segments)
+    return next(iter(styles)), plus_positions
 
 
 def _selected_table(
@@ -62,43 +78,48 @@ def _selected_table(
     error_message: str,
     allow_empty: bool = False,
 ) -> Tuple[List[str], List[List[str]]]:
-    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    lines = [line for line in output.splitlines() if line.strip()]
     header_position = None
     headers = None
+    header_line = None
     for index, line in enumerate(lines):
         if line.startswith("|") and line.endswith("|"):
             cells = _table_cells(line)
             if is_header(cells):
                 header_position = index
                 headers = cells
+                header_line = line
                 break
-    if header_position is None or headers is None:
+    if header_position is None or headers is None or header_line is None:
         raise NpuOperationError(error_message)
 
     if header_position == 0 or header_position + 1 >= len(lines):
         raise NpuOperationError(error_message)
-    geometry = _separator_geometry(lines[header_position - 1])
-    if geometry is None or _separator_geometry(lines[header_position + 1]) != geometry:
-        raise NpuOperationError(error_message)
-    _, widths = geometry
-    if len(widths) != len(headers) or any(
-        width < len(header) + 2 for width, header in zip(widths, headers)
+    geometry = _separator_geometry(lines[header_position - 1], header_line)
+    if geometry is None or (
+        _separator_geometry(lines[header_position + 1], header_line) != geometry
     ):
         raise NpuOperationError(error_message)
 
     rows = []
     normalized_headers = _normalized_row(headers)
+    header_pipe_positions = _pipe_positions(header_line)
     position = header_position + 2
     while position < len(lines):
         line = lines[position]
-        if not line.startswith("|") or not line.endswith("|"):
+        if (
+            len(line) != len(header_line)
+            or _pipe_positions(line) != header_pipe_positions
+        ):
             raise NpuOperationError(error_message)
         cells = _table_cells(line)
         if len(cells) != len(headers) or _normalized_row(cells) == normalized_headers:
             raise NpuOperationError(error_message)
         rows.append(cells)
         position += 1
-        if position >= len(lines) or _separator_geometry(lines[position]) != geometry:
+        if position >= len(lines) or (
+            _separator_geometry(lines[position], header_line) != geometry
+        ):
             raise NpuOperationError(error_message)
         position += 1
     if not rows and not allow_empty:
