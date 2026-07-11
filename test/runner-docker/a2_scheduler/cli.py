@@ -32,6 +32,15 @@ class StatePersistenceUncertainError(RuntimeError):
     pass
 
 
+class StatePersistenceCleanupError(RuntimeError):
+    def __init__(self, primary_error: Exception, cleanup_error: Exception) -> None:
+        super().__init__(
+            "state persistence failed before replace; temporary cleanup also failed"
+        )
+        self.primary_error_type = type(primary_error).__name__
+        self.cleanup_error_type = type(cleanup_error).__name__
+
+
 class LinuxFileLock:
     def __init__(
         self,
@@ -138,20 +147,28 @@ class AtomicStateStore:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(str(temporary), str(self.path))
-            temporary = None
-            try:
-                self._fsync_directory()
-            except Exception as error:
-                raise StatePersistenceUncertainError(
-                    "state replace completed but directory fsync failed; "
-                    "durability is uncertain"
-                ) from error
-        finally:
-            if temporary is not None:
-                try:
-                    temporary.unlink()
-                except FileNotFoundError:
-                    pass
+        except Exception as primary_error:
+            self._cleanup_temporary(temporary, primary_error)
+            raise
+        temporary = None
+        try:
+            self._fsync_directory()
+        except Exception as error:
+            raise StatePersistenceUncertainError(
+                "state replace completed but directory fsync failed; "
+                "durability is uncertain"
+            ) from error
+
+    @staticmethod
+    def _cleanup_temporary(temporary, primary_error: Exception) -> None:
+        if temporary is None:
+            return
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            return
+        except Exception as cleanup_error:
+            raise StatePersistenceCleanupError(primary_error, cleanup_error) from None
 
     def _fsync_directory(self) -> None:
         if not hasattr(os, "O_DIRECTORY"):

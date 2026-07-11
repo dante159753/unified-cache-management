@@ -14,7 +14,7 @@
   "vnpu_template": "vir05_1c_16g",
   "token_file": "/etc/ucm-a2-scheduler/github.token",
   "state_file": "/var/lib/ucm-a2-scheduler/state.json",
-  "lock_file": "/run/lock/ucm-a2-card7.lock",
+  "lock_file": "/run/ucm-a2-scheduler/card7.lock",
   "runner_slots": [
     {
       "name": "ucm-a2-vnpu-runner-212",

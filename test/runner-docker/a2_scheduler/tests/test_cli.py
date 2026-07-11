@@ -12,6 +12,7 @@ from a2_scheduler.cli import (
     CliError,
     LinuxFileLock,
     SchedulerCli,
+    StatePersistenceCleanupError,
     StatePersistenceUncertainError,
 )
 from a2_scheduler.host import CommandResult, NpuOperationError
@@ -556,6 +557,37 @@ def test_atomic_state_store_reports_post_replace_directory_fsync_uncertainty(
     assert list(tmp_path.glob(".state.json.*.tmp")) == []
 
 
+def test_atomic_state_store_preserves_primary_when_temp_unlink_also_fails(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "state.json"
+    secret_path = tmp_path / "private" / "github.token"
+    leaked_temp_paths = []
+
+    def fail_replace(source, destination):
+        raise OSError("replace failed {} {}".format(TOKEN, secret_path))
+
+    def fail_unlink(temporary):
+        leaked_temp_paths.append(str(temporary))
+        raise OSError("unlink failed {} {}".format(TOKEN, temporary))
+
+    monkeypatch.setattr("a2_scheduler.cli.os.replace", fail_replace)
+    monkeypatch.setattr(Path, "unlink", fail_unlink)
+
+    with pytest.raises(StatePersistenceCleanupError) as captured:
+        AtomicStateStore(path).save(SchedulerState())
+
+    error = captured.value
+    message = str(error)
+    assert error.primary_error_type == "OSError"
+    assert error.cleanup_error_type == "OSError"
+    assert "state persistence failed before replace" in message
+    assert "temporary cleanup also failed" in message
+    assert TOKEN not in message
+    assert str(secret_path) not in message
+    assert leaked_temp_paths and leaked_temp_paths[0] not in message
+
+
 def test_systemd_service_matches_plan():
     path = Path(__file__).resolve().parents[1] / "systemd" / "ucm-a2-scheduler.service"
     content = path.read_text(encoding="utf-8")
@@ -570,6 +602,30 @@ def test_systemd_service_matches_plan():
         "ExecStart=/usr/bin/python3 -m a2_scheduler.cli reconcile --config "
         "/etc/ucm-a2-scheduler/config.json"
     ) in content
+
+
+def test_systemd_service_preserves_runtime_directory_for_lock_identity():
+    path = Path(__file__).resolve().parents[1] / "systemd" / "ucm-a2-scheduler.service"
+    lines = path.read_text(encoding="utf-8").splitlines()
+
+    assert lines.count("RuntimeDirectoryPreserve=yes") == 1
+
+
+def test_config_example_lock_path_matches_systemd_runtime_directory():
+    package = Path(__file__).resolve().parents[1]
+    config = json.loads((package / "config.example.json").read_text(encoding="utf-8"))
+    service_lines = (
+        (package / "systemd" / "ucm-a2-scheduler.service")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
+    runtime_directory = next(
+        line.split("=", 1)[1]
+        for line in service_lines
+        if line.startswith("RuntimeDirectory=")
+    )
+
+    assert config["lock_file"] == "/run/{}/card7.lock".format(runtime_directory)
 
 
 def test_systemd_timer_matches_monotonic_plan():

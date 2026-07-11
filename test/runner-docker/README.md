@@ -79,7 +79,9 @@ read-only checks and operator validation below have passed.
 Set `lock_file` to `/run/ucm-a2-scheduler/card7.lock`. The service creates
 `/run/ucm-a2-scheduler` as a root-owned runtime directory with mode `0700`; the
 lock refuses symlinks, non-root ownership, non-file/non-directory objects, and
-any group/other permissions.
+any group/other permissions. systemd preserves the runtime directory after the
+oneshot exits so service teardown cannot unlink the identity of a lock still
+held by a concurrent manual invocation.
 
 ## Read-only checks
 
