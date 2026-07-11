@@ -192,11 +192,15 @@ class Reconciler:
             self.npu.create_vnpus(
                 self.config.vnpu_count,
                 self.config.vnpu_template,
+                on_created=self._checkpoint_created_vnpus,
             )
             inventory = self._validated_inventory(allow_empty=False)
         except (NpuOperationError, ValueError) as error:
             return self._rollback(error)
         return self._prepare_and_start(inventory)
+
+    def _checkpoint_created_vnpus(self, created: Sequence[Vnpu]) -> None:
+        self._checkpoint(self._transition(Phase.SPLITTING, vnpu_ids=self._ids(created)))
 
     def _prepare_and_start(self, inventory: Sequence[Vnpu]) -> SchedulerState:
         ids = self._ids(inventory)
@@ -327,22 +331,6 @@ class Reconciler:
                     return self._error(cause or RuntimeError("runner worker is active"))
             except RunnerOperationError as error:
                 return self._error(self._combined(cause, error))
-
-        try:
-            card_pids = self.npu.list_card_pids()
-        except NpuOperationError as error:
-            return self._error(
-                self._combined(cause, error),
-                vnpu_ids=ids,
-            )
-        if card_pids:
-            return self._error(
-                self._combined(
-                    cause,
-                    RuntimeError("NPU card processes are active"),
-                ),
-                vnpu_ids=ids,
-            )
 
         if ids:
             try:

@@ -109,21 +109,34 @@ class FakeNpu:
             raise NpuOperationError("PID inventory failed")
         return list(self.card_pids)
 
-    def create_vnpus(self, count, template):
+    def create_vnpus(self, count, template, on_created=None):
         self.events.append("create")
         if self.fail == "create":
-            created = [Vnpu(vnpu_id, template) for vnpu_id in self.partial_create]
-            self.inventory.extend(created)
-            self.created_count += len(created)
+            created = []
+            for vnpu_id in self.partial_create:
+                vnpu = Vnpu(vnpu_id, template)
+                created.append(vnpu)
+                self.inventory.append(vnpu)
+                self.created_count += 1
+                if on_created is not None:
+                    on_created(tuple(created))
             raise NpuOperationError("creation failed")
         start = max([vnpu.id for vnpu in self.inventory] + [300]) + 7
-        created = [Vnpu(start + index * 3, template) for index in range(count)]
-        self.inventory.extend(created)
-        self.created_count += len(created)
+        created = []
+        for index in range(count):
+            vnpu = Vnpu(start + index * 3, template)
+            created.append(vnpu)
+            self.inventory.append(vnpu)
+            self.created_count += 1
+            if on_created is not None:
+                on_created(tuple(created))
         return created
 
     def destroy_vnpus(self, vnpu_ids):
         ids = tuple(vnpu_ids)
+        card_pids = self.list_card_pids()
+        if card_pids:
+            raise NpuOperationError("NPU card processes are active")
         self.events.append("destroy")
         if self.fail == "destroy":
             raise NpuOperationError("destroy failed")
@@ -729,12 +742,22 @@ def test_actual_ids_are_checkpointed_before_runner_preparation_and_start():
 
     fixture.reconcile()
 
+    progress_ids = [
+        state.vnpu_ids
+        for state in fixture.checkpoint.states
+        if state.phase == Phase.SPLITTING and state.vnpu_ids
+    ]
+    assert progress_ids[:4] == [
+        (307,),
+        (307, 310),
+        (307, 310, 313),
+        (307, 310, 313, 316),
+    ]
     split = next(
         state
         for state in fixture.checkpoint.states
-        if state.phase == Phase.SPLITTING and state.vnpu_ids
+        if state.vnpu_ids == progress_ids[3]
     )
-    assert split.vnpu_ids == (307, 310, 313, 316)
     split_checkpoint = next(
         index
         for index, event in enumerate(fixture.events)
@@ -752,16 +775,18 @@ def test_actual_id_checkpoint_failure_prevents_runner_and_destroy_actions():
     fixture = SchedulerFixture(
         queued=1,
         checkpoint=True,
-        checkpoint_fail_on=2,
+        checkpoint_fail_on=3,
     )
 
     state = fixture.reconcile()
 
     assert state.phase == Phase.ERROR
-    assert state.vnpu_ids == (307, 310, 313, 316)
+    assert state.vnpu_ids == (307, 310)
+    assert tuple(vnpu.id for vnpu in fixture.npu.inventory) == (307, 310)
     assert fixture.runners.prepared_ids == ()
     assert fixture.runners.concurrent_starts == 0
     assert fixture.npu.destroyed_count == 0
+    assert fixture.npu.restored_modes == []
 
 
 def test_restoring_checkpoint_failure_prevents_runner_stop_and_vnpu_destroy():

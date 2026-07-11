@@ -2,7 +2,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from a2_scheduler.host import (
+
+from a2_scheduler.host import (  # isort: skip
     SIGKILL,
     SIGTERM,
     CommandResult,
@@ -48,8 +49,9 @@ def inventory(ids):
 
 
 class ScriptedRunner:
-    def __init__(self, results, initial_ids=()):
+    def __init__(self, results, initial_ids=(), pid_results=()):
         self.results = list(results)
+        self.pid_results = list(pid_results)
         self.inventory_ids = list(initial_ids)
         self.commands = []
         self.created_ids = []
@@ -60,6 +62,13 @@ class ScriptedRunner:
         self.commands.append((argv, timeout))
         if "info-vnpu" in argv:
             return ok(inventory(self.inventory_ids))
+        if "proc-mem" in argv:
+            if not self.pid_results:
+                return ok(load_fixture("proc-mem-none.txt"))
+            result = self.pid_results.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return result
         result = self.results.pop(0)
         if "destroy-vnpu" in argv:
             vnpu_id = int(argv[argv.index("-v") + 1])
@@ -176,10 +185,18 @@ def test_partial_create_rolls_back_discovered_ids():
         ]
     )
     manager = NpuManager(runner, card_id=7, chip_id=0)
+    checkpoints = []
 
     with pytest.raises(NpuOperationError, match="create failed"):
-        manager.create_vnpus(4, "vir05_1c_16g")
+        manager.create_vnpus(
+            4,
+            "vir05_1c_16g",
+            on_created=lambda created: checkpoints.append(
+                tuple(vnpu.id for vnpu in created)
+            ),
+        )
 
+    assert checkpoints == [(212,), (212, 213)]
     assert runner.destroyed_ids == [212, 213]
 
 
@@ -196,7 +213,7 @@ def test_partial_create_continues_rollback_after_destroy_exception():
     manager = NpuManager(runner, card_id=7, chip_id=0)
 
     with pytest.raises(NpuOperationError) as caught:
-        manager.create_vnpus(4, "vir05_1c_16g")
+        manager.create_vnpus(4, "vir05_1c_16g", on_created=lambda created: None)
 
     assert "create failed" in str(caught.value)
     assert "destroy 212 exploded" in str(caught.value)
@@ -240,6 +257,73 @@ def test_destroy_uses_each_supplied_vnpu_id():
     manager.destroy_vnpus([212, 215])
 
     assert runner.destroyed_ids == [212, 215]
+
+
+def test_partial_create_pid_blocks_internal_rollback_without_destroy_command():
+    runner = ScriptedRunner([ok(), ok(), failed("create failed")])
+    manager = NpuManager(runner, card_id=7, chip_id=0)
+
+    def checkpoint(created):
+        if len(created) == 2:
+            runner.pid_results.append(ok(load_fixture("proc-mem-card7.txt")))
+
+    with pytest.raises(NpuOperationError, match="rollback failed"):
+        manager.create_vnpus(4, "vir05_1c_16g", on_created=checkpoint)
+
+    assert runner.inventory_ids == [212, 213]
+    assert not any("destroy-vnpu" in argv for argv, _ in runner.commands)
+
+
+def test_partial_create_pid_query_error_blocks_internal_rollback():
+    runner = ScriptedRunner([ok(), ok(), failed("create failed")])
+    manager = NpuManager(runner, card_id=7, chip_id=0)
+
+    def checkpoint(created):
+        if len(created) == 2:
+            runner.pid_results.append(failed("PID query failed"))
+
+    with pytest.raises(NpuOperationError, match="rollback failed"):
+        manager.create_vnpus(4, "vir05_1c_16g", on_created=checkpoint)
+
+    assert runner.inventory_ids == [212, 213]
+    assert not any("destroy-vnpu" in argv for argv, _ in runner.commands)
+
+
+@pytest.mark.parametrize(
+    "pid_result",
+    [ok(load_fixture("proc-mem-card7.txt")), failed("PID query failed")],
+)
+def test_public_destroy_refuses_active_or_unknown_card_pids(pid_result):
+    runner = ScriptedRunner([], initial_ids=(212,), pid_results=[pid_result])
+    manager = NpuManager(runner, card_id=7, chip_id=0)
+
+    with pytest.raises(NpuOperationError):
+        manager.destroy_vnpus([212])
+
+    assert runner.inventory_ids == [212]
+    assert not any("destroy-vnpu" in argv for argv, _ in runner.commands)
+
+
+def test_create_callback_failure_retains_discoverable_ids_without_destroy():
+    class PersistenceFailure(RuntimeError):
+        pass
+
+    runner = ScriptedRunner([ok(), ok()])
+    manager = NpuManager(runner, card_id=7, chip_id=0)
+    checkpoints = []
+
+    def checkpoint(created):
+        ids = tuple(vnpu.id for vnpu in created)
+        checkpoints.append(ids)
+        if len(ids) == 2:
+            raise PersistenceFailure("checkpoint failed")
+
+    with pytest.raises(PersistenceFailure, match="checkpoint failed"):
+        manager.create_vnpus(4, "vir05_1c_16g", on_created=checkpoint)
+
+    assert checkpoints == [(212,), (212, 213)]
+    assert runner.inventory_ids == [212, 213]
+    assert not any("destroy-vnpu" in argv for argv, _ in runner.commands)
 
 
 def test_evict_terms_waits_kills_remaining_and_requires_clean_samples():

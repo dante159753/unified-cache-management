@@ -3,7 +3,7 @@ import signal
 import subprocess
 import time
 from dataclasses import dataclass
-from typing import Callable, Iterable, List, Sequence, Tuple
+from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
 from .models import Vnpu
 
@@ -250,9 +250,15 @@ class NpuManager:
                     "NPU processes remain after SIGKILL: {}".format(remaining)
                 )
 
-    def create_vnpus(self, count: int, template: str) -> List[Vnpu]:
+    def create_vnpus(
+        self,
+        count: int,
+        template: str,
+        on_created: Optional[Callable[[Sequence[Vnpu]], None]] = None,
+    ) -> List[Vnpu]:
         known_ids = {vnpu.id for vnpu in self.list_vnpus()}
         created = []
+        checkpointed_count = 0
         try:
             for _ in range(count):
                 result = self._run(self._set_argv("create-vnpu") + ["-f", template])
@@ -265,9 +271,16 @@ class NpuManager:
                     )
                 created.append(new_vnpus[0])
                 known_ids = {vnpu.id for vnpu in inventory}
-        except NpuOperationError as error:
-            rollback_errors = self._destroy_all(vnpu.id for vnpu in created)
-            if rollback_errors:
+                if on_created is not None:
+                    on_created(tuple(created))
+                    checkpointed_count = len(created)
+        except Exception as error:
+            rollback_errors = []
+            if created and checkpointed_count != len(created):
+                rollback_errors.append("created IDs were not durably checkpointed")
+            elif created:
+                rollback_errors = self._destroy_all(vnpu.id for vnpu in created)
+            if rollback_errors and isinstance(error, NpuOperationError):
                 raise NpuOperationError(
                     "{}; rollback failed: {}".format(error, "; ".join(rollback_errors))
                 ) from error
@@ -280,8 +293,18 @@ class NpuManager:
             raise NpuOperationError("; ".join(errors))
 
     def _destroy_all(self, vnpu_ids: Iterable[int]) -> List[str]:
+        ids = tuple(vnpu_ids)
+        if not ids:
+            return []
+        try:
+            card_pids = self.list_card_pids()
+        except NpuOperationError as error:
+            return ["could not prove NPU card PID inventory empty: {}".format(error)]
+        if card_pids:
+            return ["NPU card processes are active: {}".format(card_pids)]
+
         errors = []
-        for vnpu_id in vnpu_ids:
+        for vnpu_id in ids:
             operation = "destroy vNPU {}".format(vnpu_id)
             try:
                 result = self._run(
