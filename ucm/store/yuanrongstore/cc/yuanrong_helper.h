@@ -125,6 +125,35 @@ inline size_t TotalBlobBytes(const std::vector<datasystem::DeviceBlobList>& blob
     return total;
 }
 
+inline Status SelectMissingYuanRongObjects(
+    const std::vector<bool>& exists, std::vector<std::string>& keys,
+    std::vector<datasystem::DeviceBlobList>& blobLists, Detail::TaskDesc& desc)
+{
+    if (exists.size() != keys.size() || blobLists.size() != keys.size() ||
+        desc.size() != keys.size()) {
+        return Status::InvalidParam(
+            "YuanRong object selection size mismatch: exists({}), keys({}), blobs({}), shards({})",
+            exists.size(), keys.size(), blobLists.size(), desc.size());
+    }
+
+    std::vector<std::string> missingKeys;
+    std::vector<datasystem::DeviceBlobList> missingBlobLists;
+    Detail::TaskDesc missingDesc;
+    missingKeys.reserve(keys.size());
+    missingBlobLists.reserve(blobLists.size());
+    missingDesc.reserve(desc.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (exists[i]) { continue; }
+        missingKeys.push_back(std::move(keys[i]));
+        missingBlobLists.push_back(std::move(blobLists[i]));
+        missingDesc.push_back(std::move(desc[i]));
+    }
+    keys = std::move(missingKeys);
+    blobLists = std::move(missingBlobLists);
+    desc = std::move(missingDesc);
+    return Status::OK();
+}
+
 inline std::vector<size_t> FailedIndexes(const std::vector<std::string>& keys,
                                          const std::vector<std::string>& failedKeys,
                                          bool requestFailed)

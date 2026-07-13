@@ -44,9 +44,9 @@ bool IsKeyDuplicatedStatus(const datasystem::Status& status)
 
 Status FilterMissingKeys(datasystem::HeteroClient& client, const std::vector<std::string>& keys,
                          std::vector<datasystem::DeviceBlobList>& blobLists,
-                         std::vector<std::string>& missingKeys,
+                         Detail::TaskDesc& desc, std::vector<std::string>& missingKeys,
                          std::vector<datasystem::DeviceBlobList>& missingBlobLists,
-                         double& existCostMs)
+                         Detail::TaskDesc& missingDesc, double& existCostMs)
 {
     std::vector<bool> exists;
     auto existStart = NowTime::Now();
@@ -57,16 +57,10 @@ Status FilterMissingKeys(datasystem::HeteroClient& client, const std::vector<std
             fmt::format("YuanRong Exist before D2H failed: {}", existStatus.ToString()));
     }
 
-    missingKeys.clear();
-    missingBlobLists.clear();
-    missingKeys.reserve(keys.size());
-    missingBlobLists.reserve(blobLists.size());
-    for (size_t i = 0; i < keys.size(); ++i) {
-        if (exists[i]) { continue; }
-        missingKeys.push_back(keys[i]);
-        missingBlobLists.push_back(std::move(blobLists[i]));
-    }
-    return Status::OK();
+    missingKeys = keys;
+    missingBlobLists = std::move(blobLists);
+    missingDesc = std::move(desc);
+    return SelectMissingYuanRongObjects(exists, missingKeys, missingBlobLists, missingDesc);
 }
 
 }  // namespace
@@ -193,9 +187,10 @@ Status DumpQueue::DumpOne(TaskPtr task, const std::shared_ptr<Trans::Stream>& pr
 
     std::vector<std::string> missingKeys;
     std::vector<datasystem::DeviceBlobList> missingBlobLists;
+    Detail::TaskDesc missingDesc;
     double preExistMs = 0.0;
-    s = FilterMissingKeys(*heteroClient_, keys, blobLists, missingKeys, missingBlobLists,
-                          preExistMs);
+    s = FilterMissingKeys(*heteroClient_, keys, blobLists, task->desc, missingKeys,
+                          missingBlobLists, missingDesc, preExistMs);
     if (s.Failure()) { return s; }
 
     datasystem::SetParam setParam;
@@ -209,7 +204,10 @@ Status DumpQueue::DumpOne(TaskPtr task, const std::shared_ptr<Trans::Stream>& pr
         d2hMs = (NowTime::Now() - d2hStart) * 1e3;
         if (dumpStatus.IsError()) {
             if (IsKeyDuplicatedStatus(dumpStatus)) {
-                UC_WARN("YuanRong MSetD2H hit duplicated keys: {}", dumpStatus.ToString());
+                UC_WARN("YuanRong MSetD2H hit duplicated keys; skip Posix dump for this batch "
+                        "because local publish ownership is unknown: {}",
+                        dumpStatus.ToString());
+                return Status::OK();
             } else {
                 return Status::Error(
                     fmt::format("YuanRong MSetD2H failed: {}", dumpStatus.ToString()));
@@ -227,38 +225,61 @@ Status DumpQueue::DumpOne(TaskPtr task, const std::shared_ptr<Trans::Stream>& pr
                  (NowTime::Now() - taskStart) * 1e3);
         return Status::OK();
     }
+    if (missingKeys.empty()) {
+        UC_DEBUG("YuanRong dump task({}) skips backend because all {} keys already exist.",
+                 task->id, keys.size());
+        return Status::OK();
+    }
 
     std::vector<bool> exists;
     auto postExistStart = NowTime::Now();
-    auto existStatus = heteroClient_->Exist(keys, exists);
+    auto existStatus = heteroClient_->Exist(missingKeys, exists);
     auto postExistEnd = NowTime::Now();
-    if (existStatus.IsError() || exists.size() != keys.size() ||
-        !std::all_of(exists.begin(), exists.end(), [](bool value) { return value; })) {
+    size_t unpublishedCount = 0;
+    std::string firstUnpublishedKey;
+    if (!existStatus.IsError() && exists.size() == missingKeys.size()) {
+        for (size_t i = 0; i < exists.size(); ++i) {
+            if (exists[i]) { continue; }
+            if (unpublishedCount == 0) { firstUnpublishedKey = missingKeys[i]; }
+            ++unpublishedCount;
+        }
+    }
+    if (existStatus.IsError() || exists.size() != missingKeys.size() || unpublishedCount != 0) {
+        if (existStatus.IsError() || exists.size() != missingKeys.size()) {
+            unpublishedCount = missingKeys.size();
+            firstUnpublishedKey = "unknown";
+        }
         return Status::Error(
-            fmt::format("YuanRong MSetD2H did not publish all keys: {}", existStatus.ToString()));
+            fmt::format("YuanRong MSetD2H did not publish all keys, unpublished({}/{}), "
+                        "first unpublished key({}): {}",
+                        unpublishedCount, missingKeys.size(), firstUnpublishedKey,
+                        existStatus.ToString()));
     }
 
     std::vector<datasystem::MetaInfo> metaInfos;
     std::vector<std::string> metaFailedKeys;
     auto metaStart = NowTime::Now();
-    auto metaStatus = heteroClient_->GetMetaInfo(keys, false, metaInfos, metaFailedKeys);
+    auto metaStatus = heteroClient_->GetMetaInfo(missingKeys, false, metaInfos, metaFailedKeys);
     auto metaEnd = NowTime::Now();
-    if (metaStatus.IsError() || metaInfos.size() != keys.size() || !metaFailedKeys.empty()) {
+    if (metaStatus.IsError() || metaInfos.size() != missingKeys.size() ||
+        !metaFailedKeys.empty()) {
         return Status::Error(fmt::format("YuanRong GetMetaInfo after D2H failed: {}, "
                                          "failed keys({}), meta count({}), key count({})",
                                          metaStatus.ToString(), metaFailedKeys.size(),
-                                         metaInfos.size(), keys.size()));
+                                         metaInfos.size(), missingKeys.size()));
     }
-    for (size_t i = 0; i < keys.size(); ++i) {
-        auto metaCheck = ValidateYuanRongBlobSizes(keys[i], metaInfos[i], config_.tensorSizes);
+    for (size_t i = 0; i < missingKeys.size(); ++i) {
+        auto metaCheck =
+            ValidateYuanRongBlobSizes(missingKeys[i], metaInfos[i], config_.tensorSizes);
         if (metaCheck.Failure()) { return metaCheck; }
     }
 
     std::vector<datasystem::Optional<datasystem::ReadOnlyBuffer>> buffers;
     auto kvGetStart = NowTime::Now();
-    auto getStatus = kvClient_->Get(keys, buffers, static_cast<int32_t>(config_.timeoutMs));
+    auto getStatus =
+        kvClient_->Get(missingKeys, buffers, static_cast<int32_t>(config_.timeoutMs));
     auto kvGetEnd = NowTime::Now();
-    if (getStatus.IsError() || buffers.size() != keys.size()) {
+    if (getStatus.IsError() || buffers.size() != missingKeys.size()) {
         return Status::Error(
             fmt::format("YuanRong Get after D2H failed: {}", getStatus.ToString()));
     }
@@ -266,13 +287,13 @@ Status DumpQueue::DumpOne(TaskPtr task, const std::shared_ptr<Trans::Stream>& pr
     size_t locked = 0;
     Detail::TaskDesc backendTask;
     backendTask.brief = "YuanRong2Posix";
-    backendTask.reserve(task->desc.size());
+    backendTask.reserve(missingDesc.size());
     for (size_t i = 0; i < buffers.size(); ++i) {
         auto& buffer = buffers[i];
         if (!buffer) {
             for (size_t j = 0; j < locked; ++j) { (void)buffers[j]->UnRLatch(); }
             return Status::Error(
-                fmt::format("YuanRong Get returned no buffer for key({})", keys[i]));
+                fmt::format("YuanRong Get returned no buffer for key({})", missingKeys[i]));
         }
         auto latchStatus = buffer->RLatch();
         if (latchStatus.IsError()) {
@@ -284,13 +305,13 @@ Status DumpQueue::DumpOne(TaskPtr task, const std::shared_ptr<Trans::Stream>& pr
         const auto* bufferAddress = buffer->ImmutableData();
         const void* payloadAddress = nullptr;
         auto payloadStatus = GetYuanRongPayloadAddress(
-            keys[i], bufferAddress, buffer->GetSize(), metaInfos[i], config_.tensorSizes,
+            missingKeys[i], bufferAddress, buffer->GetSize(), metaInfos[i], config_.tensorSizes,
             payloadAddress);
         if (payloadStatus.Failure()) {
             for (size_t j = 0; j < locked; ++j) { (void)buffers[j]->UnRLatch(); }
             return payloadStatus;
         }
-        const auto& source = task->desc[i];
+        const auto& source = missingDesc[i];
         backendTask.push_back(
             Detail::Shard{source.owner, source.index, {const_cast<void*>(payloadAddress)}});
     }
@@ -305,7 +326,8 @@ Status DumpQueue::DumpOne(TaskPtr task, const std::shared_ptr<Trans::Stream>& pr
     UC_DEBUG(
         "YuanRong dump task({}) backend submit keys={}, post_exist={:.3f}ms, "
         "meta={:.3f}ms, kv_get={:.3f}ms, prepare_backend={:.3f}ms, total={:.3f}ms.",
-        task->id, keys.size(), (postExistEnd - postExistStart) * 1e3, (metaEnd - metaStart) * 1e3,
+        task->id, missingKeys.size(), (postExistEnd - postExistStart) * 1e3,
+        (metaEnd - metaStart) * 1e3,
         (kvGetEnd - kvGetStart) * 1e3, (backendSubmitEnd - kvGetEnd) * 1e3,
         (backendSubmitEnd - taskStart) * 1e3);
     reaping_.Push(DumpContext{task->id, backendResult.Value(), std::move(buffers)});
