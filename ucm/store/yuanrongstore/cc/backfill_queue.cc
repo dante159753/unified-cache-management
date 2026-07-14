@@ -116,7 +116,8 @@ void BackfillQueue::RunOne(BackfillTask& task)
     param.writeMode = datasystem::WriteMode::NONE_L2_CACHE_EVICT;
     param.existence = datasystem::ExistenceOpt::NX;
     param.cacheType = datasystem::CacheType::MEMORY;
-    const auto composedSize = YuanRongComposedObjectSize(config_.tensorSizes);
+    const auto composedSize =
+        YuanRongComposedObjectSize(config_.tensorSizes, config_.memoryAlignment);
     std::vector<uint64_t> objectSizes(task.keys.size(), composedSize);
     std::vector<std::shared_ptr<datasystem::Buffer>> buffers;
     auto createStart = NowTime::Now();
@@ -138,8 +139,9 @@ void BackfillQueue::RunOne(BackfillTask& task)
         }
         if (buffer->GetSize() == 0) { continue; }
         void* payload = nullptr;
-        auto status = InitYuanRongComposedBuffer(task.keys[i], buffer->MutableData(),
-                                                 buffer->GetSize(), config_.tensorSizes, payload);
+        auto status =
+            InitYuanRongComposedBuffer(task.keys[i], buffer->MutableData(), buffer->GetSize(),
+                                       config_.tensorSizes, config_.memoryAlignment, payload);
         if (status.Failure()) {
             UC_ERROR("YuanRong async backfill buffer init failed: {}.", status);
             return;

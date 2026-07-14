@@ -53,8 +53,9 @@ Status LoadQueue::Setup(const Config& config, TaskIdSet* failureSet,
         queue->Setup(config.waitingQueueDepth);
         running_.push_back(std::move(queue));
     }
-    auto status = hostBufferPool_.Setup(
-        config.deviceId, static_cast<uint32_t>(config.hostBufferCount), config.objectSize);
+    auto status =
+        hostBufferPool_.Setup(config.deviceId, static_cast<uint32_t>(config.hostBufferCount),
+                              config.objectSize, config.ioDirect && config.storeBackend != nullptr);
     if (status.Failure()) { return status; }
     status = backfillQueue_.Setup(config, kvClient_);
     if (status.Failure()) { return status; }
@@ -191,10 +192,10 @@ Status LoadQueue::LoadOne(CopyStream& stream, TaskPtr task)
         return Status::OK();
     }
     if (backend_ == nullptr) {
-        return Status::Error(fmt::format("YuanRong MGetH2D miss({}/{}) and no backend is "
-                                         "configured, first miss key({}): {}",
-                                         missIndexes.size(), keys.size(),
-                                         keys[missIndexes.front()], rc.ToString()));
+        return Status::Error(
+            fmt::format("YuanRong MGetH2D miss({}/{}) and no backend is "
+                        "configured, first miss key({}): {}",
+                        missIndexes.size(), keys.size(), keys[missIndexes.front()], rc.ToString()));
     }
     auto recoverStart = NowTime::Now();
     auto recoverStatus = RecoverFromBackend(stream, task, keys, blobLists, missIndexes);

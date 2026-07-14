@@ -677,11 +677,12 @@ ucm_connectors:
       yuanrong_port: 9088
       yuanrong_namespace: "model-a-dp0"
       yuanrong_enable_remote_h2d: true
+      yuanrong_memory_alignment: 4096
       yuanrong_timeout_ms: 60000
       storage_backends:
         - "/mnt/ucm"
       posix_io_engine: "psync"
-      io_direct: false
+      io_direct: true
 
 enable_event_sync: true
 use_layerwise: false
@@ -695,6 +696,7 @@ use_layerwise: false
 | `yuanrong_port` | 是 | - | YuanRong worker 端口 |
 | `yuanrong_namespace` | 是 | - | key 隔离命名空间 |
 | `yuanrong_enable_remote_h2d` | 否 | `true` | YuanRong Remote H2D |
+| `yuanrong_memory_alignment` | 否 | `64` | UCM解析和构造composed object使用；Direct IO必须为`4096` |
 | `yuanrong_timeout_ms` | 否 | `60000` | SDK 调用超时 |
 | `tensor_size_list` | worker 必选 | 自动生成 | 每个 device blob 的字节数 |
 | `device_id` | worker 必选 | - | NPU device id |
@@ -703,11 +705,19 @@ use_layerwise: false
 
 `enable_event_sync` 必须开启，以确保 Dump 的 `prerequisiteHandle` 有效。
 
-首期明确只支持 `posix_io_engine: "psync"` 和 `io_direct: false`。若用户配置
-`io_direct: true`，Pipeline builder 和 `YuanRongStore::Setup` 均应直接拒绝启动，
-而不是在运行期间尝试降级。后续若要支持 Direct IO，需要先由 YuanRong 保证
-`MutableData/ImmutableData` 地址对齐，并同时保证 `host_object_size` 和文件
-offset 满足文件系统的 Direct IO 对齐要求。
+`YuanRong|Posix`仅支持`posix_io_engine: "psync"`。启用`io_direct: true`时必须满足：
+
+- YuanRong Worker配置`memory_alignment=4096`，并保留默认的
+  `oc_metadata_header=true`。metadata header会按4096对齐，且read latch可保护后台
+  Posix读取期间的共享内存。
+- Worker在client注册响应中返回`memory_alignment`，SDK client自动使用该值组装
+  composed header，不修改进程级flag，也不对外暴露alignment查询接口。
+- UCM独立配置`yuanrong_memory_alignment: 4096`，仅用于Posix dump解析、异步回填
+  构造composed object和Direct IO校验，不传入YuanRong `ConnectOptions`。
+- `host_object_size`是4096的整数倍；UCM在提交Posix任务前再次校验实际payload
+  地址和长度。
+- Posix miss恢复使用Direct IO对齐的HostBuffer。UCM持有read latch和
+  `ReadOnlyBuffer`直到后台Posix Dump完成。
 
 ### 5.2 Pipeline 注册
 
@@ -951,8 +961,9 @@ ucm/store/test/e2e/yuanrong_on_posix_test.py
 | 后台回填失败 | 当前Load成功，后续请求再次从Posix回源 |
 | Posix Dump 后台失败 | 前台 Dump 已成功，指标记录失败 |
 | 多 blob shard | Host Object 拼接和拆分顺序正确 |
-| `io_direct=false` | 基础链路通过 |
-| `io_direct=true` | 首期初始化直接拒绝 |
+| `io_direct=false` | 64字节默认对齐链路通过 |
+| `io_direct=true`且配置匹配 | 4096对齐Dump和Load链路通过 |
+| `io_direct=true`且alignment/header/object size不匹配 | 初始化直接拒绝 |
 
 ### 8.3 数据一致性校验
 

@@ -105,7 +105,39 @@ class YuanRongPipelineBuilderTest(unittest.TestCase):
         self.assertNotIn("tensor_size", pipeline.stacks[0][2])
         self.assertEqual(pipeline.stacks[0][2]["block_size"], 768)
 
-    def test_direct_io_is_rejected(self):
+    def test_direct_io_accepts_explicit_4096_alignment(self):
+        pipeline = FakeNativePipeline()
+        config = {
+            "device_id": 0,
+            "tensor_size_list": [4096],
+            "shard_size": 4096,
+            "block_size": 4096,
+            "yuanrong_memory_alignment": 4096,
+            "io_direct": True,
+        }
+
+        self.connector._yuanrong_posix_pipeline_builder(config, pipeline)
+
+        self.assertEqual(
+            [entry[0] for entry in pipeline.stacks], ["Posix", "YuanRong"]
+        )
+        self.assertEqual(pipeline.stacks[1][2]["yuanrong_memory_alignment"], 4096)
+
+    def test_direct_io_requires_aligned_payload_size(self):
+        pipeline = FakeNativePipeline()
+        config = {
+            "device_id": 0,
+            "tensor_size_list": [4097],
+            "shard_size": 4097,
+            "block_size": 4097,
+            "yuanrong_memory_alignment": 4096,
+            "io_direct": True,
+        }
+
+        with self.assertRaisesRegex(ValueError, "aligned to 4096"):
+            self.connector._yuanrong_posix_pipeline_builder(config, pipeline)
+
+    def test_direct_io_requires_explicit_4096_alignment(self):
         pipeline = FakeNativePipeline()
         config = {
             "device_id": 0,
@@ -115,7 +147,7 @@ class YuanRongPipelineBuilderTest(unittest.TestCase):
             "io_direct": True,
         }
 
-        with self.assertRaisesRegex(ValueError, "io_direct=true"):
+        with self.assertRaisesRegex(ValueError, "yuanrong_memory_alignment=4096"):
             self.connector._yuanrong_posix_pipeline_builder(config, pipeline)
 
     def test_aio_is_rejected(self):

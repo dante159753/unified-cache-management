@@ -203,15 +203,17 @@ TEST(YuanRongHelperTest, ComposedBufferHeaderMapsPayloadAfterYuanRongHeader)
 {
     using namespace UC::YuanRongStore;
 
+    constexpr size_t memoryAlignment = 4096;
     std::vector<size_t> tensorSizes{64, 96, 128};
-    std::vector<uint8_t> buffer(YuanRongComposedObjectSize(tensorSizes));
+    std::vector<uint8_t> buffer(YuanRongComposedObjectSize(tensorSizes, memoryAlignment));
 
     void* payloadAddress = nullptr;
     auto initStatus = InitYuanRongComposedBuffer("key-a", buffer.data(), buffer.size(), tensorSizes,
-                                                 payloadAddress);
+                                                 memoryAlignment, payloadAddress);
     ASSERT_TRUE(initStatus.Success()) << initStatus.ToString();
 
-    const auto headerSize = YuanRongHeaderSize(tensorSizes.size());
+    const auto headerSize = YuanRongHeaderSize(tensorSizes.size(), memoryAlignment);
+    EXPECT_EQ(headerSize, memoryAlignment);
     EXPECT_EQ(payloadAddress, buffer.data() + headerSize);
 
     auto* offsets = reinterpret_cast<uint64_t*>(buffer.data());
@@ -225,7 +227,7 @@ TEST(YuanRongHelperTest, ComposedBufferHeaderMapsPayloadAfterYuanRongHeader)
     metaInfo.blobSizeList = {64, 96, 128};
     const void* readPayloadAddress = nullptr;
     auto getStatus = GetYuanRongPayloadAddress("key-a", buffer.data(), buffer.size(), metaInfo,
-                                               tensorSizes, readPayloadAddress);
+                                               tensorSizes, memoryAlignment, readPayloadAddress);
     ASSERT_TRUE(getStatus.Success()) << getStatus.ToString();
     EXPECT_EQ(readPayloadAddress, payloadAddress);
 }
@@ -234,11 +236,12 @@ TEST(YuanRongHelperTest, PayloadAddressRejectsInvalidComposedHeader)
 {
     using namespace UC::YuanRongStore;
 
+    constexpr size_t memoryAlignment = 64;
     std::vector<size_t> tensorSizes{64, 96};
-    std::vector<uint8_t> buffer(YuanRongComposedObjectSize(tensorSizes));
+    std::vector<uint8_t> buffer(YuanRongComposedObjectSize(tensorSizes, memoryAlignment));
     void* payloadAddress = nullptr;
     ASSERT_TRUE(InitYuanRongComposedBuffer("key-a", buffer.data(), buffer.size(), tensorSizes,
-                                           payloadAddress)
+                                           memoryAlignment, payloadAddress)
                     .Success());
 
     auto* offsets = reinterpret_cast<uint64_t*>(buffer.data());
@@ -248,7 +251,23 @@ TEST(YuanRongHelperTest, PayloadAddressRejectsInvalidComposedHeader)
     metaInfo.blobSizeList = {64, 96};
     const void* readPayloadAddress = nullptr;
     auto status = GetYuanRongPayloadAddress("key-a", buffer.data(), buffer.size(), metaInfo,
-                                            tensorSizes, readPayloadAddress);
+                                            tensorSizes, memoryAlignment, readPayloadAddress);
     EXPECT_TRUE(status.Failure());
     EXPECT_EQ(readPayloadAddress, nullptr);
+}
+
+TEST(YuanRongHelperTest, DirectIoPayloadRequiresAlignedAddressAndSize)
+{
+    using namespace UC::YuanRongStore;
+
+    constexpr size_t alignment = 4096;
+    alignas(alignment) std::array<uint8_t, alignment * 2> buffer{};
+
+    EXPECT_TRUE(
+        ValidateYuanRongDirectIoPayload("key-a", buffer.data(), alignment, alignment).Success());
+    EXPECT_TRUE(ValidateYuanRongDirectIoPayload("key-a", buffer.data() + 1, alignment, alignment)
+                    .Failure());
+    EXPECT_TRUE(ValidateYuanRongDirectIoPayload("key-a", buffer.data(), alignment - 1, alignment)
+                    .Failure());
+    EXPECT_TRUE(ValidateYuanRongDirectIoPayload("key-a", buffer.data(), alignment, 0).Failure());
 }

@@ -179,6 +179,7 @@ private:
         input.GetNumbers("tensor_size_list", config.tensorSizes);
         input.GetNumber("shard_size", config.shardSize);
         input.GetNumber("block_size", config.blockSize);
+        input.GetNumber("yuanrong_memory_alignment", config.memoryAlignment);
         input.GetNumber("yuanrong_timeout_ms", config.timeoutMs);
         input.GetNumber("yuanrong_waiting_queue_depth", config.waitingQueueDepth);
         input.GetNumber("yuanrong_load_worker_count", config.loadWorkerCount);
@@ -215,6 +216,11 @@ private:
         if (config.timeoutMs > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
             return Status::InvalidParam("yuanrong_timeout_ms is too large");
         }
+        if (config.memoryAlignment == 0 || config.memoryAlignment > 4096 ||
+            (config.memoryAlignment & (config.memoryAlignment - 1)) != 0) {
+            return Status::InvalidParam(
+                "yuanrong_memory_alignment must be a power of two in (0, 4096]");
+        }
         if (config.waitingQueueDepth <= 1 || config.loadWorkerCount == 0 ||
             config.recoveryBatchSize == 0 || config.hostBufferCount < config.recoveryBatchSize ||
             config.hostBufferCount >= std::numeric_limits<uint32_t>::max() ||
@@ -222,7 +228,6 @@ private:
             config.backfillQueueDepth == 0 || config.reaperQueueDepth <= 1) {
             return Status::InvalidParam("invalid YuanRong queue depth");
         }
-        if (config.ioDirect && config.storeBackend != nullptr) { return Status::Unsupported(); }
         if (config.storeBackend != nullptr && config.posixIoEngine != "psync") {
             return Status::Unsupported();
         }
@@ -233,6 +238,17 @@ private:
         if (config.shardSize == 0 || config.blockSize == 0 ||
             config.blockSize % config.shardSize != 0) {
             return Status::InvalidParam("invalid shard/block size");
+        }
+        if (config.ioDirect && config.storeBackend != nullptr) {
+            constexpr size_t directIoAlignment = 4096;
+            if (config.memoryAlignment != directIoAlignment) {
+                return Status::InvalidParam(
+                    "YuanRong|Posix io_direct requires yuanrong_memory_alignment=4096");
+            }
+            if (config.objectSize % directIoAlignment != 0) {
+                return Status::InvalidParam(
+                    "YuanRong object size must be aligned to 4096 bytes for io_direct");
+            }
         }
         return Status::OK();
     }
@@ -246,6 +262,8 @@ private:
         UC_INFO("{}::EnableRemoteH2D = {}", name, config.enableRemoteH2D);
         UC_INFO("{}::DeviceId = {}", name, config.deviceId);
         UC_INFO("{}::ObjectSize = {}", name, config.objectSize);
+        UC_INFO("{}::MemoryAlignment = {}", name, config.memoryAlignment);
+        UC_INFO("{}::IoDirect = {}", name, config.ioDirect);
         UC_INFO("{}::TimeoutMs = {}", name, config.timeoutMs);
         UC_INFO("{}::LoadWorkerCount = {}", name, config.loadWorkerCount);
         UC_INFO("{}::RecoveryBatchSize = {}", name, config.recoveryBatchSize);

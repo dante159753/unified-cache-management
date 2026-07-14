@@ -318,12 +318,6 @@ def _yuanrong_posix_pipeline_builder(
         raise ValueError(
             "YuanRong|Posix currently supports only posix_io_engine=psync"
         )
-    if config.get("io_direct", False):
-        raise ValueError(
-            "YuanRong|Posix does not support io_direct=true because YuanRong "
-            "payload addresses are not guaranteed to satisfy O_DIRECT alignment"
-        )
-
     store_dir = Path(__file__).resolve().parent.parent
     posix_config = copy.deepcopy(config)
     tensor_sizes = config.get("tensor_size_list")
@@ -335,6 +329,26 @@ def _yuanrong_posix_pipeline_builder(
         if shard_size <= 0 or block_size % shard_size != 0:
             raise ValueError("invalid shard_size/block_size for YuanRong|Posix")
         object_size = sum(int(size) for size in tensor_sizes)
+        memory_alignment = int(config.get("yuanrong_memory_alignment", 64))
+        if (
+            memory_alignment <= 0
+            or memory_alignment > 4096
+            or memory_alignment & (memory_alignment - 1)
+        ):
+            raise ValueError(
+                "yuanrong_memory_alignment must be a power of two in (0, 4096]"
+            )
+        if config.get("io_direct", False):
+            if memory_alignment != 4096:
+                raise ValueError(
+                    "YuanRong|Posix io_direct requires "
+                    "yuanrong_memory_alignment=4096"
+                )
+            if object_size % 4096:
+                raise ValueError(
+                    "YuanRong object size must be aligned to 4096 bytes for "
+                    "io_direct"
+                )
         shards_per_block = block_size // shard_size
         posix_config["tensor_size"] = object_size
         posix_config["shard_size"] = object_size

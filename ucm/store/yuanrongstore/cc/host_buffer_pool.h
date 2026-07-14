@@ -39,7 +39,7 @@ class HostBufferPool {
 public:
     using Handle = std::shared_ptr<void>;
 
-    Status Setup(int32_t deviceId, uint32_t count, size_t unitSize)
+    Status Setup(int32_t deviceId, uint32_t count, size_t unitSize, bool ioDirect)
     {
         if (count == 0 || unitSize == 0) {
             return Status::InvalidParam("invalid YuanRong host buffer pool size");
@@ -52,7 +52,8 @@ public:
         if (status.Failure()) { return status; }
         auto buffer = device.MakeBuffer();
         if (!buffer) { return Status::Error("failed to create YuanRong host buffer factory"); }
-        pool_ = buffer->MakeHostBuffer(totalSize);
+        pool_ = ioDirect ? buffer->MakeHostBuffer4DirectIo(totalSize)
+                         : buffer->MakeHostBuffer(totalSize);
         if (!pool_) { return Status::OutOfMemory(); }
 
         unitSize_ = unitSize;

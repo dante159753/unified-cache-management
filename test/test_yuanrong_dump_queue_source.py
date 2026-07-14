@@ -69,19 +69,22 @@ class YuanRongDumpQueueSourceTest(unittest.TestCase):
     def test_posix_dump_validates_yuanrong_payload_layout_before_using_buffer(self):
         dump_one_body = self._function_body("DumpQueue::DumpOne")
 
-        self.assertIn("GetMetaInfo(keys, false", dump_one_body)
+        self.assertIn("GetMetaInfo(missingKeys, false", dump_one_body)
         self.assertIn("ValidateYuanRongBlobSizes", dump_one_body)
         self.assertLess(
             dump_one_body.index("ValidateYuanRongBlobSizes"),
             dump_one_body.index("kvClient_->Get"),
         )
 
-    def test_yuanrong_posix_load_probes_yuanrong_miss_without_full_timeout(self):
+    def test_yuanrong_load_probes_miss_with_zero_timeout(self):
         load_one_body = self._function_body("LoadQueue::LoadOne", self.load_source)
 
-        self.assertIn("firstGetTimeoutMs", load_one_body)
-        self.assertIn("backend_ == nullptr ? config_.timeoutMs : config_.missTimeoutMs", load_one_body)
-        self.assertIn("static_cast<int32_t>(firstGetTimeoutMs)", load_one_body)
+        self.assertIn("constexpr int32_t mgetTimeoutMs = 0", load_one_body)
+        self.assertIn(
+            "MGetH2D(keys, blobLists, failedKeys, mgetTimeoutMs)", load_one_body
+        )
+        self.assertNotIn("firstGetTimeoutMs", load_one_body)
+        self.assertNotIn("missTimeoutMs", load_one_body)
 
     def test_yuanrong_posix_miss_h2d_precedes_async_backfill(self):
         recover_body = self._function_body(

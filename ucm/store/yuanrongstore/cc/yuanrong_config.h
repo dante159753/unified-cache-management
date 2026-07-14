@@ -42,6 +42,7 @@ struct Config {
     size_t shardSize{0};
     size_t blockSize{0};
     size_t objectSize{0};
+    size_t memoryAlignment{64};
 
     size_t timeoutMs{60000};
     size_t waitingQueueDepth{8192};

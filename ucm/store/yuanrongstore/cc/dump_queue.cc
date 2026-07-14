@@ -43,8 +43,8 @@ bool IsKeyDuplicatedStatus(const datasystem::Status& status)
 }
 
 Status FilterMissingKeys(datasystem::HeteroClient& client, const std::vector<std::string>& keys,
-                         std::vector<datasystem::DeviceBlobList>& blobLists,
-                         Detail::TaskDesc& desc, std::vector<std::string>& missingKeys,
+                         std::vector<datasystem::DeviceBlobList>& blobLists, Detail::TaskDesc& desc,
+                         std::vector<std::string>& missingKeys,
                          std::vector<datasystem::DeviceBlobList>& missingBlobLists,
                          Detail::TaskDesc& missingDesc, double& existCostMs)
 {
@@ -204,9 +204,10 @@ Status DumpQueue::DumpOne(TaskPtr task, const std::shared_ptr<Trans::Stream>& pr
         d2hMs = (NowTime::Now() - d2hStart) * 1e3;
         if (dumpStatus.IsError()) {
             if (IsKeyDuplicatedStatus(dumpStatus)) {
-                UC_WARN("YuanRong MSetD2H hit duplicated keys; skip Posix dump for this batch "
-                        "because local publish ownership is unknown: {}",
-                        dumpStatus.ToString());
+                UC_WARN(
+                    "YuanRong MSetD2H hit duplicated keys; skip Posix dump for this batch "
+                    "because local publish ownership is unknown: {}",
+                    dumpStatus.ToString());
                 return Status::OK();
             } else {
                 return Status::Error(
@@ -249,11 +250,10 @@ Status DumpQueue::DumpOne(TaskPtr task, const std::shared_ptr<Trans::Stream>& pr
             unpublishedCount = missingKeys.size();
             firstUnpublishedKey = "unknown";
         }
-        return Status::Error(
-            fmt::format("YuanRong MSetD2H did not publish all keys, unpublished({}/{}), "
-                        "first unpublished key({}): {}",
-                        unpublishedCount, missingKeys.size(), firstUnpublishedKey,
-                        existStatus.ToString()));
+        return Status::Error(fmt::format(
+            "YuanRong MSetD2H did not publish all keys, unpublished({}/{}), "
+            "first unpublished key({}): {}",
+            unpublishedCount, missingKeys.size(), firstUnpublishedKey, existStatus.ToString()));
     }
 
     std::vector<datasystem::MetaInfo> metaInfos;
@@ -261,12 +261,11 @@ Status DumpQueue::DumpOne(TaskPtr task, const std::shared_ptr<Trans::Stream>& pr
     auto metaStart = NowTime::Now();
     auto metaStatus = heteroClient_->GetMetaInfo(missingKeys, false, metaInfos, metaFailedKeys);
     auto metaEnd = NowTime::Now();
-    if (metaStatus.IsError() || metaInfos.size() != missingKeys.size() ||
-        !metaFailedKeys.empty()) {
-        return Status::Error(fmt::format("YuanRong GetMetaInfo after D2H failed: {}, "
-                                         "failed keys({}), meta count({}), key count({})",
-                                         metaStatus.ToString(), metaFailedKeys.size(),
-                                         metaInfos.size(), missingKeys.size()));
+    if (metaStatus.IsError() || metaInfos.size() != missingKeys.size() || !metaFailedKeys.empty()) {
+        return Status::Error(fmt::format(
+            "YuanRong GetMetaInfo after D2H failed: {}, "
+            "failed keys({}), meta count({}), key count({})",
+            metaStatus.ToString(), metaFailedKeys.size(), metaInfos.size(), missingKeys.size()));
     }
     for (size_t i = 0; i < missingKeys.size(); ++i) {
         auto metaCheck =
@@ -276,8 +275,7 @@ Status DumpQueue::DumpOne(TaskPtr task, const std::shared_ptr<Trans::Stream>& pr
 
     std::vector<datasystem::Optional<datasystem::ReadOnlyBuffer>> buffers;
     auto kvGetStart = NowTime::Now();
-    auto getStatus =
-        kvClient_->Get(missingKeys, buffers, static_cast<int32_t>(config_.timeoutMs));
+    auto getStatus = kvClient_->Get(missingKeys, buffers, static_cast<int32_t>(config_.timeoutMs));
     auto kvGetEnd = NowTime::Now();
     if (getStatus.IsError() || buffers.size() != missingKeys.size()) {
         return Status::Error(
@@ -306,10 +304,18 @@ Status DumpQueue::DumpOne(TaskPtr task, const std::shared_ptr<Trans::Stream>& pr
         const void* payloadAddress = nullptr;
         auto payloadStatus = GetYuanRongPayloadAddress(
             missingKeys[i], bufferAddress, buffer->GetSize(), metaInfos[i], config_.tensorSizes,
-            payloadAddress);
+            config_.memoryAlignment, payloadAddress);
         if (payloadStatus.Failure()) {
             for (size_t j = 0; j < locked; ++j) { (void)buffers[j]->UnRLatch(); }
             return payloadStatus;
+        }
+        if (config_.ioDirect) {
+            auto directStatus = ValidateYuanRongDirectIoPayload(
+                missingKeys[i], payloadAddress, config_.objectSize, config_.memoryAlignment);
+            if (directStatus.Failure()) {
+                for (size_t j = 0; j < locked; ++j) { (void)buffers[j]->UnRLatch(); }
+                return directStatus;
+            }
         }
         const auto& source = missingDesc[i];
         backendTask.push_back(
@@ -327,9 +333,8 @@ Status DumpQueue::DumpOne(TaskPtr task, const std::shared_ptr<Trans::Stream>& pr
         "YuanRong dump task({}) backend submit keys={}, post_exist={:.3f}ms, "
         "meta={:.3f}ms, kv_get={:.3f}ms, prepare_backend={:.3f}ms, total={:.3f}ms.",
         task->id, missingKeys.size(), (postExistEnd - postExistStart) * 1e3,
-        (metaEnd - metaStart) * 1e3,
-        (kvGetEnd - kvGetStart) * 1e3, (backendSubmitEnd - kvGetEnd) * 1e3,
-        (backendSubmitEnd - taskStart) * 1e3);
+        (metaEnd - metaStart) * 1e3, (kvGetEnd - kvGetStart) * 1e3,
+        (backendSubmitEnd - kvGetEnd) * 1e3, (backendSubmitEnd - taskStart) * 1e3);
     reaping_.Push(DumpContext{task->id, backendResult.Value(), std::move(buffers)});
     return Status::OK();
 }

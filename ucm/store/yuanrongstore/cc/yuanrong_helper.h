@@ -125,9 +125,10 @@ inline size_t TotalBlobBytes(const std::vector<datasystem::DeviceBlobList>& blob
     return total;
 }
 
-inline Status SelectMissingYuanRongObjects(
-    const std::vector<bool>& exists, std::vector<std::string>& keys,
-    std::vector<datasystem::DeviceBlobList>& blobLists, Detail::TaskDesc& desc)
+inline Status SelectMissingYuanRongObjects(const std::vector<bool>& exists,
+                                           std::vector<std::string>& keys,
+                                           std::vector<datasystem::DeviceBlobList>& blobLists,
+                                           Detail::TaskDesc& desc)
 {
     if (exists.size() != keys.size() || blobLists.size() != keys.size() ||
         desc.size() != keys.size()) {
@@ -194,16 +195,16 @@ inline bool YuanRongBufferHasEnoughPayload(int64_t bufferSize, size_t objectSize
     return bufferSize >= 0 && static_cast<size_t>(bufferSize) >= objectSize;
 }
 
-inline size_t YuanRongHeaderSize(size_t blobCount)
+inline size_t YuanRongHeaderSize(size_t blobCount, size_t memoryAlignment)
 {
-    constexpr size_t alignSize = 64;
     auto size = sizeof(uint64_t) * (blobCount + 2);
-    return (size + alignSize - 1) / alignSize * alignSize;
+    return (size + memoryAlignment - 1) / memoryAlignment * memoryAlignment;
 }
 
-inline size_t YuanRongComposedObjectSize(const std::vector<size_t>& tensorSizes)
+inline size_t YuanRongComposedObjectSize(const std::vector<size_t>& tensorSizes,
+                                         size_t memoryAlignment)
 {
-    size_t size = YuanRongHeaderSize(tensorSizes.size());
+    size_t size = YuanRongHeaderSize(tensorSizes.size(), memoryAlignment);
     for (auto tensorSize : tensorSizes) { size += tensorSize; }
     return size;
 }
@@ -213,25 +214,26 @@ inline Status ValidateYuanRongBlobSizes(const std::string& key,
                                         const std::vector<size_t>& tensorSizes)
 {
     if (metaInfo.blobSizeList.size() != tensorSizes.size()) {
-        return Status::Error(fmt::format("YuanRong blob count({}) does not match tensor count({}) "
-                                         "for key({})",
-                                         metaInfo.blobSizeList.size(), tensorSizes.size(), key));
+        return Status::Error(
+            fmt::format("YuanRong blob count({}) does not match tensor count({}) "
+                        "for key({})",
+                        metaInfo.blobSizeList.size(), tensorSizes.size(), key));
     }
     for (size_t i = 0; i < tensorSizes.size(); ++i) {
         if (metaInfo.blobSizeList[i] != tensorSizes[i]) {
-            return Status::Error(fmt::format("YuanRong blob size({}) does not match tensor "
-                                             "size({}) for key({}) at blob({})",
-                                             metaInfo.blobSizeList[i], tensorSizes[i], key, i));
+            return Status::Error(
+                fmt::format("YuanRong blob size({}) does not match tensor "
+                            "size({}) for key({}) at blob({})",
+                            metaInfo.blobSizeList[i], tensorSizes[i], key, i));
         }
     }
     return Status::OK();
 }
 
 inline Status GetYuanRongPayloadAddress(const std::string& key, const void* address,
-                                        int64_t bufferSize,
-                                        const datasystem::MetaInfo& metaInfo,
+                                        int64_t bufferSize, const datasystem::MetaInfo& metaInfo,
                                         const std::vector<size_t>& tensorSizes,
-                                        const void*& payloadAddress)
+                                        size_t memoryAlignment, const void*& payloadAddress)
 {
     payloadAddress = nullptr;
     auto metaCheck = ValidateYuanRongBlobSizes(key, metaInfo, tensorSizes);
@@ -245,50 +247,55 @@ inline Status GetYuanRongPayloadAddress(const std::string& key, const void* addr
     }
     const auto size = static_cast<size_t>(bufferSize);
     const auto count = tensorSizes.size();
-    const auto headerSize = YuanRongHeaderSize(count);
-    const auto composedSize = YuanRongComposedObjectSize(tensorSizes);
+    const auto headerSize = YuanRongHeaderSize(count, memoryAlignment);
+    const auto composedSize = YuanRongComposedObjectSize(tensorSizes, memoryAlignment);
     if (size < composedSize) {
-        return Status::Error(fmt::format("YuanRong buffer size({}) is smaller than composed "
-                                         "object size({}) for key({})",
-                                         size, composedSize, key));
+        return Status::Error(
+            fmt::format("YuanRong buffer size({}) is smaller than composed "
+                        "object size({}) for key({})",
+                        size, composedSize, key));
     }
 
     const auto* offsets = reinterpret_cast<const uint64_t*>(address);
     if (offsets[0] != count) {
-        return Status::Error(fmt::format("YuanRong blob count({}) does not match tensor count({}) "
-                                         "in buffer for key({})",
-                                         offsets[0], count, key));
+        return Status::Error(
+            fmt::format("YuanRong blob count({}) does not match tensor count({}) "
+                        "in buffer for key({})",
+                        offsets[0], count, key));
     }
     if (offsets[1] != headerSize) {
-        return Status::Error(fmt::format("YuanRong payload offset({}) does not match expected "
-                                         "offset({}) for key({})",
-                                         offsets[1], headerSize, key));
+        return Status::Error(
+            fmt::format("YuanRong payload offset({}) does not match expected "
+                        "offset({}) for key({})",
+                        offsets[1], headerSize, key));
     }
     for (size_t i = 0; i < count; ++i) {
         const auto expected = offsets[i + 1] + tensorSizes[i];
         if (offsets[i + 2] != expected) {
-            return Status::Error(fmt::format("YuanRong payload offset({}) does not match "
-                                             "expected offset({}) for key({}) at blob({})",
-                                             offsets[i + 2], expected, key, i));
+            return Status::Error(
+                fmt::format("YuanRong payload offset({}) does not match "
+                            "expected offset({}) for key({}) at blob({})",
+                            offsets[i + 2], expected, key, i));
         }
     }
     if (offsets[count + 1] != composedSize) {
-        return Status::Error(fmt::format("YuanRong composed size({}) does not match expected "
-                                         "size({}) for key({})",
-                                         offsets[count + 1], composedSize, key));
+        return Status::Error(
+            fmt::format("YuanRong composed size({}) does not match expected "
+                        "size({}) for key({})",
+                        offsets[count + 1], composedSize, key));
     }
     payloadAddress = static_cast<const uint8_t*>(address) + offsets[1];
     return Status::OK();
 }
 
-inline Status InitYuanRongComposedBuffer(const std::string& key, void* address,
-                                         int64_t bufferSize,
+inline Status InitYuanRongComposedBuffer(const std::string& key, void* address, int64_t bufferSize,
                                          const std::vector<size_t>& tensorSizes,
-                                         void*& payloadAddress)
+                                         size_t memoryAlignment, void*& payloadAddress)
 {
     payloadAddress = nullptr;
     if (address == nullptr) {
-        return Status::Error(fmt::format("YuanRong buffer has no mutable address for key({})", key));
+        return Status::Error(
+            fmt::format("YuanRong buffer has no mutable address for key({})", key));
     }
     if (bufferSize < 0) {
         return Status::Error(
@@ -296,12 +303,13 @@ inline Status InitYuanRongComposedBuffer(const std::string& key, void* address,
     }
     const auto size = static_cast<size_t>(bufferSize);
     const auto count = tensorSizes.size();
-    const auto headerSize = YuanRongHeaderSize(count);
-    const auto composedSize = YuanRongComposedObjectSize(tensorSizes);
+    const auto headerSize = YuanRongHeaderSize(count, memoryAlignment);
+    const auto composedSize = YuanRongComposedObjectSize(tensorSizes, memoryAlignment);
     if (size < composedSize) {
-        return Status::Error(fmt::format("YuanRong buffer size({}) is smaller than composed "
-                                         "object size({}) for key({})",
-                                         size, composedSize, key));
+        return Status::Error(
+            fmt::format("YuanRong buffer size({}) is smaller than composed "
+                        "object size({}) for key({})",
+                        size, composedSize, key));
     }
 
     auto* offsets = reinterpret_cast<uint64_t*>(address);
@@ -309,6 +317,26 @@ inline Status InitYuanRongComposedBuffer(const std::string& key, void* address,
     offsets[1] = headerSize;
     for (size_t i = 0; i < count; ++i) { offsets[i + 2] = offsets[i + 1] + tensorSizes[i]; }
     payloadAddress = static_cast<uint8_t*>(address) + headerSize;
+    return Status::OK();
+}
+
+inline Status ValidateYuanRongDirectIoPayload(const std::string& key, const void* payloadAddress,
+                                              size_t payloadSize, size_t memoryAlignment)
+{
+    if (memoryAlignment == 0) {
+        return Status::InvalidParam("invalid YuanRong memory alignment");
+    }
+    if (payloadAddress == nullptr ||
+        reinterpret_cast<uintptr_t>(payloadAddress) % memoryAlignment != 0) {
+        return Status::Error(
+            fmt::format("YuanRong payload address is not aligned to {} bytes for key({})",
+                        memoryAlignment, key));
+    }
+    if (payloadSize % memoryAlignment != 0) {
+        return Status::Error(
+            fmt::format("YuanRong payload size({}) is not aligned to {} bytes for key({})",
+                        payloadSize, memoryAlignment, key));
+    }
     return Status::OK();
 }
 
