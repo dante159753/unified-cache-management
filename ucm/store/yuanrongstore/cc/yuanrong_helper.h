@@ -155,6 +155,29 @@ inline Status SelectMissingYuanRongObjects(const std::vector<bool>& exists,
     return Status::OK();
 }
 
+inline Status SelectPublishedYuanRongObjects(const std::vector<bool>& exists,
+                                             std::vector<std::string>& keys, Detail::TaskDesc& desc)
+{
+    if (exists.size() != keys.size() || desc.size() != keys.size()) {
+        return Status::InvalidParam(
+            "YuanRong published object selection size mismatch: exists({}), keys({}), shards({})",
+            exists.size(), keys.size(), desc.size());
+    }
+
+    std::vector<std::string> publishedKeys;
+    Detail::TaskDesc publishedDesc;
+    publishedKeys.reserve(keys.size());
+    publishedDesc.reserve(desc.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (!exists[i]) { continue; }
+        publishedKeys.push_back(std::move(keys[i]));
+        publishedDesc.push_back(std::move(desc[i]));
+    }
+    keys = std::move(publishedKeys);
+    desc = std::move(publishedDesc);
+    return Status::OK();
+}
+
 inline std::vector<size_t> FailedIndexes(const std::vector<std::string>& keys,
                                          const std::vector<std::string>& failedKeys,
                                          bool requestFailed)
@@ -323,9 +346,7 @@ inline Status InitYuanRongComposedBuffer(const std::string& key, void* address, 
 inline Status ValidateYuanRongDirectIoPayload(const std::string& key, const void* payloadAddress,
                                               size_t payloadSize, size_t memoryAlignment)
 {
-    if (memoryAlignment == 0) {
-        return Status::InvalidParam("invalid YuanRong memory alignment");
-    }
+    if (memoryAlignment == 0) { return Status::InvalidParam("invalid YuanRong memory alignment"); }
     if (payloadAddress == nullptr ||
         reinterpret_cast<uintptr_t>(payloadAddress) % memoryAlignment != 0) {
         return Status::Error(

@@ -78,6 +78,29 @@ class YuanRongDumpQueueSourceTest(unittest.TestCase):
             dump_one_body.index("kvClient_->Get"),
         )
 
+    def test_partial_post_exist_persists_published_keys(self):
+        dump_one_body = self._function_body("DumpQueue::DumpOne")
+
+        self.assertIn("unpublishedCount == missingKeys.size()", dump_one_body)
+        self.assertIn(
+            "SelectPublishedYuanRongObjects(exists, missingKeys, missingDesc)",
+            dump_one_body,
+        )
+        self.assertIn("persisting the published keys only", dump_one_body)
+        self.assertNotIn(
+            "exists.size() != missingKeys.size() || unpublishedCount != 0",
+            dump_one_body,
+        )
+
+    def test_partial_kv_get_persists_only_latched_buffers(self):
+        dump_one_body = self._function_body("DumpQueue::DumpOne")
+
+        self.assertIn("if (!buffer)", dump_one_body)
+        self.assertIn("lockedBuffers.push_back(std::move(buffer))", dump_one_body)
+        self.assertIn("if (backendTask.empty())", dump_one_body)
+        self.assertIn("std::move(lockedBuffers)", dump_one_body)
+        self.assertIn("persisting readable buffers only", dump_one_body)
+
     def test_yuanrong_load_probes_miss_with_zero_timeout(self):
         load_one_body = self._function_body("LoadQueue::LoadOne", self.load_source)
 

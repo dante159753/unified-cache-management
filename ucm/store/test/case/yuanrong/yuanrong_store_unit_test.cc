@@ -184,6 +184,32 @@ TEST(YuanRongHelperTest, SelectMissingYuanRongObjectsKeepsAlignedMissingEntries)
     EXPECT_EQ(desc[0].addrs[0], tensor1.data());
 }
 
+TEST(YuanRongHelperTest, SelectPublishedYuanRongObjectsKeepsAlignedPublishedEntries)
+{
+    using namespace UC::YuanRongStore;
+
+    std::array<char, 1> tensor0{};
+    std::array<char, 1> tensor1{};
+    std::array<char, 1> tensor2{};
+    std::vector<std::string> keys{"key-a", "key-b", "key-c"};
+    UC::Detail::TaskDesc desc;
+    desc.push_back(UC::Detail::Shard{MakeBlock({0x01}), 10, {tensor0.data()}});
+    desc.push_back(UC::Detail::Shard{MakeBlock({0x02}), 20, {tensor1.data()}});
+    desc.push_back(UC::Detail::Shard{MakeBlock({0x03}), 30, {tensor2.data()}});
+
+    auto status = SelectPublishedYuanRongObjects({true, false, true}, keys, desc);
+
+    ASSERT_TRUE(status.Success()) << status.ToString();
+    ASSERT_EQ(keys.size(), 2);
+    EXPECT_EQ(keys[0], "key-a");
+    EXPECT_EQ(keys[1], "key-c");
+    ASSERT_EQ(desc.size(), 2);
+    EXPECT_EQ(desc[0].index, 10);
+    EXPECT_EQ(desc[1].index, 30);
+    EXPECT_EQ(desc[0].addrs[0], tensor0.data());
+    EXPECT_EQ(desc[1].addrs[0], tensor2.data());
+}
+
 TEST(YuanRongHelperTest, RecoveryBatchRangesCoverAllIndexesWithoutOverlap)
 {
     using namespace UC::YuanRongStore;
