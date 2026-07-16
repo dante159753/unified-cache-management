@@ -145,6 +145,10 @@ _COUNTER_METRICS = [
         "Total bytes dumped through the Mooncake stage",
     ),
     (
+        "mooncake_lookup_hit_blocks_total",
+        "Blocks found by Mooncake lookup before descending to the backend",
+    ),
+    (
         "mooncake_load_hit_shards_total",
         "Mooncake load shards served directly from Mooncake",
     ),

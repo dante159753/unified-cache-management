@@ -96,6 +96,8 @@ counter:
     documentation: "Total bytes loaded through the Mooncake stage"
   - name: "mooncake_dump_bytes_total"
     documentation: "Total bytes dumped through the Mooncake stage"
+  - name: "mooncake_lookup_hit_blocks_total"
+    documentation: "Blocks found by Mooncake lookup before descending to the backend"
   - name: "mooncake_load_hit_shards_total"
     documentation: "Mooncake load shards served directly from Mooncake"
   - name: "mooncake_load_miss_shards_total"

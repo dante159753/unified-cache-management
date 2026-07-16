@@ -32,6 +32,7 @@
 #include "client_service.h"
 #include "global_config.h"
 #include "logger/logger.h"
+#include "metrics_api.h"
 #include "trans_manager.h"
 #include "transfer_engine.h"
 #include "ucmstore_v1.h"
@@ -146,6 +147,10 @@ public:
                 break;
             }
         }
+
+        const auto mooncakeHitCount = firstMiss < 0 ? num : static_cast<size_t>(firstMiss);
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("mooncake_lookup_hit_blocks_total"),
+                                 static_cast<double>(mooncakeHitCount));
 
         if (firstMiss == -1) { return static_cast<ssize_t>(num) - 1; }
 
