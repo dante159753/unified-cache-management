@@ -221,12 +221,39 @@ private:
             return Status::InvalidParam(
                 "yuanrong_memory_alignment must be a power of two in (0, 4096]");
         }
-        if (config.waitingQueueDepth <= 1 || config.loadWorkerCount == 0 ||
-            config.recoveryBatchSize == 0 || config.hostBufferCount < config.recoveryBatchSize ||
-            config.hostBufferCount >= std::numeric_limits<uint32_t>::max() ||
-            config.h2dStreamCount == 0 || config.backfillWorkerCount == 0 ||
-            config.backfillQueueDepth == 0 || config.reaperQueueDepth <= 1) {
-            return Status::InvalidParam("invalid YuanRong queue depth");
+        if (config.waitingQueueDepth <= 1) {
+            return Status::InvalidParam("yuanrong_waiting_queue_depth({}) must be greater than 1",
+                                        config.waitingQueueDepth);
+        }
+        if (config.loadWorkerCount == 0) {
+            return Status::InvalidParam("yuanrong_load_worker_count must be greater than 0");
+        }
+        if (config.recoveryBatchSize == 0) {
+            return Status::InvalidParam("yuanrong_recovery_batch_size must be greater than 0");
+        }
+        if (config.hostBufferCount < config.recoveryBatchSize) {
+            return Status::InvalidParam(
+                "yuanrong_host_buffer_count({}) must be greater than or equal to "
+                "yuanrong_recovery_batch_size({})",
+                config.hostBufferCount, config.recoveryBatchSize);
+        }
+        if (config.hostBufferCount >= std::numeric_limits<uint32_t>::max()) {
+            return Status::InvalidParam("yuanrong_host_buffer_count({}) must be less than {}",
+                                        config.hostBufferCount,
+                                        std::numeric_limits<uint32_t>::max());
+        }
+        if (config.h2dStreamCount == 0) {
+            return Status::InvalidParam("yuanrong_h2d_stream_count must be greater than 0");
+        }
+        if (config.backfillWorkerCount == 0) {
+            return Status::InvalidParam("yuanrong_backfill_worker_count must be greater than 0");
+        }
+        if (config.backfillQueueDepth == 0) {
+            return Status::InvalidParam("yuanrong_backfill_queue_depth must be greater than 0");
+        }
+        if (config.reaperQueueDepth <= 1) {
+            return Status::InvalidParam("yuanrong_reaper_queue_depth({}) must be greater than 1",
+                                        config.reaperQueueDepth);
         }
         if (config.storeBackend != nullptr && config.posixIoEngine != "psync") {
             return Status::Unsupported();

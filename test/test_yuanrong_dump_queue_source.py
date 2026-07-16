@@ -17,8 +17,10 @@ class YuanRongDumpQueueSourceTest(unittest.TestCase):
         )
         load_source_path = source_path.with_name("load_queue.cc")
         backfill_source_path = source_path.with_name("backfill_queue.cc")
+        store_source_path = source_path.with_name("yuanrong_store.cc")
         cls.source = source_path.read_text()
         cls.load_source = load_source_path.read_text()
+        cls.store_source = store_source_path.read_text()
         cls.backfill_source = (
             backfill_source_path.read_text() if backfill_source_path.exists() else ""
         )
@@ -113,6 +115,20 @@ class YuanRongDumpQueueSourceTest(unittest.TestCase):
         self.assertIn("kvClient_->MSet", run_body)
         self.assertIn("InitYuanRongComposedBuffer", run_body)
         self.assertNotIn("failureSet_", run_body)
+
+    def test_invalid_queue_config_identifies_the_parameter_and_values(self):
+        check_body = self._function_body("CheckConfig", self.store_source)
+
+        self.assertNotIn("invalid YuanRong queue depth", check_body)
+        self.assertIn("yuanrong_waiting_queue_depth({})", check_body)
+        self.assertIn("yuanrong_load_worker_count", check_body)
+        self.assertIn("yuanrong_recovery_batch_size", check_body)
+        self.assertIn("yuanrong_host_buffer_count({})", check_body)
+        self.assertIn("config.hostBufferCount, config.recoveryBatchSize", check_body)
+        self.assertIn("yuanrong_h2d_stream_count", check_body)
+        self.assertIn("yuanrong_backfill_worker_count", check_body)
+        self.assertIn("yuanrong_backfill_queue_depth", check_body)
+        self.assertIn("yuanrong_reaper_queue_depth({})", check_body)
 
 
 if __name__ == "__main__":
