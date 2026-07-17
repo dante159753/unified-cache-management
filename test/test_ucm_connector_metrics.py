@@ -1874,6 +1874,17 @@ def test_cache_load_h2d_duration_records_stream_synchronize_only():
     assert "auto h2dSyncMs = (NowTime::Now() - tpH2dSubmitted) * 1e3;" not in source
 
 
+def test_cache_load_records_ready_hits_and_backend_wait_shards():
+    source = (REPO_ROOT / "ucm" / "store" / "cache" / "cc" / "load_queue.cc").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'NAME_TO_METRIC_ID("cache_load_hit_shards_total")' in source
+    assert 'NAME_TO_METRIC_ID("cache_load_backend_wait_shards_total")' in source
+    assert "static_cast<double>(cacheHitCount)" in source
+    assert "static_cast<double>(backendWaitCount)" in source
+
+
 def test_cache_dump_d2h_metrics_require_event_ready_timestamp():
     source = (REPO_ROOT / "ucm" / "store" / "cache" / "cc" / "dump_queue.cc").read_text(
         encoding="utf-8"
@@ -2055,7 +2066,7 @@ def test_pipeline_dashboard_orders_cache_bandwidth_rows():
     assert "Cache Dump D2H Duration" not in panels
 
 
-def test_pipeline_dashboard_cache_backend_load_ratio_uses_hit_source_share():
+def test_pipeline_dashboard_cache_backend_load_ratio_uses_worker_backend_wait_share():
     dashboard = json.loads(
         (REPO_ROOT / "examples" / "metrics" / "grafana_pipeline_store.json").read_text(
             encoding="utf-8"
@@ -2068,8 +2079,8 @@ def test_pipeline_dashboard_cache_backend_load_ratio_uses_hit_source_share():
     )
     expression = panel["targets"][0]["expr"]
 
-    assert expression.count("ucm:posix_lookup_hit_blocks_total") == 2
-    assert expression.count("ucm:cache_lookup_hit_blocks_total") == 1
-    assert "cache_load_backend_shards_total" not in expression
-    assert "cache_load_shards_total" not in expression
-    assert "returned hit blocks" in panel["description"]
+    assert expression.count("ucm:cache_load_backend_wait_shards_total") == 1
+    assert expression.count("ucm:cache_load_shards_total") == 1
+    assert "posix_lookup_hit_blocks_total" not in expression
+    assert "cache_lookup_hit_blocks_total" not in expression
+    assert "waiting for backend data" in panel["description"]

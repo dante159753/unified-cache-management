@@ -245,6 +245,8 @@ exported in milliseconds.
 | `ucm:cache_dump_blocks_total` | Total blocks dumped by the Cache stage. |
 | `ucm:cache_load_shards_total` | Total shards dispatched by Cache load. |
 | `ucm:cache_load_backend_shards_total` | Shards that descended to the backend on load. |
+| `ucm:cache_load_hit_shards_total` | Cache load shards that were ready in Cache at dispatch time. |
+| `ucm:cache_load_backend_wait_shards_total` | Cache load shards that required waiting for backend data. |
 | `ucm:cache_dump_shards_total` | Total shards dispatched by Cache dump. |
 | `ucm:cache_dump_backend_shards_total` | Shards actually pushed to backend on dump. |
 | `ucm:cache_load_bytes_total` | Total bytes loaded through the Cache stage. |

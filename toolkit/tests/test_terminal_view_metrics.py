@@ -860,8 +860,8 @@ vllm:num_requests_running{worker_id="1"} 5
                 "vllm:prefix_cache_hits_total",
                 "vllm:prefix_cache_queries_total",
                 "vllm:external_prefix_cache_hits_total",
-                "ucm:cache_lookup_hit_blocks_total",
-                "ucm:posix_lookup_hit_blocks_total",
+                "ucm:cache_load_backend_wait_shards_total",
+                "ucm:cache_load_shards_total",
             }.issubset(metric_names_for_scrape(config))
         )
         self.assertFalse(
@@ -946,6 +946,8 @@ vllm:request_decode_time_seconds_count 5
 ucm:cache_lookup_hit_blocks_total 10
 ucm:cache_lookup_miss_blocks_total 10
 ucm:posix_lookup_hit_blocks_total 5
+ucm:cache_load_backend_wait_shards_total 2
+ucm:cache_load_shards_total 8
 """
                     ),
                     t0,
@@ -988,6 +990,8 @@ vllm:request_decode_time_seconds_count 9
 ucm:cache_lookup_hit_blocks_total 30
 ucm:cache_lookup_miss_blocks_total 30
 ucm:posix_lookup_hit_blocks_total 15
+ucm:cache_load_backend_wait_shards_total 6
+ucm:cache_load_shards_total 24
 """
                     ),
                     t1,
@@ -1023,7 +1027,7 @@ ucm:posix_lookup_hit_blocks_total 15
         self.assertAlmostEqual(
             values["external_prefix_cache_hit_rate"]["hit_rate"], 0.2
         )
-        self.assertAlmostEqual(values["cache_backend_load_ratio"]["ratio"], 1.0 / 3.0)
+        self.assertAlmostEqual(values["cache_backend_load_ratio"]["ratio"], 0.25)
         self.assertAlmostEqual(values["total_requests"]["requests"], 4.0)
         for removed in (
             "prompt_tokens_per_s",
@@ -1041,7 +1045,7 @@ ucm:posix_lookup_hit_blocks_total 15
         ):
             self.assertNotIn(removed, values)
 
-    def test_cache_backend_load_ratio_uses_posix_hit_share_across_ranks(self):
+    def test_cache_backend_load_ratio_uses_backend_wait_share_across_ranks(self):
         with tempfile.TemporaryDirectory() as tmp:
             with MetricsStore(Path(tmp) / "metrics.db") as store:
                 t0 = parse_time_ms("2026-06-25T10:00:00")
@@ -1054,6 +1058,8 @@ ucm:cache_lookup_miss_blocks_total{worker_id="0"} 0
 ucm:cache_lookup_hit_blocks_total{worker_id="1"} 0
 ucm:cache_lookup_miss_blocks_total{worker_id="1"} 0
 ucm:posix_lookup_hit_blocks_total{worker_id="0"} 0
+ucm:cache_load_backend_wait_shards_total{worker_id="0"} 0
+ucm:cache_load_backend_wait_shards_total{worker_id="1"} 0
 ucm:cache_load_backend_shards_total{worker_id="0"} 0
 ucm:cache_load_backend_shards_total{worker_id="1"} 0
 ucm:cache_load_shards_total{worker_id="0"} 0
@@ -1070,6 +1076,8 @@ ucm:cache_lookup_miss_blocks_total{worker_id="0"} 10
 ucm:cache_lookup_hit_blocks_total{worker_id="1"} 0
 ucm:cache_lookup_miss_blocks_total{worker_id="1"} 10
 ucm:posix_lookup_hit_blocks_total{worker_id="0"} 10
+ucm:cache_load_backend_wait_shards_total{worker_id="0"} 6
+ucm:cache_load_backend_wait_shards_total{worker_id="1"} 2
 ucm:cache_load_backend_shards_total{worker_id="0"} 10
 ucm:cache_load_backend_shards_total{worker_id="1"} 0
 ucm:cache_load_shards_total{worker_id="0"} 10
@@ -1087,7 +1095,7 @@ ucm:cache_load_shards_total{worker_id="1"} 10
                 )
                 values = {row.metric: row.values for row in rows}
 
-        self.assertAlmostEqual(values["cache_backend_load_ratio"]["ratio"], 1.0)
+        self.assertAlmostEqual(values["cache_backend_load_ratio"]["ratio"], 0.4)
 
     def test_default_db_uses_tmp_ucm_metrics_db(self):
         self.assertEqual(DEFAULT_DB, "/tmp/ucm_metrics.db")

@@ -93,6 +93,8 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
     auto tpWait = NowTime::Now();
     const auto nShard = task->desc.size();
     const auto taskLaunch = UseSdmaDirectTaskLaunch();
+    size_t cacheHitCount = 0;
+    size_t backendWaitCount = 0;
     size_t backendSubmitCount = 0;
     std::vector<ShardTask> readyTasks;
     std::vector<ShardTask> pendingTasks;
@@ -105,7 +107,10 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
         ShardTask shardTask;
         shardTask.bufferHandle = buffer_->Get(shard.owner, shard.index, true, true);
         shardTask.backendTaskHandle = 0;
-        if (shardTask.bufferHandle.Owner() && !shardTask.bufferHandle.Ready()) {
+        const auto cacheHit = shardTask.bufferHandle.Ready();
+        cacheHitCount += static_cast<size_t>(cacheHit);
+        backendWaitCount += static_cast<size_t>(!cacheHit);
+        if (shardTask.bufferHandle.Owner() && !cacheHit) {
             Detail::TaskDesc backendTask{
                 Detail::Shard{shard.owner, shard.index, {shardTask.bufferHandle.Data()}}
             };
@@ -156,6 +161,10 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
                              (tpDispatch - tpWait) * 1e3);
     UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_backend_shards_total"),
                              static_cast<double>(backendSubmitCount));
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_hit_shards_total"),
+                             static_cast<double>(cacheHitCount));
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_backend_wait_shards_total"),
+                             static_cast<double>(backendWaitCount));
     UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_shards_total"),
                              static_cast<double>(nShard));
 }

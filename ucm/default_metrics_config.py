@@ -40,6 +40,17 @@ _COUNTER_METRICS = [
         ),
     ),
     (
+        "cache_load_hit_shards_total",
+        "Cache load shards that were ready in Cache at dispatch time",
+    ),
+    (
+        "cache_load_backend_wait_shards_total",
+        (
+            "Cache load shards that were not ready and required waiting for backend "
+            "data, including coalesced waits"
+        ),
+    ),
+    (
         "cache_dump_shards_total",
         "Total shards dispatched by Cache dump (mirror of cache_load_shards_total)",
     ),

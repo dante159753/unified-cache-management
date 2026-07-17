@@ -237,7 +237,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "Fraction of returned hit blocks served by the Posix backend. Equals Posix hits divided by Cache-buffer hits plus Posix hits; the Cache-buffer hit share is the complement.",
+      "description": "Fraction of Cache load shards that were not ready at dispatch time and therefore required waiting for backend data. Includes both shards that submitted backend IO and coalesced shards waiting on another in-flight load.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -325,7 +325,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum by (${perWorker:raw}) (rate(ucm:posix_lookup_hit_blocks_total{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))\n/ clamp_min(\n  sum by (${perWorker:raw}) (rate(ucm:cache_lookup_hit_blocks_total{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))\n  +\n  sum by (${perWorker:raw}) (rate(ucm:posix_lookup_hit_blocks_total{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])),\n  1e-9\n)",
+          "expr": "sum by (${perWorker:raw}) (rate(ucm:cache_load_backend_wait_shards_total{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))\n/\nclamp_min(sum by (${perWorker:raw}) (rate(ucm:cache_load_shards_total{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])), 1e-9)",
           "hide": false,
           "instant": false,
           "legendFormat": "{{engine}} {{worker_rank}}",
