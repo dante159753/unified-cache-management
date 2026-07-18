@@ -101,6 +101,12 @@ class YuanRongDumpQueueSourceTest(unittest.TestCase):
         self.assertIn("std::move(lockedBuffers)", dump_one_body)
         self.assertIn("persisting readable buffers only", dump_one_body)
 
+    def test_backend_submit_logs_time_since_d2h_completion(self):
+        dump_one_body = self._function_body("DumpQueue::DumpOne")
+
+        self.assertIn("d2h_to_backend_submit={:.3f}ms", dump_one_body)
+        self.assertIn("(backendSubmitEnd - publishEnd) * 1e3", dump_one_body)
+
     def test_yuanrong_load_probes_miss_with_zero_timeout(self):
         load_one_body = self._function_body("LoadQueue::LoadOne", self.load_source)
 

@@ -354,12 +354,14 @@ Status DumpQueue::DumpOne(TaskPtr task, const std::shared_ptr<Trans::Stream>& pr
         return Status::Error(
             fmt::format("failed to submit Posix dump: {}", backendResult.Error().ToString()));
     }
-    UC_DEBUG(
+    UC_INFO(
         "YuanRong dump task({}) backend submit keys={}, post_exist_keys={}, post_exist={:.3f}ms, "
-        "meta={:.3f}ms, kv_get={:.3f}ms, prepare_backend={:.3f}ms, total={:.3f}ms.",
+        "get_meta={:.3f}ms, kvClient_get={:.3f}ms, prepare_backend={:.3f}ms, "
+        "d2h_to_backend_submit={:.3f}ms, total={:.3f}ms.",
         task->id, backendKeyCount, postExistKeyCount, (postExistEnd - postExistStart) * 1e3,
         (metaEnd - metaStart) * 1e3, (kvGetEnd - kvGetStart) * 1e3,
-        (backendSubmitEnd - kvGetEnd) * 1e3, (backendSubmitEnd - taskStart) * 1e3);
+        (backendSubmitEnd - kvGetEnd) * 1e3, (backendSubmitEnd - publishEnd) * 1e3,
+        (backendSubmitEnd - taskStart) * 1e3);
     reaping_.Push(DumpContext{task->id, backendResult.Value(), std::move(lockedBuffers)});
     return Status::OK();
 }
