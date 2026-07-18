@@ -71,26 +71,38 @@ class YuanRongDumpQueueSourceTest(unittest.TestCase):
     def test_posix_dump_validates_yuanrong_payload_layout_before_using_buffer(self):
         dump_one_body = self._function_body("DumpQueue::DumpOne")
 
-        self.assertIn("GetMetaInfo(missingKeys, false", dump_one_body)
+        self.assertIn("GetMetaInfo(keys, false", dump_one_body)
         self.assertIn("ValidateYuanRongBlobSizes", dump_one_body)
         self.assertLess(
             dump_one_body.index("ValidateYuanRongBlobSizes"),
             dump_one_body.index("kvClient_->Get"),
         )
 
-    def test_partial_post_exist_persists_published_keys(self):
+    def test_dump_persists_only_mset_confirmed_local_keys(self):
         dump_one_body = self._function_body("DumpQueue::DumpOne")
 
-        self.assertIn("unpublishedCount == missingKeys.size()", dump_one_body)
         self.assertIn(
-            "SelectPublishedYuanRongObjects(exists, missingKeys, missingDesc)",
+            "MSetD2H(keys, blobLists, setParam, &localSetKeys)",
             dump_one_body,
         )
-        self.assertIn("persisting the published keys only", dump_one_body)
-        self.assertNotIn(
-            "exists.size() != missingKeys.size() || unpublishedCount != 0",
+        self.assertIn(
+            "SelectYuanRongObjectsByKeys(localSetKeys, keys, task->desc)",
             dump_one_body,
         )
+        self.assertIn("persisting the confirmed keys only", dump_one_body)
+        self.assertNotIn("heteroClient_->Exist", dump_one_body)
+        self.assertNotIn("postExist", dump_one_body)
+
+    def test_mset_error_without_confirmed_local_key_fails_dump(self):
+        dump_one_body = self._function_body("DumpQueue::DumpOne")
+
+        empty_pos = dump_one_body.index("if (localSetKeys.empty())")
+        error_pos = dump_one_body.index("if (dumpStatus.IsError())", empty_pos)
+        selection_pos = dump_one_body.index("SelectYuanRongObjectsByKeys")
+        partial_pos = dump_one_body.index("partially failed", selection_pos)
+        self.assertLess(empty_pos, error_pos)
+        self.assertLess(error_pos, selection_pos)
+        self.assertLess(selection_pos, partial_pos)
 
     def test_partial_kv_get_persists_only_latched_buffers(self):
         dump_one_body = self._function_body("DumpQueue::DumpOne")
@@ -106,6 +118,7 @@ class YuanRongDumpQueueSourceTest(unittest.TestCase):
 
         self.assertIn("d2h_to_backend_submit={:.3f}ms", dump_one_body)
         self.assertIn("(backendSubmitEnd - publishEnd) * 1e3", dump_one_body)
+        self.assertIn("local_set_keys={}", dump_one_body)
 
     def test_yuanrong_load_probes_miss_with_zero_timeout(self):
         load_one_body = self._function_body("LoadQueue::LoadOne", self.load_source)

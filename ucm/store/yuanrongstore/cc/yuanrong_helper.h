@@ -125,56 +125,38 @@ inline size_t TotalBlobBytes(const std::vector<datasystem::DeviceBlobList>& blob
     return total;
 }
 
-inline Status SelectMissingYuanRongObjects(const std::vector<bool>& exists,
-                                           std::vector<std::string>& keys,
-                                           std::vector<datasystem::DeviceBlobList>& blobLists,
-                                           Detail::TaskDesc& desc)
+inline Status SelectYuanRongObjectsByKeys(const std::vector<std::string>& selectedKeys,
+                                          std::vector<std::string>& keys, Detail::TaskDesc& desc)
 {
-    if (exists.size() != keys.size() || blobLists.size() != keys.size() ||
-        desc.size() != keys.size()) {
-        return Status::InvalidParam(
-            "YuanRong object selection size mismatch: exists({}), keys({}), blobs({}), shards({})",
-            exists.size(), keys.size(), blobLists.size(), desc.size());
+    if (desc.size() != keys.size()) {
+        return Status::InvalidParam("YuanRong object selection size mismatch: keys({}), shards({})",
+                                    keys.size(), desc.size());
     }
 
-    std::vector<std::string> missingKeys;
-    std::vector<datasystem::DeviceBlobList> missingBlobLists;
-    Detail::TaskDesc missingDesc;
-    missingKeys.reserve(keys.size());
-    missingBlobLists.reserve(blobLists.size());
-    missingDesc.reserve(desc.size());
+    std::unordered_set<std::string> inputKeys(keys.begin(), keys.end());
+    std::unordered_set<std::string> selected;
+    selected.reserve(selectedKeys.size());
+    for (const auto& key : selectedKeys) {
+        if (inputKeys.count(key) == 0) {
+            return Status::InvalidParam("YuanRong MSetD2H returned an unknown local key({})", key);
+        }
+        if (!selected.insert(key).second) {
+            return Status::InvalidParam("YuanRong MSetD2H returned a duplicated local key({})",
+                                        key);
+        }
+    }
+
+    std::vector<std::string> filteredKeys;
+    Detail::TaskDesc filteredDesc;
+    filteredKeys.reserve(selectedKeys.size());
+    filteredDesc.reserve(selectedKeys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        if (exists[i]) { continue; }
-        missingKeys.push_back(std::move(keys[i]));
-        missingBlobLists.push_back(std::move(blobLists[i]));
-        missingDesc.push_back(std::move(desc[i]));
+        if (selected.count(keys[i]) == 0) { continue; }
+        filteredKeys.push_back(std::move(keys[i]));
+        filteredDesc.push_back(std::move(desc[i]));
     }
-    keys = std::move(missingKeys);
-    blobLists = std::move(missingBlobLists);
-    desc = std::move(missingDesc);
-    return Status::OK();
-}
-
-inline Status SelectPublishedYuanRongObjects(const std::vector<bool>& exists,
-                                             std::vector<std::string>& keys, Detail::TaskDesc& desc)
-{
-    if (exists.size() != keys.size() || desc.size() != keys.size()) {
-        return Status::InvalidParam(
-            "YuanRong published object selection size mismatch: exists({}), keys({}), shards({})",
-            exists.size(), keys.size(), desc.size());
-    }
-
-    std::vector<std::string> publishedKeys;
-    Detail::TaskDesc publishedDesc;
-    publishedKeys.reserve(keys.size());
-    publishedDesc.reserve(desc.size());
-    for (size_t i = 0; i < keys.size(); ++i) {
-        if (!exists[i]) { continue; }
-        publishedKeys.push_back(std::move(keys[i]));
-        publishedDesc.push_back(std::move(desc[i]));
-    }
-    keys = std::move(publishedKeys);
-    desc = std::move(publishedDesc);
+    keys = std::move(filteredKeys);
+    desc = std::move(filteredDesc);
     return Status::OK();
 }
 
