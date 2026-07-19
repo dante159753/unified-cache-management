@@ -314,10 +314,11 @@ def _yuanrong_pipeline_builder(
 def _yuanrong_posix_pipeline_builder(
     config: Dict[str, object], pipeline: ucmpipelinestore.PipelineStore
 ):
-    if config.get("posix_io_engine", "psync") != "psync":
-        raise ValueError(
-            "YuanRong|Posix currently supports only posix_io_engine=psync"
-        )
+    io_engine = config.get("posix_io_engine", "psync")
+    if io_engine not in ("psync", "aio"):
+        raise ValueError(f"invalid posix_io_engine={io_engine} for YuanRong|Posix")
+    if io_engine == "aio" and not config.get("io_direct", False):
+        raise ValueError("YuanRong|Posix posix_io_engine=aio requires io_direct=true")
     store_dir = Path(__file__).resolve().parent.parent
     posix_config = copy.deepcopy(config)
     tensor_sizes = config.get("tensor_size_list")

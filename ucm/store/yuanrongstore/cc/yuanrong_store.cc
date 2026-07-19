@@ -255,8 +255,14 @@ private:
             return Status::InvalidParam("yuanrong_reaper_queue_depth({}) must be greater than 1",
                                         config.reaperQueueDepth);
         }
-        if (config.storeBackend != nullptr && config.posixIoEngine != "psync") {
-            return Status::Unsupported();
+        if (config.storeBackend != nullptr && config.posixIoEngine != "psync" &&
+            config.posixIoEngine != "aio") {
+            return Status::InvalidParam("invalid posix_io_engine({}) for YuanRong|Posix",
+                                        config.posixIoEngine);
+        }
+        if (config.storeBackend != nullptr && config.posixIoEngine == "aio" && !config.ioDirect) {
+            return Status::InvalidParam(
+                "YuanRong|Posix posix_io_engine=aio requires io_direct=true");
         }
         if (config.deviceId < 0) { return Status::OK(); }
         if (config.tensorSizes.empty() || config.objectSize == 0) {
@@ -291,6 +297,7 @@ private:
         UC_INFO("{}::ObjectSize = {}", name, config.objectSize);
         UC_INFO("{}::MemoryAlignment = {}", name, config.memoryAlignment);
         UC_INFO("{}::IoDirect = {}", name, config.ioDirect);
+        UC_INFO("{}::PosixIoEngine = {}", name, config.posixIoEngine);
         UC_INFO("{}::TimeoutMs = {}", name, config.timeoutMs);
         UC_INFO("{}::LoadWorkerCount = {}", name, config.loadWorkerCount);
         UC_INFO("{}::RecoveryBatchSize = {}", name, config.recoveryBatchSize);

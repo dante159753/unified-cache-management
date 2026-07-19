@@ -150,7 +150,7 @@ class YuanRongPipelineBuilderTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "yuanrong_memory_alignment=4096"):
             self.connector._yuanrong_posix_pipeline_builder(config, pipeline)
 
-    def test_aio_is_rejected(self):
+    def test_aio_requires_direct_io(self):
         pipeline = FakeNativePipeline()
         config = {
             "device_id": 0,
@@ -161,7 +161,34 @@ class YuanRongPipelineBuilderTest(unittest.TestCase):
             "io_direct": False,
         }
 
-        with self.assertRaisesRegex(ValueError, "posix_io_engine=psync"):
+        with self.assertRaisesRegex(ValueError, "requires io_direct=true"):
+            self.connector._yuanrong_posix_pipeline_builder(config, pipeline)
+
+    def test_aio_is_accepted_with_direct_io_alignment(self):
+        pipeline = FakeNativePipeline()
+        config = {
+            "device_id": 0,
+            "tensor_size_list": [4096],
+            "shard_size": 4096,
+            "block_size": 4096,
+            "yuanrong_memory_alignment": 4096,
+            "posix_io_engine": "aio",
+            "io_direct": True,
+        }
+
+        self.connector._yuanrong_posix_pipeline_builder(config, pipeline)
+
+        self.assertEqual([entry[0] for entry in pipeline.stacks], ["Posix", "YuanRong"])
+        self.assertEqual(pipeline.stacks[0][2]["posix_io_engine"], "aio")
+
+    def test_unknown_io_engine_is_rejected(self):
+        pipeline = FakeNativePipeline()
+        config = {
+            "device_id": 0,
+            "posix_io_engine": "unknown",
+        }
+
+        with self.assertRaisesRegex(ValueError, "invalid posix_io_engine=unknown"):
             self.connector._yuanrong_posix_pipeline_builder(config, pipeline)
 
 

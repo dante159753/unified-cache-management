@@ -29,6 +29,7 @@ ucm_connectors:
 
       share_buffer_enable: true
       storage_backends: "/mnt/ucm"
+      # "aio" is supported when io_direct is true; "psync" supports either mode.
       posix_io_engine: "psync"
       io_direct: true
 

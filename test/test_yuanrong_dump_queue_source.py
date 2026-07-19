@@ -172,6 +172,15 @@ class YuanRongDumpQueueSourceTest(unittest.TestCase):
         self.assertIn("yuanrong_backfill_queue_depth", check_body)
         self.assertIn("yuanrong_reaper_queue_depth({})", check_body)
 
+    def test_yuanrong_posix_accepts_aio_only_with_direct_io(self):
+        check_body = self._function_body("CheckConfig", self.store_source)
+
+        self.assertIn('config.posixIoEngine != "aio"', check_body)
+        self.assertIn('config.posixIoEngine == "aio"', check_body)
+        self.assertIn("!config.ioDirect", check_body)
+        self.assertIn("posix_io_engine=aio requires io_direct=true", check_body)
+        self.assertNotIn("return Status::Unsupported()", check_body)
+
 
 if __name__ == "__main__":
     unittest.main()
