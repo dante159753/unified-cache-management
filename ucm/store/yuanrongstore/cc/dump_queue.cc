@@ -162,7 +162,7 @@ Status DumpQueue::DumpOne(TaskPtr task, const std::shared_ptr<Trans::Stream>& pr
     auto d2hStart = NowTime::Now();
     auto dumpStatus = heteroClient_->MSetD2H(keys, blobLists, setParam, &localSetKeys);
     auto publishEnd = NowTime::Now();
-    UC_DEBUG(
+    UC_INFO(
         "YuanRong dump task({}) MSetD2H keys={}, local_set={}, bytes={}, prereq={:.3f}ms, "
         "d2h={:.3f}ms, status={}.",
         task->id, keys.size(), localSetKeys.size(), totalBytes, (prereqEnd - prereqStart) * 1e3,

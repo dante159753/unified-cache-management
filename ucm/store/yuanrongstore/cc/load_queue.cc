@@ -181,10 +181,10 @@ Status LoadQueue::LoadOne(CopyStream& stream, TaskPtr task)
     auto rc = heteroClient_->MGetH2D(keys, blobLists, failedKeys, mgetTimeoutMs);
     auto getEnd = NowTime::Now();
     auto missIndexes = FailedIndexes(keys, failedKeys, rc.IsError());
-    UC_DEBUG(
-        "YuanRong load task({}) MGetH2D keys={}, miss={}, timeout={}ms, cost={:.3f}ms, "
+    UC_INFO(
+        "YuanRong load task({}) MGetH2D keys={}, miss={}, cost={:.3f}ms, "
         "rc={}.",
-        task->id, keys.size(), missIndexes.size(), mgetTimeoutMs, (getEnd - getStart) * 1e3,
+        task->id, keys.size(), missIndexes.size(), (getEnd - getStart) * 1e3,
         rc.ToString());
     if (missIndexes.empty()) {
         UC_DEBUG("YuanRong load task({}) all hit, total={:.3f}ms.", task->id,
@@ -200,8 +200,8 @@ Status LoadQueue::LoadOne(CopyStream& stream, TaskPtr task)
     auto recoverStart = NowTime::Now();
     auto recoverStatus = RecoverFromBackend(stream, task, keys, blobLists, missIndexes);
     auto recoverEnd = NowTime::Now();
-    UC_DEBUG(
-        "YuanRong load task({}) recovered miss={}, recover={:.3f}ms, total={:.3f}ms, "
+    UC_INFO(
+        "YuanRong load task({}) recovered miss={}, posix load={:.3f}ms, total={:.3f}ms, "
         "status={}.",
         task->id, missIndexes.size(), (recoverEnd - recoverStart) * 1e3,
         (recoverEnd - taskStart) * 1e3, recoverStatus.ToString());
@@ -236,7 +236,7 @@ Status LoadQueue::RecoverFromBackend(CopyStream& stream, TaskPtr task,
             }
         }
 
-        UC_DEBUG("YuanRong host load task({}) finalizing batch({}/{},{} blocks).", task->id, i + 1,
+        UC_INFO("YuanRong host load task({}) finalizing batch({}/{},{} blocks).", task->id, i + 1,
                  ranges.size(), current.indexes.size());
         auto status = FinalizeHostBatch(stream, blobLists, current);
         if (firstFailure.Success() && status.Failure()) { firstFailure = std::move(status); }
