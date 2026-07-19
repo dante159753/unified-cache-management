@@ -13,25 +13,29 @@ ucm_connectors:
       yuanrong_host: "127.0.0.1"
       yuanrong_port: 18481
       yuanrong_namespace: "ucm_model"
-      yuanrong_enable_remote_h2d: false
-      yuanrong_memory_alignment: 4096
+      yuanrong_enable_remote_h2d: true
       yuanrong_timeout_ms: 60000
       yuanrong_waiting_queue_depth: 8192
       yuanrong_load_worker_count: 4
       # Posix cold recovery pipeline batch size.
       yuanrong_recovery_batch_size: 32
-      # Pinned host memory usage is count * one UCM shard size.
-      yuanrong_host_buffer_count: 128
+      # 0 derives complete batches from load/backfill concurrency and the capacity limit.
+      # Automatic allocation when host buffer count is 0
+      # yuanrong_host_buffer_count: 0
+      # max pin memory when host buffer count is 0
+      # yuanrong_host_buffer_capacity_gb: 8
       yuanrong_h2d_stream_count: 4
       yuanrong_backfill_worker_count: 1
       yuanrong_backfill_queue_depth: 128
+      # Queue depth for async Posix dump completion and YuanRong buffer release.
       yuanrong_reaper_queue_depth: 8192
 
       share_buffer_enable: true
       storage_backends: "/mnt/ucm"
       # "aio" is supported when io_direct is true; "psync" supports either mode.
       posix_io_engine: "psync"
-      io_direct: true
+      io_direct: false
+      yuanrong_memory_alignment: 64
 
 enable_event_sync: true
 use_layerwise: false

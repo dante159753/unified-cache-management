@@ -588,14 +588,17 @@ flowchart TD
 ```yaml
 yuanrong_load_worker_count: 4
 yuanrong_recovery_batch_size: 32
-yuanrong_host_buffer_count: 128
+yuanrong_host_buffer_count: 0
+yuanrong_host_buffer_capacity_gb: 8
 yuanrong_h2d_stream_count: 4
 yuanrong_backfill_worker_count: 1
 yuanrong_backfill_queue_depth: 128
 ```
 
-`yuanrong_recovery_batch_size`控制Posix和直接H2D批次。`yuanrong_host_buffer_count`
-必须不小于批次大小。Backfill worker默认单线程，避免后台MCreate和内存复制过度争用前台资源。
+`yuanrong_recovery_batch_size`控制Posix和直接H2D批次。`yuanrong_host_buffer_count=0`
+时，按照Load worker双批流水线、Backfill worker并发数和pinned host内存容量自动推导完整批次数；
+非零值作为显式覆盖且不受自动容量上限约束。纯YuanRong模式不分配该HostBuffer池。Backfill
+worker默认单线程，避免后台MCreate和内存复制过度争用前台资源。
 
 ### 4.4 Lookup 和 Prefetch
 

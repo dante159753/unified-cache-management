@@ -212,6 +212,24 @@ TEST(YuanRongHelperTest, RecoveryBatchRangesCoverAllIndexesWithoutOverlap)
     EXPECT_TRUE(RecoveryBatchRanges(10, 0).empty());
 }
 
+TEST(YuanRongHelperTest, HostBufferCountUsesPipelineConcurrencyAndCompleteBatches)
+{
+    using namespace UC::YuanRongStore;
+
+    constexpr uint64_t capacityBytes = 8ULL << 30;
+    EXPECT_EQ(DeriveYuanRongHostBufferCount(4ULL << 20, 32, 4, 1, capacityBytes), 288);
+    EXPECT_EQ(DeriveYuanRongHostBufferCount(64ULL << 20, 32, 4, 1, capacityBytes), 128);
+}
+
+TEST(YuanRongHelperTest, HostBufferCountRejectsCapacitySmallerThanOneBatch)
+{
+    using namespace UC::YuanRongStore;
+
+    constexpr uint64_t capacityBytes = 8ULL << 30;
+    EXPECT_EQ(DeriveYuanRongHostBufferCount(1ULL << 30, 32, 4, 1, capacityBytes), 0);
+    EXPECT_EQ(DeriveYuanRongHostBufferCount(0, 32, 4, 1, capacityBytes), 0);
+}
+
 TEST(YuanRongHelperTest, ComposedBufferHeaderMapsPayloadAfterYuanRongHeader)
 {
     using namespace UC::YuanRongStore;

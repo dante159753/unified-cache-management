@@ -185,6 +185,8 @@ private:
         input.GetNumber("yuanrong_load_worker_count", config.loadWorkerCount);
         input.GetNumber("yuanrong_recovery_batch_size", config.recoveryBatchSize);
         input.GetNumber("yuanrong_host_buffer_count", config.hostBufferCount);
+        config.hostBufferCountExplicit = config.hostBufferCount != 0;
+        input.GetNumber("yuanrong_host_buffer_capacity_gb", config.hostBufferCapacityGb);
         input.GetNumber("yuanrong_h2d_stream_count", config.h2dStreamCount);
         input.GetNumber("yuanrong_backfill_worker_count", config.backfillWorkerCount);
         input.GetNumber("yuanrong_backfill_queue_depth", config.backfillQueueDepth);
@@ -195,7 +197,25 @@ private:
         input.Get("store_backend", config.storeBackend);
         config.objectSize =
             std::accumulate(config.tensorSizes.begin(), config.tensorSizes.end(), size_t{0});
+        DeriveHostBufferCount(config);
         return config;
+    }
+
+    static void DeriveHostBufferCount(Config& config)
+    {
+        if (config.deviceId < 0 || config.storeBackend == nullptr) {
+            config.hostBufferCount = 0;
+            return;
+        }
+        if (config.hostBufferCountExplicit || config.objectSize == 0 ||
+            config.hostBufferCapacityGb == 0 ||
+            config.hostBufferCapacityGb > (std::numeric_limits<uint64_t>::max() >> 30)) {
+            return;
+        }
+        const auto capacityBytes = static_cast<uint64_t>(config.hostBufferCapacityGb) << 30;
+        config.hostBufferCount = DeriveYuanRongHostBufferCount(
+            config.objectSize, config.recoveryBatchSize, config.loadWorkerCount,
+            config.backfillWorkerCount, capacityBytes);
     }
 
     static Status CheckConfig(const Config& config)
@@ -228,28 +248,8 @@ private:
         if (config.loadWorkerCount == 0) {
             return Status::InvalidParam("yuanrong_load_worker_count must be greater than 0");
         }
-        if (config.recoveryBatchSize == 0) {
-            return Status::InvalidParam("yuanrong_recovery_batch_size must be greater than 0");
-        }
-        if (config.hostBufferCount < config.recoveryBatchSize) {
-            return Status::InvalidParam(
-                "yuanrong_host_buffer_count({}) must be greater than or equal to "
-                "yuanrong_recovery_batch_size({})",
-                config.hostBufferCount, config.recoveryBatchSize);
-        }
-        if (config.hostBufferCount >= std::numeric_limits<uint32_t>::max()) {
-            return Status::InvalidParam("yuanrong_host_buffer_count({}) must be less than {}",
-                                        config.hostBufferCount,
-                                        std::numeric_limits<uint32_t>::max());
-        }
         if (config.h2dStreamCount == 0) {
             return Status::InvalidParam("yuanrong_h2d_stream_count must be greater than 0");
-        }
-        if (config.backfillWorkerCount == 0) {
-            return Status::InvalidParam("yuanrong_backfill_worker_count must be greater than 0");
-        }
-        if (config.backfillQueueDepth == 0) {
-            return Status::InvalidParam("yuanrong_backfill_queue_depth must be greater than 0");
         }
         if (config.reaperQueueDepth <= 1) {
             return Status::InvalidParam("yuanrong_reaper_queue_depth({}) must be greater than 1",
@@ -271,6 +271,43 @@ private:
         if (config.shardSize == 0 || config.blockSize == 0 ||
             config.blockSize % config.shardSize != 0) {
             return Status::InvalidParam("invalid shard/block size");
+        }
+        if (config.storeBackend != nullptr) {
+            if (config.recoveryBatchSize == 0) {
+                return Status::InvalidParam("yuanrong_recovery_batch_size must be greater than 0");
+            }
+            if (config.backfillWorkerCount == 0) {
+                return Status::InvalidParam(
+                    "yuanrong_backfill_worker_count must be greater than 0");
+            }
+            if (config.backfillQueueDepth == 0) {
+                return Status::InvalidParam("yuanrong_backfill_queue_depth must be greater than 0");
+            }
+            if (!config.hostBufferCountExplicit &&
+                (config.hostBufferCapacityGb == 0 ||
+                 config.hostBufferCapacityGb > (std::numeric_limits<uint64_t>::max() >> 30))) {
+                return Status::InvalidParam("invalid yuanrong_host_buffer_capacity_gb({})",
+                                            config.hostBufferCapacityGb);
+            }
+            if (config.hostBufferCount < config.recoveryBatchSize) {
+                if (config.hostBufferCountExplicit) {
+                    return Status::InvalidParam(
+                        "yuanrong_host_buffer_count({}) must be greater than or equal to "
+                        "yuanrong_recovery_batch_size({})",
+                        config.hostBufferCount, config.recoveryBatchSize);
+                }
+                return Status::InvalidParam(
+                    "YuanRong host buffer capacity({}GB) can provide {} buffers, fewer than "
+                    "yuanrong_recovery_batch_size({}); increase "
+                    "yuanrong_host_buffer_capacity_gb, reduce the batch size, or set "
+                    "yuanrong_host_buffer_count explicitly",
+                    config.hostBufferCapacityGb, config.hostBufferCount, config.recoveryBatchSize);
+            }
+            if (config.hostBufferCount >= std::numeric_limits<uint32_t>::max()) {
+                return Status::InvalidParam("yuanrong_host_buffer_count({}) must be less than {}",
+                                            config.hostBufferCount,
+                                            std::numeric_limits<uint32_t>::max());
+            }
         }
         if (config.ioDirect && config.storeBackend != nullptr) {
             constexpr size_t directIoAlignment = 4096;
@@ -302,6 +339,11 @@ private:
         UC_INFO("{}::LoadWorkerCount = {}", name, config.loadWorkerCount);
         UC_INFO("{}::RecoveryBatchSize = {}", name, config.recoveryBatchSize);
         UC_INFO("{}::HostBufferCount = {}", name, config.hostBufferCount);
+        UC_INFO("{}::HostBufferCountSource = {}", name,
+                config.deviceId < 0 || config.storeBackend == nullptr
+                    ? "disabled"
+                    : (config.hostBufferCountExplicit ? "explicit" : "derived"));
+        UC_INFO("{}::HostBufferCapacityGb = {}", name, config.hostBufferCapacityGb);
         UC_INFO("{}::H2DStreamCount = {}", name, config.h2dStreamCount);
         UC_INFO("{}::BackfillWorkerCount = {}", name, config.backfillWorkerCount);
         UC_INFO("{}::BackfillQueueDepth = {}", name, config.backfillQueueDepth);

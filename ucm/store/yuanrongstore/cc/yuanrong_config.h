@@ -48,7 +48,9 @@ struct Config {
     size_t waitingQueueDepth{8192};
     size_t loadWorkerCount{4};
     size_t recoveryBatchSize{32};
-    size_t hostBufferCount{128};
+    size_t hostBufferCount{0};
+    size_t hostBufferCapacityGb{8};
+    bool hostBufferCountExplicit{false};
     size_t h2dStreamCount{4};
     size_t backfillWorkerCount{1};
     size_t backfillQueueDepth{128};

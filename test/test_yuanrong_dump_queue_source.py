@@ -130,6 +130,12 @@ class YuanRongDumpQueueSourceTest(unittest.TestCase):
         self.assertNotIn("firstGetTimeoutMs", load_one_body)
         self.assertNotIn("missTimeoutMs", load_one_body)
 
+    def test_yuanrong_load_logs_total_mget_bytes(self):
+        load_one_body = self._function_body("LoadQueue::LoadOne", self.load_source)
+
+        self.assertIn("config_.objectSize * keys.size()", load_one_body)
+        self.assertIn("MGetH2D keys={}, bytes={}, miss={}", load_one_body)
+
     def test_yuanrong_posix_miss_h2d_precedes_async_backfill(self):
         recover_body = self._function_body(
             "LoadQueue::RecoverFromBackend", self.load_source
@@ -171,6 +177,26 @@ class YuanRongDumpQueueSourceTest(unittest.TestCase):
         self.assertIn("yuanrong_backfill_worker_count", check_body)
         self.assertIn("yuanrong_backfill_queue_depth", check_body)
         self.assertIn("yuanrong_reaper_queue_depth({})", check_body)
+
+    def test_host_buffer_count_is_derived_and_explicit_value_is_preserved(self):
+        parse_body = self._function_body("ParseConfig", self.store_source)
+        derive_body = self._function_body("DeriveHostBufferCount", self.store_source)
+
+        self.assertIn("yuanrong_host_buffer_capacity_gb", parse_body)
+        self.assertIn("config.hostBufferCount != 0", parse_body)
+        self.assertIn("DeriveHostBufferCount(config)", parse_body)
+        self.assertIn("config.hostBufferCountExplicit", derive_body)
+        self.assertIn("DeriveYuanRongHostBufferCount", derive_body)
+
+    def test_pure_yuanrong_skips_recovery_resources(self):
+        setup_body = self._function_body("LoadQueue::Setup", self.load_source)
+        derive_body = self._function_body("DeriveHostBufferCount", self.store_source)
+
+        self.assertIn("if (backend_ != nullptr)", setup_body)
+        self.assertIn("hostBufferPool_.Setup", setup_body)
+        self.assertIn("backfillQueue_.Setup", setup_body)
+        self.assertIn("config.storeBackend == nullptr", derive_body)
+        self.assertIn("config.hostBufferCount = 0", derive_body)
 
     def test_yuanrong_posix_accepts_aio_only_with_direct_io(self):
         check_body = self._function_body("CheckConfig", self.store_source)

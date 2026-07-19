@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -123,6 +124,29 @@ inline size_t TotalBlobBytes(const std::vector<datasystem::DeviceBlobList>& blob
         for (const auto& blob : blobList.blobs) { total += blob.size; }
     }
     return total;
+}
+
+inline size_t DeriveYuanRongHostBufferCount(size_t objectSize, size_t recoveryBatchSize,
+                                            size_t loadWorkerCount, size_t backfillWorkerCount,
+                                            uint64_t capacityBytes)
+{
+    if (objectSize == 0 || recoveryBatchSize == 0 || loadWorkerCount == 0 ||
+        backfillWorkerCount == 0 || capacityBytes == 0) {
+        return 0;
+    }
+
+    const auto maxValue = std::numeric_limits<uint64_t>::max();
+    const auto loadWorkers = static_cast<uint64_t>(loadWorkerCount);
+    const auto backfillWorkers = static_cast<uint64_t>(backfillWorkerCount);
+    const auto targetBatchCount = loadWorkers > (maxValue - backfillWorkers) / 2
+                                      ? maxValue
+                                      : loadWorkers * 2 + backfillWorkers;
+    const auto buffersByCapacity = capacityBytes / static_cast<uint64_t>(objectSize);
+    const auto batchesByCapacity = buffersByCapacity / static_cast<uint64_t>(recoveryBatchSize);
+    const auto selectedBatchCount = std::min(targetBatchCount, batchesByCapacity);
+    const auto selectedCount = selectedBatchCount * static_cast<uint64_t>(recoveryBatchSize);
+    if (selectedCount > std::numeric_limits<size_t>::max()) { return 0; }
+    return static_cast<size_t>(selectedCount);
 }
 
 inline Status SelectYuanRongObjectsByKeys(const std::vector<std::string>& selectedKeys,
