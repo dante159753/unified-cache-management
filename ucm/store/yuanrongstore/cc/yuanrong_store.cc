@@ -23,6 +23,7 @@
  * */
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -52,6 +53,8 @@ public:
     {
         config_ = ParseConfig(input);
         auto s = CheckConfig(config_);
+        if (s.Failure()) { return s; }
+        s = ResolveDeviceMemoryPreRegistration(config_, std::getenv("DS_RH2D_LINK_TYPE"));
         if (s.Failure()) { return s; }
 
         datasystem::ConnectOptions options;
@@ -161,8 +164,24 @@ public:
 
     Status RegisterMemory(void* baseAddr, size_t totalSize) override
     {
-        (void)baseAddr;
-        (void)totalSize;
+        if (!config_.enableDeviceMemoryPreRegistration) { return Status::OK(); }
+        if (baseAddr == nullptr) {
+            return Status::InvalidParam("YuanRong device memory address cannot be null");
+        }
+        if (totalSize == 0) {
+            return Status::InvalidParam("YuanRong device memory size must be greater than zero");
+        }
+        if (heteroClient_ == nullptr) {
+            return Status::Error("YuanRong HeteroClient is not initialized");
+        }
+
+        auto status = heteroClient_->PreRegisterDeviceMemory(
+            std::vector<void*>{baseAddr}, std::vector<uint64_t>{static_cast<uint64_t>(totalSize)});
+        if (status.IsError()) {
+            UC_ERROR("YuanRong PreRegisterDeviceMemory failed: addr={}, size={}, error={}",
+                     baseAddr, totalSize, status.ToString());
+            return Status::Error("YuanRong PreRegisterDeviceMemory failed: " + status.ToString());
+        }
         return Status::OK();
     }
 
@@ -330,6 +349,8 @@ private:
         UC_INFO("{}::Port = {}", name, config.port);
         UC_INFO("{}::Namespace = {}", name, config.nameSpace);
         UC_INFO("{}::EnableRemoteH2D = {}", name, config.enableRemoteH2D);
+        UC_INFO("{}::DeviceMemoryPreRegistration = {}", name,
+                config.enableDeviceMemoryPreRegistration);
         UC_INFO("{}::DeviceId = {}", name, config.deviceId);
         UC_INFO("{}::ObjectSize = {}", name, config.objectSize);
         UC_INFO("{}::MemoryAlignment = {}", name, config.memoryAlignment);

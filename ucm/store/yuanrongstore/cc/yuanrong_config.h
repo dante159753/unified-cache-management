@@ -36,6 +36,7 @@ struct Config {
     int32_t port{9088};
     std::string nameSpace{};
     bool enableRemoteH2D{true};
+    bool enableDeviceMemoryPreRegistration{false};
 
     int32_t deviceId{-1};
     std::vector<size_t> tensorSizes{};

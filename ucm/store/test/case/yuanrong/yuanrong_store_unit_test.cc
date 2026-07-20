@@ -40,6 +40,40 @@ UC::Detail::BlockId MakeBlock(std::initializer_list<uint8_t> bytes)
 
 }  // namespace
 
+TEST(YuanRongHelperTest, DeviceMemoryPreRegistrationRequiresRemoteH2DAndHccs)
+{
+    using namespace UC::YuanRongStore;
+
+    Config config;
+    config.enableRemoteH2D = false;
+    EXPECT_TRUE(ResolveDeviceMemoryPreRegistration(config, "HCCS").Success());
+    EXPECT_FALSE(config.enableDeviceMemoryPreRegistration);
+    EXPECT_TRUE(ResolveDeviceMemoryPreRegistration(config, "invalid").Success());
+    EXPECT_FALSE(config.enableDeviceMemoryPreRegistration);
+
+    config.enableRemoteH2D = true;
+    EXPECT_TRUE(ResolveDeviceMemoryPreRegistration(config, nullptr).Success());
+    EXPECT_FALSE(config.enableDeviceMemoryPreRegistration);
+    EXPECT_TRUE(ResolveDeviceMemoryPreRegistration(config, "").Success());
+    EXPECT_FALSE(config.enableDeviceMemoryPreRegistration);
+    EXPECT_TRUE(ResolveDeviceMemoryPreRegistration(config, "ROCE").Success());
+    EXPECT_FALSE(config.enableDeviceMemoryPreRegistration);
+    EXPECT_TRUE(ResolveDeviceMemoryPreRegistration(config, "HCCS").Success());
+    EXPECT_TRUE(config.enableDeviceMemoryPreRegistration);
+}
+
+TEST(YuanRongHelperTest, DeviceMemoryPreRegistrationRejectsInvalidLinkType)
+{
+    using namespace UC::YuanRongStore;
+
+    Config config;
+    config.enableRemoteH2D = true;
+    auto status = ResolveDeviceMemoryPreRegistration(config, "invalid");
+
+    EXPECT_TRUE(status.Failure());
+    EXPECT_FALSE(config.enableDeviceMemoryPreRegistration);
+}
+
 TEST(YuanRongHelperTest, BuildKeysAndBlobsMapsShardToOneContiguousYuanRongObject)
 {
     using namespace UC::YuanRongStore;

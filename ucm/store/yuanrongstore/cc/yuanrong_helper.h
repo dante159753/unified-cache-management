@@ -40,6 +40,21 @@
 
 namespace UC::YuanRongStore {
 
+inline Status ResolveDeviceMemoryPreRegistration(Config& config, const char* linkTypeEnv)
+{
+    config.enableDeviceMemoryPreRegistration = false;
+    if (!config.enableRemoteH2D) { return Status::OK(); }
+
+    const std::string linkType =
+        linkTypeEnv == nullptr || *linkTypeEnv == '\0' ? "ROCE" : linkTypeEnv;
+    if (linkType != "ROCE" && linkType != "HCCS") {
+        return Status::InvalidParam("DS_RH2D_LINK_TYPE must be ROCE or HCCS");
+    }
+
+    config.enableDeviceMemoryPreRegistration = linkType == "HCCS";
+    return Status::OK();
+}
+
 inline std::string BlockIdToHex(const Detail::BlockId& block)
 {
     constexpr char hex[] = "0123456789abcdef";
