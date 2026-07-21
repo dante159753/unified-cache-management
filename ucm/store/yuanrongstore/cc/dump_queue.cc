@@ -23,6 +23,7 @@
  * */
 #include "dump_queue.h"
 #include <algorithm>
+#include <exception>
 #include <fmt/format.h>
 #include "logger/logger.h"
 #ifdef __linux__
@@ -45,67 +46,132 @@ Status DumpQueue::Setup(const Config& config, TaskIdSet* failureSet,
     heteroClient_ = std::move(heteroClient);
     kvClient_ = std::move(kvClient);
     backend_ = config.storeBackend;
-    waiting_.Setup(config.waitingQueueDepth);
+    ready_.Setup(config.waitingQueueDepth);
     reaping_.Setup(config.reaperQueueDepth);
+    closing_.store(false, std::memory_order_release);
+    stopD2H_.store(false, std::memory_order_release);
+    stopReaper_.store(false, std::memory_order_release);
+    pendingCount_.store(0, std::memory_order_release);
 
-    std::promise<Status> started;
-    auto future = started.get_future();
-    worker_ = std::thread{&DumpQueue::WorkerStage, this, std::ref(started)};
-    auto s = future.get();
-    if (s.Failure()) { return s; }
-    reaper_ = std::thread{&DumpQueue::ReaperStage, this};
+    Trans::Device validationDevice;
+    auto validationStatus = validationDevice.Setup(config_.deviceId);
+    if (validationStatus.Failure()) { return validationStatus; }
+    if (!validationDevice.MakeSharedStream()) {
+        return Status::Error("failed to create YuanRong prerequisite stream");
+    }
+
+    try {
+        std::promise<Status> d2hStarted;
+        auto d2hStatus = d2hStarted.get_future();
+        d2hWorker_ = std::thread{&DumpQueue::D2HStage, this, std::ref(d2hStarted)};
+        auto status = d2hStatus.get();
+        if (status.Failure()) {
+            d2hWorker_.join();
+            return status;
+        }
+
+        prerequisitePool_ =
+            std::make_unique<ThreadPool<DumpTaskContext, std::shared_ptr<WorkerContext>>>();
+        auto prerequisiteStarted =
+            prerequisitePool_
+                ->SetWorkerInitFn([this](auto& worker) {
+                    try {
+                        worker = std::make_shared<WorkerContext>();
+                        worker->status = worker->device.Setup(config_.deviceId);
+                    } catch (const std::exception& e) {
+                        worker.reset();
+                        UC_ERROR("Failed({}) to initialize YuanRong prerequisite worker.",
+                                 e.what());
+                    }
+                    if (worker && worker->status.Success()) {
+                        worker->prerequisiteStream = worker->device.MakeSharedStream();
+                        if (!worker->prerequisiteStream) {
+                            worker->status =
+                                Status::Error("failed to create YuanRong prerequisite stream");
+                        }
+                    }
+                    return true;
+                })
+                .SetWorkerFn(
+                    [this](auto& context, const auto& worker) { RunPrerequisite(context, worker); })
+                .SetNWorker(config_.dumpPrerequisiteWorkerCount)
+                .SetCpuAffinity(config_.cpuAffinityCores)
+                .Run();
+        if (!prerequisiteStarted) {
+            prerequisitePool_.reset();
+            stopD2H_.store(true, std::memory_order_release);
+            d2hWorker_.join();
+            return Status::Error("failed to start YuanRong prerequisite worker pool");
+        }
+        reaper_ = std::thread{&DumpQueue::ReaperStage, this};
+    } catch (const std::exception& e) {
+        prerequisitePool_.reset();
+        stopD2H_.store(true, std::memory_order_release);
+        if (d2hWorker_.joinable()) { d2hWorker_.join(); }
+        return Status::Error(fmt::format("failed to start YuanRong dump pipeline: {}", e.what()));
+    }
     return Status::OK();
 }
 
 void DumpQueue::Close()
 {
-    if (stop_.exchange(true)) { return; }
-    if (worker_.joinable()) { worker_.join(); }
-    if (reaper_.joinable()) { reaper_.join(); }
-
-    TaskPair pair;
-    while (waiting_.TryPop(pair)) {
-        failureSet_->Insert(pair.first->id);
-        pair.second->Done();
+    {
+        std::lock_guard<std::mutex> lock(submitMutex_);
+        if (closing_.exchange(true)) { return; }
     }
+
+    auto cancel = [this](DumpTaskContext& context) {
+        Finish(context, Status::Error("YuanRong dump pipeline is closing"));
+    };
+    auto all = [](const DumpTaskContext&) { return true; };
+
+    if (prerequisitePool_) {
+        prerequisitePool_->TraverseWaitQueue(all, cancel, {});
+        // Running prerequisite tasks are allowed to hand off to D2H before this returns.
+        prerequisitePool_.reset();
+    }
+    stopD2H_.store(true, std::memory_order_release);
+    if (d2hWorker_.joinable()) { d2hWorker_.join(); }
+    DumpTaskContext readyContext;
+    while (ready_.TryPop(readyContext)) { cancel(readyContext); }
+
+    stopReaper_.store(true, std::memory_order_release);
+    if (reaper_.joinable()) { reaper_.join(); }
     DumpContext context;
     while (reaping_.TryPop(context)) { Reap(std::move(context)); }
+}
+
+void DumpQueue::D2HStage(std::promise<Status>& started)
+{
+    Trans::Device device;
+    auto status = device.Setup(config_.deviceId);
+    started.set_value(status);
+    if (status.Failure()) { return; }
+#ifdef __linux__
+    if (!config_.cpuAffinityCores.empty()) {
+        auto s = CpuAffinity::SetCpuAffinity4CurrentThread(config_.cpuAffinityCores);
+        if (s.Failure()) { UC_WARN("Failed({}) to set YuanRong D2H affinity.", s); }
+    }
+#endif
+    ready_.ConsumerLoop(stopD2H_, &DumpQueue::RunD2H, this);
 }
 
 void DumpQueue::Submit(TaskPtr task, WaiterPtr waiter)
 {
     waiter->Up();
-    std::lock_guard<std::mutex> lock(submitMutex_);
-    if (waiting_.TryPush({task, waiter})) { return; }
-    UC_ERROR("YuanRong dump queue full, task({}) rejected.", task->id);
-    failureSet_->Insert(task->id);
-    waiter->Done();
-}
-
-void DumpQueue::WorkerStage(std::promise<Status>& started)
-{
-    Trans::Device device;
-    auto s = device.Setup(config_.deviceId);
-    if (s.Failure()) {
-        started.set_value(s);
-        return;
-    }
-    auto prerequisiteStream = device.MakeSharedStream();
-    if (!prerequisiteStream) {
-        started.set_value(Status::Error("failed to create prerequisite stream"));
-        return;
-    }
-    started.set_value(Status::OK());
-
-#ifdef __linux__
-    if (!config_.cpuAffinityCores.empty()) {
-        auto affinityStatus = CpuAffinity::SetCpuAffinity4CurrentThread(config_.cpuAffinityCores);
-        if (affinityStatus.Failure()) {
-            UC_WARN("Failed({}) to set YuanRong dump affinity.", affinityStatus);
+    {
+        std::lock_guard<std::mutex> lock(submitMutex_);
+        if (!closing_.load(std::memory_order_acquire) && prerequisitePool_ &&
+            pendingCount_.load(std::memory_order_relaxed) < config_.waitingQueueDepth) {
+            pendingCount_.fetch_add(1, std::memory_order_relaxed);
+            prerequisitePool_->Push(DumpTaskContext{task, waiter, NowTime::Now(), 0.0, 0.0});
+            return;
         }
     }
-#endif
-    waiting_.ConsumerLoop(stop_, &DumpQueue::RunOne, this, prerequisiteStream);
+    UC_ERROR("YuanRong dump pipeline unavailable or full, task({}) rejected, pending={}/{}.",
+             task->id, pendingCount_.load(std::memory_order_relaxed), config_.waitingQueueDepth);
+    failureSet_->Insert(task->id);
+    waiter->Done();
 }
 
 void DumpQueue::ReaperStage()
@@ -116,36 +182,73 @@ void DumpQueue::ReaperStage()
         if (s.Failure()) { UC_WARN("Failed({}) to set YuanRong reaper affinity.", s); }
     }
 #endif
-    reaping_.ConsumerLoop(stop_, &DumpQueue::Reap, this);
+    reaping_.ConsumerLoop(stopReaper_, &DumpQueue::Reap, this);
 }
 
-void DumpQueue::RunOne(std::shared_ptr<Trans::Stream>& prerequisiteStream, TaskPair&& pair)
+void DumpQueue::RunPrerequisite(DumpTaskContext& context,
+                                const std::shared_ptr<WorkerContext>& worker)
 {
-    auto& task = pair.first;
-    auto& waiter = pair.second;
-    if (!failureSet_->Contains(task->id)) {
-        auto s = DumpOne(task, prerequisiteStream);
-        if (s.Failure()) {
-            UC_ERROR("YuanRong dump task({}) failed: {}.", task->id, s);
-            failureSet_->Insert(task->id);
-        }
+    if (!worker) {
+        Finish(context, Status::OutOfMemory());
+        return;
     }
+    if (worker->status.Failure()) {
+        Finish(context, worker->status);
+        return;
+    }
+    if (failureSet_->Contains(context.task->id)) {
+        Finish(context, Status::Error("YuanRong dump task was already marked failed"));
+        return;
+    }
+
+    context.prerequisiteStart = NowTime::Now();
+    auto status = Status::OK();
+    if (context.task->desc.prerequisiteHandle != 0) {
+        status = worker->prerequisiteStream->WaitEvent(
+            reinterpret_cast<void*>(context.task->desc.prerequisiteHandle));
+        if (status.Success()) { status = worker->prerequisiteStream->Synchronized(); }
+    }
+    context.prerequisiteEnd = NowTime::Now();
+    if (status.Failure()) {
+        Finish(context, status);
+        return;
+    }
+    std::lock_guard<std::mutex> lock(readySubmitMutex_);
+    ready_.Push(std::move(context));
+}
+
+void DumpQueue::RunD2H(DumpTaskContext&& context)
+{
+    auto status = Status::OK();
+    if (!failureSet_->Contains(context.task->id)) {
+        const auto prerequisiteQueueWaitMs = (context.prerequisiteStart - context.submitTime) * 1e3;
+        const auto prerequisiteMs = (context.prerequisiteEnd - context.prerequisiteStart) * 1e3;
+        const auto d2hQueueWaitMs = (NowTime::Now() - context.prerequisiteEnd) * 1e3;
+        status = DumpReadyTask(context.task, prerequisiteQueueWaitMs, prerequisiteMs,
+                               d2hQueueWaitMs, context.submitTime);
+    }
+    Finish(context, status);
+}
+
+void DumpQueue::Finish(DumpTaskContext& context, const Status& status)
+{
+    if (!context.waiter) { return; }
+    if (status.Failure()) {
+        UC_ERROR("YuanRong dump task({}) failed: {}.", context.task->id, status);
+        failureSet_->Insert(context.task->id);
+    }
+    auto previous = pendingCount_.fetch_sub(1, std::memory_order_relaxed);
+    if (previous == 0) {
+        pendingCount_.store(0, std::memory_order_relaxed);
+        UC_ERROR("YuanRong dump pending task counter underflow for task({}).", context.task->id);
+    }
+    auto waiter = std::move(context.waiter);
     waiter->Done();
 }
 
-Status DumpQueue::DumpOne(TaskPtr task, const std::shared_ptr<Trans::Stream>& prerequisiteStream)
+Status DumpQueue::DumpReadyTask(TaskPtr task, double prerequisiteQueueWaitMs, double prerequisiteMs,
+                                double d2hQueueWaitMs, double pipelineStart)
 {
-    auto taskStart = NowTime::Now();
-    auto prereqStart = taskStart;
-    if (task->desc.prerequisiteHandle != 0) {
-        auto s =
-            prerequisiteStream->WaitEvent(reinterpret_cast<void*>(task->desc.prerequisiteHandle));
-        if (s.Failure()) { return s; }
-        s = prerequisiteStream->Synchronized();
-        if (s.Failure()) { return s; }
-    }
-    auto prereqEnd = NowTime::Now();
-
     std::vector<std::string> keys;
     std::vector<datasystem::DeviceBlobList> blobLists;
     auto s = BuildKeysAndBlobs(config_, task->desc, keys, blobLists);
@@ -163,10 +266,11 @@ Status DumpQueue::DumpOne(TaskPtr task, const std::shared_ptr<Trans::Stream>& pr
     auto dumpStatus = heteroClient_->MSetD2H(keys, blobLists, setParam, &localSetKeys);
     auto publishEnd = NowTime::Now();
     UC_INFO(
-        "YuanRong dump task({}) MSetD2H keys={}, local_set={}, bytes={}, prereq={:.3f}ms, "
+        "YuanRong dump task({}) MSetD2H keys={}, local_set={}, bytes={}, "
+        "prereq_queue={:.3f}ms, prereq={:.3f}ms, d2h_queue={:.3f}ms, "
         "d2h={:.3f}ms, status={}.",
-        task->id, keys.size(), localSetKeys.size(), totalBytes, (prereqEnd - prereqStart) * 1e3,
-        (publishEnd - d2hStart) * 1e3, dumpStatus.ToString());
+        task->id, keys.size(), localSetKeys.size(), totalBytes, prerequisiteQueueWaitMs,
+        prerequisiteMs, d2hQueueWaitMs, (publishEnd - d2hStart) * 1e3, dumpStatus.ToString());
     if (localSetKeys.empty()) {
         if (dumpStatus.IsError()) {
             return Status::Error(
@@ -188,7 +292,7 @@ Status DumpQueue::DumpOne(TaskPtr task, const std::shared_ptr<Trans::Stream>& pr
     }
     if (backend_ == nullptr) {
         UC_DEBUG("YuanRong dump task({}) finished without backend, local_set={}, total={:.3f}ms.",
-                 task->id, keys.size(), (NowTime::Now() - taskStart) * 1e3);
+                 task->id, keys.size(), (NowTime::Now() - pipelineStart) * 1e3);
         return Status::OK();
     }
 
@@ -287,7 +391,7 @@ Status DumpQueue::DumpOne(TaskPtr task, const std::shared_ptr<Trans::Stream>& pr
         "d2h_to_backend_submit={:.3f}ms, total={:.3f}ms.",
         task->id, backendKeyCount, keys.size(), (metaEnd - metaStart) * 1e3,
         (kvGetEnd - kvGetStart) * 1e3, (backendSubmitEnd - kvGetEnd) * 1e3,
-        (backendSubmitEnd - publishEnd) * 1e3, (backendSubmitEnd - taskStart) * 1e3);
+        (backendSubmitEnd - publishEnd) * 1e3, (backendSubmitEnd - pipelineStart) * 1e3);
     reaping_.Push(DumpContext{task->id, backendResult.Value(), std::move(lockedBuffers)});
     return Status::OK();
 }

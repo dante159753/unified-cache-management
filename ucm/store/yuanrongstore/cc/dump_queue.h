@@ -37,6 +37,8 @@
 #include "template/hashset.h"
 #include "template/spsc_ring_queue.h"
 #include "thread/latch.h"
+#include "thread/thread_pool.h"
+#include "trans/device.h"
 #include "trans/stream.h"
 #include "trans_task.h"
 #include "ucmstore_v1.h"
@@ -47,8 +49,21 @@ namespace UC::YuanRongStore {
 class DumpQueue {
     using TaskPtr = std::shared_ptr<TransTask>;
     using WaiterPtr = std::shared_ptr<Latch>;
-    using TaskPair = std::pair<TaskPtr, WaiterPtr>;
     using TaskIdSet = HashSet<Detail::TaskHandle>;
+
+    struct DumpTaskContext {
+        TaskPtr task;
+        WaiterPtr waiter;
+        double submitTime{0.0};
+        double prerequisiteStart{0.0};
+        double prerequisiteEnd{0.0};
+    };
+
+    struct WorkerContext {
+        Status status{Status::OK()};
+        Trans::Device device;
+        std::shared_ptr<Trans::Stream> prerequisiteStream;
+    };
 
     struct DumpContext {
         Detail::TaskHandle ownerTaskId{0};
@@ -56,16 +71,21 @@ class DumpQueue {
         std::vector<datasystem::Optional<datasystem::ReadOnlyBuffer>> buffers;
     };
 
-    alignas(64) std::atomic_bool stop_{false};
+    alignas(64) std::atomic_bool closing_{false};
+    alignas(64) std::atomic_bool stopD2H_{false};
+    alignas(64) std::atomic_bool stopReaper_{false};
+    alignas(64) std::atomic_size_t pendingCount_{0};
     TaskIdSet* failureSet_{nullptr};
     Config config_{};
     std::shared_ptr<datasystem::HeteroClient> heteroClient_;
     std::shared_ptr<datasystem::KVClient> kvClient_;
     StoreV1* backend_{nullptr};
-    SpscRingQueue<TaskPair> waiting_;
+    SpscRingQueue<DumpTaskContext> ready_;
     SpscRingQueue<DumpContext> reaping_;
     std::mutex submitMutex_;
-    std::thread worker_;
+    std::mutex readySubmitMutex_;
+    std::unique_ptr<ThreadPool<DumpTaskContext, std::shared_ptr<WorkerContext>>> prerequisitePool_;
+    std::thread d2hWorker_;
     std::thread reaper_;
 
 public:
@@ -77,10 +97,13 @@ public:
 
 private:
     void Close();
-    void WorkerStage(std::promise<Status>& started);
+    void D2HStage(std::promise<Status>& started);
     void ReaperStage();
-    void RunOne(std::shared_ptr<Trans::Stream>& prerequisiteStream, TaskPair&& pair);
-    Status DumpOne(TaskPtr task, const std::shared_ptr<Trans::Stream>& prerequisiteStream);
+    void RunPrerequisite(DumpTaskContext& context, const std::shared_ptr<WorkerContext>& worker);
+    void RunD2H(DumpTaskContext&& context);
+    void Finish(DumpTaskContext& context, const Status& status);
+    Status DumpReadyTask(TaskPtr task, double prerequisiteQueueWaitMs, double prerequisiteMs,
+                         double d2hQueueWaitMs, double pipelineStart);
     void Reap(DumpContext&& context);
     static void ReleaseBuffers(
         std::vector<datasystem::Optional<datasystem::ReadOnlyBuffer>>& buffers);

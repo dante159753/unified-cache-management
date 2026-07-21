@@ -33,6 +33,7 @@
 #include "datasystem/kv_client.h"
 #include "logger/logger.h"
 #include "task_manager.h"
+#include "time/now_time.h"
 #include "ucmstore_v1.h"
 #include "yuanrong_config.h"
 #include "yuanrong_helper.h"
@@ -90,46 +91,73 @@ public:
     Expected<std::vector<uint8_t>> Lookup(const Detail::BlockId* blocks, size_t num) override
     {
         if (num == 0) { return std::vector<uint8_t>{}; }
-        std::vector<std::string> keys;
-        keys.reserve(num);
-        for (size_t i = 0; i < num; ++i) { keys.push_back(MakeLookupKey(config_, blocks[i])); }
-
-        std::vector<bool> exists;
-        auto status = heteroClient_->Exist(keys, exists);
-        if (status.IsError() && exists.empty()) {
-            return Status::Error("YuanRong Exist failed: " + status.ToString());
-        }
-        if (exists.size() != num) {
-            return Status::Error("YuanRong Exist returned an unexpected result size");
-        }
+        auto lookupResult = LookupYuanRong(blocks, num);
+        if (!lookupResult) { return lookupResult.Error(); }
+        const auto& exists = lookupResult.Value();
 
         std::vector<uint8_t> result(num, 0);
-        bool hasMiss = false;
+        std::vector<Detail::BlockId> missBlocks;
+        std::vector<size_t> missIndexes;
+        missBlocks.reserve(num);
+        missIndexes.reserve(num);
         for (size_t i = 0; i < num; ++i) {
             result[i] = exists[i] ? 1 : 0;
-            hasMiss = hasMiss || !exists[i];
+            if (!exists[i]) {
+                missBlocks.push_back(blocks[i]);
+                missIndexes.push_back(i);
+            }
         }
-        if (!hasMiss || config_.storeBackend == nullptr) { return result; }
+        if (missBlocks.empty() || config_.storeBackend == nullptr) { return result; }
 
-        auto backendResult = config_.storeBackend->Lookup(blocks, num);
+        auto backendStart = NowTime::Now();
+        auto backendResult = config_.storeBackend->Lookup(missBlocks.data(), missBlocks.size());
+        auto backendEnd = NowTime::Now();
         if (!backendResult) { return backendResult.Error(); }
         const auto& backendExists = backendResult.Value();
-        if (backendExists.size() != num) {
+        if (backendExists.size() != missBlocks.size()) {
             return Status::Error("backend Lookup returned an unexpected result size");
         }
-        for (size_t i = 0; i < num; ++i) { result[i] = result[i] || backendExists[i]; }
+        for (size_t i = 0; i < missIndexes.size(); ++i) {
+            result[missIndexes[i]] = backendExists[i];
+        }
+        UC_DEBUG("YuanRong Lookup queried Posix misses={}/{}, cost={:.3f}ms.", missBlocks.size(),
+                 num, (backendEnd - backendStart) * 1e3);
         return result;
     }
 
     Expected<ssize_t> LookupOnPrefix(const Detail::BlockId* blocks, size_t num) override
     {
-        auto result = Lookup(blocks, num);
-        if (!result) { return result.Error(); }
-        const auto& exists = result.Value();
-        for (size_t i = 0; i < exists.size(); ++i) {
-            if (!exists[i]) { return static_cast<ssize_t>(i) - 1; }
+        if (num == 0) { return static_cast<ssize_t>(-1); }
+        auto lookupResult = LookupYuanRong(blocks, num);
+        if (!lookupResult) { return lookupResult.Error(); }
+        const auto& exists = lookupResult.Value();
+
+        std::vector<Detail::BlockId> missBlocks;
+        std::vector<size_t> missIndexes;
+        missBlocks.reserve(num);
+        missIndexes.reserve(num);
+        for (size_t i = 0; i < num; ++i) {
+            if (!exists[i]) {
+                missBlocks.push_back(blocks[i]);
+                missIndexes.push_back(i);
+            }
         }
-        return static_cast<ssize_t>(exists.size()) - 1;
+        if (missBlocks.empty()) { return static_cast<ssize_t>(num) - 1; }
+        if (config_.storeBackend == nullptr) {
+            return static_cast<ssize_t>(missIndexes.front()) - 1;
+        }
+
+        auto backendStart = NowTime::Now();
+        auto backendResult =
+            config_.storeBackend->LookupOnPrefix(missBlocks.data(), missBlocks.size());
+        auto backendEnd = NowTime::Now();
+        if (!backendResult) { return backendResult.Error(); }
+        ssize_t result = -1;
+        auto status = ResolveTieredPrefixHit(num, missIndexes, backendResult.Value(), result);
+        if (status.Failure()) { return status; }
+        UC_DEBUG("YuanRong LookupOnPrefix queried Posix misses={}/{}, cost={:.3f}ms, result={}.",
+                 missBlocks.size(), num, (backendEnd - backendStart) * 1e3, result);
+        return result;
     }
 
     void Prefetch(const Detail::BlockId* blocks, size_t num) override
@@ -186,6 +214,28 @@ public:
     }
 
 private:
+    Expected<std::vector<bool>> LookupYuanRong(const Detail::BlockId* blocks, size_t num)
+    {
+        std::vector<std::string> keys;
+        keys.reserve(num);
+        for (size_t i = 0; i < num; ++i) { keys.push_back(MakeLookupKey(config_, blocks[i])); }
+
+        std::vector<bool> exists;
+        auto start = NowTime::Now();
+        auto status = heteroClient_->Exist(keys, exists);
+        auto end = NowTime::Now();
+        if (status.IsError() && exists.empty()) {
+            return Status::Error("YuanRong Exist failed: " + status.ToString());
+        }
+        if (exists.size() != num) {
+            return Status::Error("YuanRong Exist returned an unexpected result size");
+        }
+        const auto hitCount = std::count(exists.begin(), exists.end(), true);
+        UC_DEBUG("YuanRong Lookup Exist keys={}, hit={}, cost={:.3f}ms, status={}.", num, hitCount,
+                 (end - start) * 1e3, status.ToString());
+        return exists;
+    }
+
     static Config ParseConfig(const Detail::Dictionary& input)
     {
         Config config;
@@ -202,6 +252,8 @@ private:
         input.GetNumber("yuanrong_timeout_ms", config.timeoutMs);
         input.GetNumber("yuanrong_waiting_queue_depth", config.waitingQueueDepth);
         input.GetNumber("yuanrong_load_worker_count", config.loadWorkerCount);
+        input.GetNumber("yuanrong_dump_prerequisite_worker_count",
+                        config.dumpPrerequisiteWorkerCount);
         input.GetNumber("yuanrong_recovery_batch_size", config.recoveryBatchSize);
         input.GetNumber("yuanrong_host_buffer_count", config.hostBufferCount);
         config.hostBufferCountExplicit = config.hostBufferCount != 0;
@@ -266,6 +318,10 @@ private:
         }
         if (config.loadWorkerCount == 0) {
             return Status::InvalidParam("yuanrong_load_worker_count must be greater than 0");
+        }
+        if (config.dumpPrerequisiteWorkerCount == 0) {
+            return Status::InvalidParam(
+                "yuanrong_dump_prerequisite_worker_count must be greater than 0");
         }
         if (config.h2dStreamCount == 0) {
             return Status::InvalidParam("yuanrong_h2d_stream_count must be greater than 0");
@@ -358,6 +414,7 @@ private:
         UC_INFO("{}::PosixIoEngine = {}", name, config.posixIoEngine);
         UC_INFO("{}::TimeoutMs = {}", name, config.timeoutMs);
         UC_INFO("{}::LoadWorkerCount = {}", name, config.loadWorkerCount);
+        UC_INFO("{}::DumpPrerequisiteWorkerCount = {}", name, config.dumpPrerequisiteWorkerCount);
         UC_INFO("{}::RecoveryBatchSize = {}", name, config.recoveryBatchSize);
         UC_INFO("{}::HostBufferCount = {}", name, config.hostBufferCount);
         UC_INFO("{}::HostBufferCountSource = {}", name,

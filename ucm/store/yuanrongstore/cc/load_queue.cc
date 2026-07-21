@@ -178,6 +178,105 @@ Status LoadQueue::LoadOne(CopyStream& stream, TaskPtr task)
     if (s.Failure()) { return s; }
     if (keys.empty()) { return Status::OK(); }
 
+    if (backend_ == nullptr) { return LoadThenRecover(stream, task, keys, blobLists, taskStart); }
+
+    auto existStart = NowTime::Now();
+    std::vector<bool> exists;
+    auto existStatus = heteroClient_->Exist(keys, exists);
+    auto existEnd = NowTime::Now();
+    if (existStatus.IsError() || exists.size() != keys.size()) {
+        UC_WARN(
+            "YuanRong load task({}) Exist cannot split keys, result={}/{}, cost={:.3f}ms, "
+            "status={}; falling back to MGetH2D-first load.",
+            task->id, exists.size(), keys.size(), (existEnd - existStart) * 1e3,
+            existStatus.ToString());
+        return LoadThenRecover(stream, task, keys, blobLists, taskStart);
+    }
+
+    std::vector<size_t> hitIndexes;
+    std::vector<size_t> missIndexes;
+    PartitionExistence(exists, hitIndexes, missIndexes);
+    UC_INFO("YuanRong load task({}) Exist keys={}, hit={}, miss={}, cost={:.3f}ms, status={}.",
+            task->id, keys.size(), hitIndexes.size(), missIndexes.size(),
+            (existEnd - existStart) * 1e3, existStatus.ToString());
+
+    if (hitIndexes.empty()) {
+        return RecoverFromBackend(stream, task, keys, blobLists, missIndexes);
+    }
+    if (missIndexes.empty()) { return LoadThenRecover(stream, task, keys, blobLists, taskStart); }
+
+    std::vector<std::string> hitKeys;
+    std::vector<datasystem::DeviceBlobList> hitBlobLists;
+    hitKeys.reserve(hitIndexes.size());
+    hitBlobLists.reserve(hitIndexes.size());
+    for (auto index : hitIndexes) {
+        hitKeys.push_back(keys[index]);
+        hitBlobLists.push_back(blobLists[index]);
+    }
+
+    std::shared_future<datasystem::AsyncResult> getFuture;
+    auto getStart = NowTime::Now();
+    try {
+        getFuture = heteroClient_->AsyncMGetH2D(hitKeys, hitBlobLists, 0);
+    } catch (const std::exception& e) {
+        UC_WARN("Failed({}) to start YuanRong AsyncMGetH2D; using sequential mode.", e.what());
+    }
+
+    auto backendStart = NowTime::Now();
+    auto backendStatus = RecoverFromBackend(stream, task, keys, blobLists, missIndexes);
+    auto backendEnd = NowTime::Now();
+
+    std::vector<std::string> failedHitKeys;
+    bool getFailed = false;
+    std::string getStatusText;
+    auto getWaitStart = NowTime::Now();
+    if (getFuture.valid()) {
+        try {
+            auto result = getFuture.get();
+            failedHitKeys = std::move(result.failedList);
+            getFailed = result.status.IsError();
+            getStatusText = result.status.ToString();
+        } catch (const std::exception& e) {
+            getFailed = true;
+            getStatusText = fmt::format("AsyncMGetH2D future failed: {}", e.what());
+        }
+    } else {
+        constexpr int32_t mgetTimeoutMs = 0;
+        auto status = heteroClient_->MGetH2D(hitKeys, hitBlobLists, failedHitKeys, mgetTimeoutMs);
+        getFailed = status.IsError();
+        getStatusText = status.ToString();
+    }
+    auto getEnd = NowTime::Now();
+    auto failedHitSubsetIndexes = FailedIndexes(hitKeys, failedHitKeys, getFailed);
+    std::vector<size_t> racedMissIndexes;
+    racedMissIndexes.reserve(failedHitSubsetIndexes.size());
+    for (auto index : failedHitSubsetIndexes) { racedMissIndexes.push_back(hitIndexes[index]); }
+    UC_INFO(
+        "YuanRong load task({}) parallel AsyncMGetH2D keys={}, bytes={}, raced_miss={}, "
+        "window={:.3f}ms, join_wait={:.3f}ms, Posix={:.3f}ms, rc={}.",
+        task->id, hitKeys.size(), TotalBlobBytes(hitBlobLists), racedMissIndexes.size(),
+        (getEnd - getStart) * 1e3, (getEnd - getWaitStart) * 1e3, (backendEnd - backendStart) * 1e3,
+        getStatusText);
+
+    auto firstFailure = std::move(backendStatus);
+
+    if (!racedMissIndexes.empty()) {
+        auto status = RecoverFromBackend(stream, task, keys, blobLists, racedMissIndexes);
+        if (firstFailure.Success() && status.Failure()) { firstFailure = std::move(status); }
+    }
+    UC_INFO(
+        "YuanRong load task({}) parallel load finished, hit={}, posix_miss={}, raced_miss={}, "
+        "total={:.3f}ms, status={}.",
+        task->id, hitIndexes.size(), missIndexes.size(), racedMissIndexes.size(),
+        (NowTime::Now() - taskStart) * 1e3, firstFailure.ToString());
+    return firstFailure;
+}
+
+Status LoadQueue::LoadThenRecover(CopyStream& stream, TaskPtr task,
+                                  const std::vector<std::string>& keys,
+                                  const std::vector<datasystem::DeviceBlobList>& blobLists,
+                                  double taskStart)
+{
     std::vector<std::string> failedKeys;
     constexpr int32_t mgetTimeoutMs = 0;
     auto getStart = NowTime::Now();

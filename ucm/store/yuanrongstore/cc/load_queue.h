@@ -85,6 +85,9 @@ private:
     void WorkerStage(size_t workerIndex, std::promise<Status> started);
     void RunOne(CopyStream& stream, TaskPair&& pair);
     Status LoadOne(CopyStream& stream, TaskPtr task);
+    Status LoadThenRecover(CopyStream& stream, TaskPtr task, const std::vector<std::string>& keys,
+                           const std::vector<datasystem::DeviceBlobList>& blobLists,
+                           double taskStart);
     Status RecoverFromBackend(CopyStream& stream, TaskPtr task,
                               const std::vector<std::string>& keys,
                               const std::vector<datasystem::DeviceBlobList>& blobLists,

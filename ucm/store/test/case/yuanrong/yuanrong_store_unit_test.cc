@@ -40,6 +40,13 @@ UC::Detail::BlockId MakeBlock(std::initializer_list<uint8_t> bytes)
 
 }  // namespace
 
+TEST(YuanRongConfigTest, DumpPipelineUsesConservativeWorkerDefaults)
+{
+    UC::YuanRongStore::Config config;
+
+    EXPECT_EQ(config.dumpPrerequisiteWorkerCount, 2);
+}
+
 TEST(YuanRongHelperTest, DeviceMemoryPreRegistrationRequiresRemoteH2DAndHccs)
 {
     using namespace UC::YuanRongStore;
@@ -183,6 +190,38 @@ TEST(YuanRongHelperTest, FailedIndexesHandlesTotalFailureAndPartialFailure)
     ASSERT_EQ(partial.size(), 2);
     EXPECT_EQ(partial[0], 0);
     EXPECT_EQ(partial[1], 2);
+}
+
+TEST(YuanRongHelperTest, PartitionExistencePreservesOriginalIndexes)
+{
+    using namespace UC::YuanRongStore;
+
+    std::vector<size_t> hitIndexes;
+    std::vector<size_t> missIndexes;
+    PartitionExistence({true, false, true, false, false}, hitIndexes, missIndexes);
+
+    EXPECT_EQ(hitIndexes, (std::vector<size_t>{0, 2}));
+    EXPECT_EQ(missIndexes, (std::vector<size_t>{1, 3, 4}));
+
+    PartitionExistence({}, hitIndexes, missIndexes);
+    EXPECT_TRUE(hitIndexes.empty());
+    EXPECT_TRUE(missIndexes.empty());
+}
+
+TEST(YuanRongHelperTest, TieredPrefixMapsBackendMissToOriginalIndex)
+{
+    using namespace UC::YuanRongStore;
+
+    const std::vector<size_t> missIndexes{1, 4, 7};
+    ssize_t result = -1;
+
+    EXPECT_TRUE(ResolveTieredPrefixHit(10, missIndexes, -1, result).Success());
+    EXPECT_EQ(result, 0);
+    EXPECT_TRUE(ResolveTieredPrefixHit(10, missIndexes, 0, result).Success());
+    EXPECT_EQ(result, 3);
+    EXPECT_TRUE(ResolveTieredPrefixHit(10, missIndexes, 2, result).Success());
+    EXPECT_EQ(result, 9);
+    EXPECT_TRUE(ResolveTieredPrefixHit(10, missIndexes, 3, result).Failure());
 }
 
 TEST(YuanRongHelperTest, SelectYuanRongObjectsByKeysKeepsInputOrderAndAlignedShards)

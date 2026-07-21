@@ -17,6 +17,8 @@ ucm_connectors:
       yuanrong_timeout_ms: 60000
       yuanrong_waiting_queue_depth: 8192
       yuanrong_load_worker_count: 4
+      # Workers blocked waiting for vLLM prerequisite events.
+      yuanrong_dump_prerequisite_worker_count: 2
       # Posix cold recovery pipeline batch size.
       yuanrong_recovery_batch_size: 32
       # 0 derives complete batches from load/backfill concurrency and the capacity limit.

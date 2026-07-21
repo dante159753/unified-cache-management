@@ -204,15 +204,14 @@ sequenceDiagram
 
 1. 构造 keys 和 `DeviceBlobList`。
 2. 等待 `TaskDesc::prerequisiteHandle`，确保 NPU 计算完成。
-3. 调用：
+3. 调用 `MSetD2H`，通过 `outLocalSetKeys` 获取本次调用在连接 Worker 上确认发布成功的 key：
 
 ```cpp
-heteroClient_->MSetD2H(keys, deviceBlobLists, setParam);
+heteroClient_->MSetD2H(keys, deviceBlobLists, setParam, &outLocalSetKeys);
 ```
 
-4. 调用 `HeteroClient::Exist` 校验全部 key 已发布。`MSetD2H` 的总 Status
-   只表示至少一个对象成功，不能单独作为整批成功依据。
-5. 如果没有 Posix 后端，Dump Task 成功。
+4. 不做 pre-Exist 或 post-Exist；Posix 只处理 `outLocalSetKeys`，不确定归属的 key 不落盘。
+5. 如果没有 Posix 后端，Dump Task 结束。
 6. 如果存在 Posix 后端，批量调用：
 
 ```cpp
@@ -587,6 +586,7 @@ flowchart TD
 
 ```yaml
 yuanrong_load_worker_count: 4
+yuanrong_dump_prerequisite_worker_count: 2
 yuanrong_recovery_batch_size: 32
 yuanrong_host_buffer_count: 0
 yuanrong_host_buffer_capacity_gb: 8
@@ -701,6 +701,7 @@ use_layerwise: false
 | `yuanrong_enable_remote_h2d` | 否 | `true` | YuanRong Remote H2D |
 | `yuanrong_memory_alignment` | 否 | `64` | UCM解析和构造composed object使用；Direct IO必须为`4096` |
 | `yuanrong_timeout_ms` | 否 | `60000` | SDK 调用超时 |
+| `yuanrong_dump_prerequisite_worker_count` | 否 | `2` | 并发等待Dump prerequisite event的worker数 |
 | `tensor_size_list` | worker 必选 | 自动生成 | 每个 device blob 的字节数 |
 | `device_id` | worker 必选 | - | NPU device id |
 | `storage_backends` | Posix 必选 | - | Posix 路径 |
@@ -811,7 +812,9 @@ extern "C" UC::StoreV1* MakeYuanRongStore();
 
 ```mermaid
 flowchart LR
-    DQ[Dump Queue] --> DW[Dump Worker]
+    DQ[Dump Queue] --> PP[Prerequisite Worker Pool]
+    PP --> RQ[Ready Queue]
+    RQ --> DW[Single D2H Worker]
     DW --> PR[Posix Reaper Queue]
     PR --> PW[Posix Reaper]
 
@@ -822,8 +825,8 @@ flowchart LR
 
 ### 6.1 Dump Worker
 
-- 等待 prerequisite。
-- 执行 `MSetD2H`。
+- prerequisite worker pool并发等待事件，数量由`yuanrong_dump_prerequisite_worker_count`控制。
+- 单个D2H worker串行执行`MSetD2H`，避免相同前缀并发发布冲突。
 - 获取 `ReadOnlyBuffer`。
 - 提交 Posix。
 - 将资源移交 Reaper。

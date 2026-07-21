@@ -218,6 +218,32 @@ inline std::vector<size_t> FailedIndexes(const std::vector<std::string>& keys,
     return result;
 }
 
+inline void PartitionExistence(const std::vector<bool>& exists, std::vector<size_t>& hitIndexes,
+                               std::vector<size_t>& missIndexes)
+{
+    hitIndexes.clear();
+    missIndexes.clear();
+    hitIndexes.reserve(exists.size());
+    missIndexes.reserve(exists.size());
+    for (size_t i = 0; i < exists.size(); ++i) {
+        (exists[i] ? hitIndexes : missIndexes).push_back(i);
+    }
+}
+
+inline Status ResolveTieredPrefixHit(size_t totalCount, const std::vector<size_t>& missIndexes,
+                                     ssize_t backendHit, ssize_t& result)
+{
+    if (backendHit < -1 || static_cast<size_t>(backendHit + 1) > missIndexes.size()) {
+        return Status::Error("backend LookupOnPrefix returned an unexpected result index");
+    }
+    if (static_cast<size_t>(backendHit + 1) == missIndexes.size()) {
+        result = static_cast<ssize_t>(totalCount) - 1;
+    } else {
+        result = static_cast<ssize_t>(missIndexes[backendHit + 1]) - 1;
+    }
+    return Status::OK();
+}
+
 inline std::vector<std::pair<size_t, size_t>> RecoveryBatchRanges(size_t count, size_t batchSize)
 {
     std::vector<std::pair<size_t, size_t>> ranges;
