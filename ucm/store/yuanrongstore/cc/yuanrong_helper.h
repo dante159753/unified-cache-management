@@ -164,6 +164,18 @@ inline size_t DeriveYuanRongHostBufferCount(size_t objectSize, size_t recoveryBa
     return static_cast<size_t>(selectedCount);
 }
 
+inline size_t DeriveYuanRongPosixDumpBatchSize(size_t objectSize, uint64_t maxInflightBytes)
+{
+    constexpr uint64_t targetBatchBytes = 256ULL << 20;
+    constexpr size_t maxBatchKeys = 32;
+    constexpr size_t targetInflightBatches = 4;
+    if (objectSize == 0 || maxInflightBytes < objectSize) { return 0; }
+
+    const auto bytesPerBatch = std::min(targetBatchBytes, maxInflightBytes / targetInflightBatches);
+    const auto keys = bytesPerBatch / static_cast<uint64_t>(objectSize);
+    return std::clamp<size_t>(static_cast<size_t>(keys), 1, maxBatchKeys);
+}
+
 inline Status SelectYuanRongObjectsByKeys(const std::vector<std::string>& selectedKeys,
                                           std::vector<std::string>& keys, Detail::TaskDesc& desc)
 {

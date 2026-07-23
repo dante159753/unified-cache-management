@@ -196,6 +196,7 @@ public:
 
     Status RegisterMemory(void* baseAddr, size_t totalSize) override
     {
+        UC_INFO("start Register");
         if (!config_.enableDeviceMemoryPreRegistration) { return Status::OK(); }
         if (baseAddr == nullptr) {
             return Status::InvalidParam("YuanRong device memory address cannot be null");
@@ -277,7 +278,7 @@ private:
         input.GetNumber("yuanrong_h2d_stream_count", config.h2dStreamCount);
         input.GetNumber("yuanrong_backfill_worker_count", config.backfillWorkerCount);
         input.GetNumber("yuanrong_backfill_queue_depth", config.backfillQueueDepth);
-        input.GetNumber("yuanrong_reaper_queue_depth", config.reaperQueueDepth);
+        input.GetNumber("yuanrong_posix_max_inflight_gb", config.posixMaxInflightGb);
         input.Get("cpu_affinity_cores", config.cpuAffinityCores);
         input.Get("io_direct", config.ioDirect);
         input.Get("posix_io_engine", config.posixIoEngine);
@@ -285,6 +286,7 @@ private:
         config.objectSize =
             std::accumulate(config.tensorSizes.begin(), config.tensorSizes.end(), size_t{0});
         DeriveHostBufferCount(config);
+        DerivePosixPersistence(config);
         return config;
     }
 
@@ -303,6 +305,19 @@ private:
         config.hostBufferCount = DeriveYuanRongHostBufferCount(
             config.objectSize, config.recoveryBatchSize, config.loadWorkerCount,
             config.backfillWorkerCount, capacityBytes);
+    }
+
+    static void DerivePosixPersistence(Config& config)
+    {
+        config.posixDumpBatchSize = 0;
+        if (config.storeBackend == nullptr || config.objectSize == 0 ||
+            config.posixMaxInflightGb == 0 ||
+            config.posixMaxInflightGb > (std::numeric_limits<uint64_t>::max() >> 30)) {
+            return;
+        }
+        const auto maxInflightBytes = static_cast<uint64_t>(config.posixMaxInflightGb) << 30;
+        config.posixDumpBatchSize =
+            DeriveYuanRongPosixDumpBatchSize(config.objectSize, maxInflightBytes);
     }
 
     static Status CheckConfig(const Config& config)
@@ -342,9 +357,11 @@ private:
         if (config.h2dStreamCount == 0) {
             return Status::InvalidParam("yuanrong_h2d_stream_count must be greater than 0");
         }
-        if (config.reaperQueueDepth <= 1) {
-            return Status::InvalidParam("yuanrong_reaper_queue_depth({}) must be greater than 1",
-                                        config.reaperQueueDepth);
+        if (config.storeBackend != nullptr &&
+            (config.posixMaxInflightGb == 0 ||
+             config.posixMaxInflightGb > (std::numeric_limits<size_t>::max() >> 30))) {
+            return Status::InvalidParam("invalid yuanrong_posix_max_inflight_gb({})",
+                                        config.posixMaxInflightGb);
         }
         if (config.storeBackend != nullptr && config.posixIoEngine != "psync" &&
             config.posixIoEngine != "aio") {
@@ -364,6 +381,12 @@ private:
             return Status::InvalidParam("invalid shard/block size");
         }
         if (config.storeBackend != nullptr) {
+            if (config.posixDumpBatchSize == 0) {
+                return Status::InvalidParam(
+                    "YuanRong object requires {} bytes, exceeding "
+                    "yuanrong_posix_max_inflight_gb({}GB)",
+                    config.objectSize, config.posixMaxInflightGb);
+            }
             if (config.recoveryBatchSize == 0) {
                 return Status::InvalidParam("yuanrong_recovery_batch_size must be greater than 0");
             }
@@ -441,6 +464,18 @@ private:
         UC_INFO("{}::H2DStreamCount = {}", name, config.h2dStreamCount);
         UC_INFO("{}::BackfillWorkerCount = {}", name, config.backfillWorkerCount);
         UC_INFO("{}::BackfillQueueDepth = {}", name, config.backfillQueueDepth);
+        const auto posixDumpBatchBytes = config.objectSize * config.posixDumpBatchSize;
+        const auto maxInflightBytes =
+            config.posixMaxInflightGb <= (std::numeric_limits<size_t>::max() >> 30)
+                ? config.posixMaxInflightGb << 30
+                : 0;
+        const auto maxInflightBatches =
+            posixDumpBatchBytes == 0 ? 0 : maxInflightBytes / posixDumpBatchBytes;
+        UC_INFO("{}::PersistenceQueueDepth = {}", name, kPersistenceQueueDepth);
+        UC_INFO("{}::PosixDumpBatchSize = {}", name, config.posixDumpBatchSize);
+        UC_INFO("{}::PosixDumpBatchBytes = {}", name, posixDumpBatchBytes);
+        UC_INFO("{}::PosixMaxInflightGb = {}", name, config.posixMaxInflightGb);
+        UC_INFO("{}::PosixMaxInflightBatches = {}", name, maxInflightBatches);
         UC_INFO("{}::StoreBackend = {}", name,
                 config.storeBackend ? config.storeBackend->Readme() : "none");
     }

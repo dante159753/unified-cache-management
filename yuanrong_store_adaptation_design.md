@@ -133,7 +133,8 @@ flowchart TB
 
 1. YuanRong hit 使用 `MGetH2D`；Posix miss 使用 UCM CopyStream 从 Pinned HostBuffer 直接 H2D。
 2. Dump 的 PosixStore 读取 YuanRong Host 指针；Load 的 PosixStore 写入 UCM Pinned HostBuffer。
-3. Dump 完成只保证 YuanRong D2H 成功且 Posix 异步任务提交成功，不等待磁盘写入完成。
+3. Dump 完成只保证 YuanRong D2H 成功；Posix 持久化是有界、限流的后台
+   best-effort 流程，不参与本次 Dump 成功判定。
 4. Load 完成必须保证最终 H2D 完成。
 5. 所有交给 Posix 的 YuanRong Buffer 必须持有到 Posix 任务结束。
 6. YuanRong 中每个 key 对应一个连续 Host Object，其布局等于一个 UCM shard 内所有 device blob 按顺序拼接后的布局。
@@ -148,10 +149,10 @@ Dump Task 成功表示：
 
 1. `prerequisiteHandle` 已满足。
 2. `MSetD2H` 已将 Device 数据写入 YuanRong Host Object。
-3. 如果配置了 Posix 后端，已通过 `KVClient::Get` 获取 Host Object。
-4. Posix Dump 任务已成功提交。
 
-Dump Task 不等待 Posix 真正写盘结束。
+Dump Task 不等待 `GetMetaInfo`、`KVClient::Get`、Posix任务提交或磁盘写入。后台
+持久化失败只记录日志；后续请求仍可命中YuanRong，YuanRong淘汰后则按Posix实际
+持久化结果决定是否命中。
 
 #### Dump 时序
 
@@ -159,10 +160,10 @@ Dump Task 不等待 Posix 真正写盘结束。
 Device
   -> MSetD2H
 YuanRong Host Object
-  -> KVClient::Get host pointer
-  -> submit Posix Dump
+  -> enqueue bounded persistence task
   -> UCM Dump Task complete
-  -> background Posix Wait
+  -> background GetMetaInfo / KVClient::Get
+  -> background submit and poll Posix Dump
   -> release ReadOnlyBuffer
 ```
 
@@ -174,7 +175,7 @@ sequenceDiagram
     participant HC as HeteroClient
     participant KC as KVClient
     participant PX as PosixStore
-    participant BG as Posix Reaper
+    participant BG as Persistence Worker
 
     UCM->>YR: Dump(TaskDesc)
     YR-->>UCM: TaskHandle
@@ -186,16 +187,19 @@ sequenceDiagram
     alt no Posix backend
         YR->>YR: mark task SUCCEEDED
     else Posix enabled
-        YR->>KC: Get(keys, ReadOnlyBuffers)
-        KC-->>YR: shared host pointers
-        YR->>YR: RLatch buffers
-        YR->>PX: Dump(host TaskDesc)
-        PX-->>YR: posixTaskHandle
-        YR->>BG: enqueue context
+        YR->>BG: TryPush(localSetKeys, TaskDesc)
         YR->>YR: mark task SUCCEEDED
 
-        BG->>PX: Wait(posixTaskHandle)
-        PX-->>BG: Status
+        BG->>HC: GetMetaInfo(localSetKeys)
+        BG->>KC: Get(localSetKeys, ReadOnlyBuffers)
+        KC-->>BG: shared host pointers
+        BG->>BG: RLatch buffers
+        BG->>PX: Dump(host TaskDesc)
+        PX-->>BG: posixTaskHandle
+        loop poll all inflight tasks
+            BG->>PX: Check(posixTaskHandle)
+        end
+        BG->>PX: Wait(completed task)
         BG->>BG: UnRLatch and release buffers
     end
 ```
@@ -212,14 +216,17 @@ heteroClient_->MSetD2H(keys, deviceBlobLists, setParam, &outLocalSetKeys);
 
 4. 不做 pre-Exist 或 post-Exist；Posix 只处理 `outLocalSetKeys`，不确定归属的 key 不落盘。
 5. 如果没有 Posix 后端，Dump Task 结束。
-6. 如果存在 Posix 后端，批量调用：
+6. 如果存在Posix后端，将`outLocalSetKeys`和对应`TaskDesc`非阻塞写入有界持久化
+   队列；队列满时记录告警并放弃本次Posix持久化，Dump Task仍成功。
+7. 后台worker按自动推导的batch size切批，并在
+   `yuanrong_posix_max_inflight_gb`限制内调用：
 
 ```cpp
 std::vector<datasystem::Optional<datasystem::ReadOnlyBuffer>> buffers;
 kvClient_->Get(keys, buffers, timeoutMs);
 ```
 
-7. 对每个有效 Buffer：
+8. 对每个有效 Buffer：
 
 ```cpp
 buffer.RLatch(timeoutSec);
@@ -227,19 +234,19 @@ buffer.ImmutableData();
 buffer.GetSize();
 ```
 
-8. 校验 `GetSize() == host_object_size`。
-9. 使用 Host 指针构造 Posix Dump Task。
-10. Posix `Dump()` 成功返回 handle 后，将以下对象移入后台上下文：
+9. 校验composed object布局，并使用payload Host指针构造Posix Dump Task。
+10. Posix `Dump()` 成功返回handle后，将以下对象保存在后台inflight集合中：
 
 ```cpp
 struct PosixDumpContext {
     Detail::TaskHandle posixTaskId;
+    size_t bytes;
     std::vector<Optional<ReadOnlyBuffer>> buffers;
 };
 ```
 
-11. 标记前台 Dump Task 成功。
-12. 后台线程调用 `PosixStore::Wait()`，随后 `UnRLatch` 并销毁 Buffer。
+11. 后台worker轮询全部inflight task，允许乱序回收；任务完成后调用`Wait`取得最终
+    状态，再解锁并释放Buffer和inflight字节额度。
 
 #### Posix 后台失败
 
@@ -593,12 +600,26 @@ yuanrong_host_buffer_capacity_gb: 8
 yuanrong_h2d_stream_count: 4
 yuanrong_backfill_worker_count: 1
 yuanrong_backfill_queue_depth: 128
+yuanrong_posix_max_inflight_gb: 1
 ```
 
 `yuanrong_recovery_batch_size`控制Posix和直接H2D批次。`yuanrong_host_buffer_count=0`
 时，按照Load worker双批流水线、Backfill worker并发数和pinned host内存容量自动推导完整批次数；
 非零值作为显式覆盖且不受自动容量上限约束。纯YuanRong模式不分配该HostBuffer池。Backfill
 worker默认单线程，避免后台MCreate和内存复制过度争用前台资源。
+
+Posix持久化队列深度使用内部固定值128。后台batch以256MB为目标，同时保证
+inflight上限原则上可容纳至少4个batch，并将key数量限制在`[1, 32]`：
+
+```text
+target_batch_bytes = min(256MB, max_inflight_bytes / 4)
+batch_size = clamp(target_batch_bytes / object_size, 1, 32)
+```
+
+`yuanrong_posix_max_inflight_gb`是唯一需要配置的Posix持久化调节项，限制每个UCM
+进程被未完成Posix任务持有的YuanRong Buffer总量。达到字节上限时仅阻塞后台
+持久化worker；队列最终满时，新的前台Dump放弃Posix持久化但仍按YuanRong D2H
+结果完成。
 
 ### 4.4 Lookup 和 Prefetch
 
@@ -645,8 +666,9 @@ exists = yuanrong_exists OR posix_exists
 |---|---|
 | prerequisite event 失败 | Dump Task 失败 |
 | `MSetD2H` 失败 | Dump Task 失败，不提交 Posix |
-| Dump 后 `KVClient::Get` 失败 | Dump Task 失败 |
-| Posix Dump 提交失败 | Dump Task 失败并立即释放 Buffer |
+| Posix持久化队列满 | 放弃本次Posix持久化并告警，Dump Task结果不变 |
+| 后台`GetMetaInfo/KVClient::Get`失败 | 放弃对应批次并告警，Dump Task结果不变 |
+| Posix Dump 提交失败 | 后台释放Buffer并告警，Dump Task结果不变 |
 | Posix Dump 后台执行失败 | 记录日志和指标，前台 Dump 结果不回滚 |
 | 首次 `MGetH2D` 部分 miss | 对 failed keys 回源 |
 | Load miss 且无 Posix 后端 | Load Task 失败 |
@@ -682,6 +704,7 @@ ucm_connectors:
       yuanrong_enable_remote_h2d: true
       yuanrong_memory_alignment: 4096
       yuanrong_timeout_ms: 60000
+      yuanrong_posix_max_inflight_gb: 1
       storage_backends:
         - "/mnt/ucm"
       posix_io_engine: "psync"
@@ -702,14 +725,16 @@ use_layerwise: false
 | `yuanrong_memory_alignment` | 否 | `64` | UCM解析和构造composed object使用；Direct IO必须为`4096` |
 | `yuanrong_timeout_ms` | 否 | `60000` | SDK 调用超时 |
 | `yuanrong_dump_prerequisite_worker_count` | 否 | `2` | 并发等待Dump prerequisite event的worker数 |
+| `yuanrong_posix_max_inflight_gb` | 否 | `1` | 每进程未完成Posix Dump持有的YuanRong Buffer上限 |
 | `tensor_size_list` | worker 必选 | 自动生成 | 每个 device blob 的字节数 |
 | `device_id` | worker 必选 | - | NPU device id |
 | `storage_backends` | Posix 必选 | - | Posix 路径 |
-| `posix_io_engine` | Posix 必选 | `psync` | 首期仅支持 `psync` |
+| `posix_io_engine` | Posix 必选 | `psync` | 支持`psync`；满足Direct IO约束时支持`aio` |
 
 `enable_event_sync` 必须开启，以确保 Dump 的 `prerequisiteHandle` 有效。
 
-`YuanRong|Posix`仅支持`posix_io_engine: "psync"`。启用`io_direct: true`时必须满足：
+`YuanRong|Posix`支持`posix_io_engine: "psync"`；`aio`要求同时启用
+`io_direct: true`。启用Direct IO时必须满足：
 
 - YuanRong Worker配置`memory_alignment=4096`，并保留默认的
   `oc_metadata_header=true`。metadata header会按4096对齐，且read latch可保护后台
@@ -815,8 +840,8 @@ flowchart LR
     DQ[Dump Queue] --> PP[Prerequisite Worker Pool]
     PP --> RQ[Ready Queue]
     RQ --> DW[Single D2H Worker]
-    DW --> PR[Posix Reaper Queue]
-    PR --> PW[Posix Reaper]
+    DW --> PQ[Bounded Persistence Queue]
+    PQ --> PW[Posix Persistence Worker]
 
     LQ[Load Queue] --> LW[Load Worker]
     LW --> BQ[Backfill Queue]
@@ -827,16 +852,15 @@ flowchart LR
 
 - prerequisite worker pool并发等待事件，数量由`yuanrong_dump_prerequisite_worker_count`控制。
 - 单个D2H worker串行执行`MSetD2H`，避免相同前缀并发发布冲突。
-- 获取 `ReadOnlyBuffer`。
-- 提交 Posix。
-- 将资源移交 Reaper。
-- 完成前台任务。
+- 将本次本地发布成功的key非阻塞提交到有界持久化队列。
+- `MSetD2H`完成且入队尝试结束后立即完成前台任务。
 
-### 6.2 Posix Reaper
+### 6.2 Posix Persistence Worker
 
-- 等待 Posix Dump。
-- 记录后台结果。
-- 解锁并释放 `ReadOnlyBuffer`。
+- 按配置切批执行`GetMetaInfo`、`KVClient::Get`和Posix `Dump`。
+- 以字节额度限制未完成Posix任务持有的YuanRong Buffer。
+- 轮询全部inflight任务，允许先完成的任务先释放，不被队首慢任务阻塞。
+- 记录后台结果并解锁、释放`ReadOnlyBuffer`；失败不回滚前台Dump。
 
 ### 6.3 Load Worker
 
@@ -865,27 +889,23 @@ Status DumpQueue::Run(TaskPtr task)
 
     auto keys = BuildKeys(task->shards);
     auto deviceBlobs = BuildDeviceBlobLists(task->shards);
-    RETURN_IF_NOT_OK(ToUcmStatus(
-        heteroClient_->MSetD2H(keys, deviceBlobs, setParam_)));
+    std::vector<std::string> localSetKeys;
+    auto setStatus =
+        heteroClient_->MSetD2H(keys, deviceBlobs, setParam_, &localSetKeys);
+    if (localSetKeys.empty()) {
+        return ToUcmStatus(setStatus);
+    }
+    SelectObjectsByKeys(localSetKeys, keys, task->desc);
 
     if (backend_ == nullptr) {
         return Status::OK();
     }
 
-    std::vector<Optional<ReadOnlyBuffer>> buffers;
-    RETURN_IF_NOT_OK(ToUcmStatus(
-        kvClient_->Get(keys, buffers, config_.timeoutMs)));
-
-    auto hostTask = BuildHostDumpTask(task->shards, buffers);
-    auto posixTask = backend_->Dump(std::move(hostTask));
-    if (!posixTask) {
-        UnlockAndRelease(buffers);
-        return posixTask.Error();
-    }
-
-    posixReaper_.Submit({
-        .taskId = posixTask.Value(),
-        .buffers = std::move(buffers),
+    // Non-blocking and best effort. GetMetaInfo/Get/Dump run in the
+    // persistence worker after the foreground task has completed.
+    persistenceQueue_.TryPush({
+        .keys = std::move(localSetKeys),
+        .desc = task->desc,
     });
     return Status::OK();
 }
@@ -932,19 +952,21 @@ Status LoadQueue::Run(TaskPtr task)
 1. BlockId 和 shard index 的 key 编码。
 2. `TaskDesc` 到 `DeviceBlobList` 的地址和 size 映射。
 3. Dump 等待 prerequisite。
-4. Dump 在 Posix 提交后完成，而非 Posix Wait 后完成。
-5. Posix Reaper 持有 Buffer 到 Wait 结束。
-6. Load 全命中，不访问 Posix。
-7. Load 部分 miss，只回源 failed keys。
-8. Posix Load完成前不提交直接H2D。
-9. 直接H2D同步完成后才移交HostBuffer。
-10. 后台`MCreate/MSet`失败不改变前台Load结果。
-11. `MGetH2D`总Status与`failedKeys`的组合处理。
-12. `Check` 不删除任务，`Wait` 删除任务。
-13. 所有失败路径释放 Buffer 和 latch。
-14. 多worker并发相同key时允许各自Posix回源，`MCreate NX`保证回填不覆盖。
-15. 119 个 miss、批次大小 32 时生成 `32 + 32 + 32 + 23` 四个批次。
-16. 当前批次完成顺序必须是`Posix Wait -> direct H2D -> stream sync -> enqueue backfill`。
+4. Dump 在`MSetD2H`和持久化队列入队尝试后完成，不等待`KVClient::Get`或Posix提交。
+5. 持久化worker持有Buffer到Posix `Check/Wait`确认任务结束。
+6. 持久化队列满或后台Get/Dump失败不改变已完成的前台Dump结果。
+7. inflight字节达到上限时后台等待已提交任务释放额度，不丢弃已取出的任务后续批次。
+8. Load 全命中，不访问 Posix。
+9. Load 部分 miss，只回源 failed keys。
+10. Posix Load完成前不提交直接H2D。
+11. 直接H2D同步完成后才移交HostBuffer。
+12. 后台`MCreate/MSet`失败不改变前台Load结果。
+13. `MGetH2D`总Status与`failedKeys`的组合处理。
+14. `Check` 不删除任务，`Wait` 删除任务。
+15. 所有失败路径释放 Buffer 和 latch。
+16. 多worker并发相同key时允许各自Posix回源，`MCreate NX`保证回填不覆盖。
+17. 119 个 miss、批次大小 32 时生成 `32 + 32 + 32 + 23` 四个批次。
+18. 当前批次完成顺序必须是`Posix Wait -> direct H2D -> stream sync -> enqueue backfill`。
 
 ### 8.2 集成测试
 

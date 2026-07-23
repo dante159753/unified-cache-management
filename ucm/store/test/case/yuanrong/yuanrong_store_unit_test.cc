@@ -40,11 +40,27 @@ UC::Detail::BlockId MakeBlock(std::initializer_list<uint8_t> bytes)
 
 }  // namespace
 
-TEST(YuanRongConfigTest, DumpPipelineUsesConservativeWorkerDefaults)
+TEST(YuanRongConfigTest, UsesConservativeDefaults)
 {
     UC::YuanRongStore::Config config;
 
     EXPECT_EQ(config.dumpPrerequisiteWorkerCount, 2);
+    EXPECT_EQ(config.posixDumpBatchSize, 0);
+    EXPECT_EQ(config.posixMaxInflightGb, 1);
+}
+
+TEST(YuanRongHelperTest, DerivePosixDumpBatchSizeTargetsBoundedByteBatches)
+{
+    using namespace UC::YuanRongStore;
+    constexpr uint64_t oneGb = 1ULL << 30;
+    constexpr size_t oneMb = 1ULL << 20;
+
+    EXPECT_EQ(DeriveYuanRongPosixDumpBatchSize(16 * oneMb, oneGb), 16);
+    EXPECT_EQ(DeriveYuanRongPosixDumpBatchSize(64 * oneMb, oneGb), 4);
+    EXPECT_EQ(DeriveYuanRongPosixDumpBatchSize(300 * oneMb, oneGb), 1);
+    EXPECT_EQ(DeriveYuanRongPosixDumpBatchSize(oneMb, oneGb), 32);
+    EXPECT_EQ(DeriveYuanRongPosixDumpBatchSize(0, oneGb), 0);
+    EXPECT_EQ(DeriveYuanRongPosixDumpBatchSize(oneGb + 1, oneGb), 0);
 }
 
 TEST(YuanRongHelperTest, DeviceMemoryPreRegistrationRequiresRemoteH2DAndHccs)

@@ -31,6 +31,8 @@
 
 namespace UC::YuanRongStore {
 
+inline constexpr size_t kPersistenceQueueDepth = 128;
+
 struct Config {
     std::string host{"127.0.0.1"};
     int32_t port{9088};
@@ -56,7 +58,8 @@ struct Config {
     size_t h2dStreamCount{4};
     size_t backfillWorkerCount{1};
     size_t backfillQueueDepth{128};
-    size_t reaperQueueDepth{8192};
+    size_t posixDumpBatchSize{0};
+    size_t posixMaxInflightGb{1};
     std::vector<ssize_t> cpuAffinityCores{};
     bool ioDirect{false};
     std::string posixIoEngine{"psync"};

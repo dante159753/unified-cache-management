@@ -26,6 +26,7 @@
 
 #include <atomic>
 #include <future>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -65,15 +66,23 @@ class DumpQueue {
         std::shared_ptr<Trans::Stream> prerequisiteStream;
     };
 
-    struct DumpContext {
+    struct PersistenceTask {
+        Detail::TaskHandle ownerTaskId{0};
+        std::vector<std::string> keys;
+        Detail::TaskDesc desc;
+        double enqueueTime{0.0};
+    };
+
+    struct PersistenceContext {
         Detail::TaskHandle ownerTaskId{0};
         Detail::TaskHandle backendTaskId{0};
+        size_t bytes{0};
         std::vector<datasystem::Optional<datasystem::ReadOnlyBuffer>> buffers;
     };
 
     alignas(64) std::atomic_bool closing_{false};
     alignas(64) std::atomic_bool stopD2H_{false};
-    alignas(64) std::atomic_bool stopReaper_{false};
+    alignas(64) std::atomic_bool stopPersistence_{false};
     alignas(64) std::atomic_size_t pendingCount_{0};
     TaskIdSet* failureSet_{nullptr};
     Config config_{};
@@ -81,12 +90,12 @@ class DumpQueue {
     std::shared_ptr<datasystem::KVClient> kvClient_;
     StoreV1* backend_{nullptr};
     SpscRingQueue<DumpTaskContext> ready_;
-    SpscRingQueue<DumpContext> reaping_;
+    SpscRingQueue<PersistenceTask> persistence_;
     std::mutex submitMutex_;
     std::mutex readySubmitMutex_;
     std::unique_ptr<ThreadPool<DumpTaskContext, std::shared_ptr<WorkerContext>>> prerequisitePool_;
     std::thread d2hWorker_;
-    std::thread reaper_;
+    std::thread persistenceWorker_;
 
 public:
     ~DumpQueue();
@@ -98,13 +107,18 @@ public:
 private:
     void Close();
     void D2HStage(std::promise<Status>& started);
-    void ReaperStage();
+    void PersistenceStage();
     void RunPrerequisite(DumpTaskContext& context, const std::shared_ptr<WorkerContext>& worker);
     void RunD2H(DumpTaskContext&& context);
     void Finish(DumpTaskContext& context, const Status& status);
     Status DumpReadyTask(TaskPtr task, double prerequisiteQueueWaitMs, double prerequisiteMs,
                          double d2hQueueWaitMs, double pipelineStart);
-    void Reap(DumpContext&& context);
+    void Persist(const PersistenceTask& task, size_t& inflightBytes,
+                 std::list<PersistenceContext>& inflight);
+    Status PersistBatch(const PersistenceTask& task, size_t begin, size_t end,
+                        size_t& inflightBytes, std::list<PersistenceContext>& inflight);
+    void PollCompletions(size_t& inflightBytes, std::list<PersistenceContext>& inflight);
+    void ReleasePersistenceContext(PersistenceContext& context, size_t& inflightBytes);
     static void ReleaseBuffers(
         std::vector<datasystem::Optional<datasystem::ReadOnlyBuffer>>& buffers);
 };

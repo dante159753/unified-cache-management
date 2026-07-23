@@ -29,8 +29,8 @@ ucm_connectors:
       yuanrong_h2d_stream_count: 4
       yuanrong_backfill_worker_count: 1
       yuanrong_backfill_queue_depth: 128
-      # Queue depth for async Posix dump completion and YuanRong buffer release.
-      yuanrong_reaper_queue_depth: 8192
+      # Maximum YuanRong buffers held by Posix per UCM process.
+      yuanrong_posix_max_inflight_gb: 1
 
       share_buffer_enable: true
       storage_backends: "/mnt/ucm"
