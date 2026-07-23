@@ -26,8 +26,10 @@
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include "datasystem/hetero_client.h"
 #include "datasystem/kv_client.h"
@@ -46,6 +48,8 @@ class YuanRongStore : public StoreV1 {
     std::shared_ptr<datasystem::KVClient> kvClient_;
     TaskManager taskManager_;
     bool taskManagerEnabled_{false};
+    std::mutex registerMtx_;
+    std::unordered_map<void*, size_t> registered_;
 
 public:
     ~YuanRongStore() override = default;
@@ -203,6 +207,16 @@ public:
             return Status::Error("YuanRong HeteroClient is not initialized");
         }
 
+        std::lock_guard<std::mutex> lock(registerMtx_);
+        auto iter = registered_.find(baseAddr);
+        if (iter != registered_.end() && iter->second >= totalSize) {
+            UC_DEBUG(
+                "YuanRong device memory already registered: "
+                "addr={}, registered_size={}, requested_size={}",
+                baseAddr, iter->second, totalSize);
+            return Status::OK();
+        }
+
         auto status = heteroClient_->PreRegisterDeviceMemory(
             std::vector<void*>{baseAddr}, std::vector<uint64_t>{static_cast<uint64_t>(totalSize)});
         if (status.IsError()) {
@@ -210,6 +224,8 @@ public:
                      baseAddr, totalSize, status.ToString());
             return Status::Error("YuanRong PreRegisterDeviceMemory failed: " + status.ToString());
         }
+        registered_[baseAddr] = totalSize;
+        UC_DEBUG("YuanRong device memory registered: addr={}, size={}", baseAddr, totalSize);
         return Status::OK();
     }
 
