@@ -693,6 +693,16 @@ def test_store_health_and_mooncake_lookup_metrics_are_configured():
     assert definitions["mooncake_store_health"] == "gauge"
 
 
+def test_cache_load_ready_shards_metric_is_configured():
+    config = load_launch_metrics_config({})
+    definitions = {
+        definition.name: definition.metric_type
+        for definition in get_metric_definitions(config)
+    }
+
+    assert definitions["cache_load_ready_shards_total"] == "counter"
+
+
 def test_dispatcher_fans_out_single_core_drain_to_independent_consumers():
     _reset_fakes()
     config = _metrics_config()
@@ -1695,7 +1705,7 @@ def test_grafana_dashboards_use_isolated_vllm_ucm_identity():
                 assert link["tags"] == [GRAFANA_VLLM_UCM_TAG]
 
 
-def test_ucm_overview_keeps_vllm_summary_and_adds_block_hit_and_health_views():
+def test_ucm_overview_keeps_vllm_summary_and_adds_health_views():
     metrics_dir = REPO_ROOT / "examples" / "metrics"
     source = json.loads((metrics_dir / "grafana_vllm.json").read_text(encoding="utf-8"))
     dashboard = json.loads(
@@ -1710,33 +1720,7 @@ def test_ucm_overview_keeps_vllm_summary_and_adds_block_hit_and_health_views():
     assert panels["Total Input Tokens"]["gridPos"]["y"] == 0
     assert panels["Total Output Tokens"]["gridPos"]["y"] == 0
 
-    hit_rate = panels["KV Cache Block Hit Rate by Store"]
-    assert hit_rate["type"] == "timeseries"
-    assert hit_rate["fieldConfig"]["defaults"]["unit"] == "percentunit"
-    assert hit_rate["fieldConfig"]["defaults"]["min"] == 0
-    assert hit_rate["fieldConfig"]["defaults"]["max"] == 1
-    assert hit_rate["fieldConfig"]["defaults"]["custom"]["drawStyle"] == "bars"
-    assert hit_rate["fieldConfig"]["defaults"]["custom"]["stacking"] == {
-        "group": "A",
-        "mode": "normal",
-    }
-    assert hit_rate["maxDataPoints"] == 60
-    assert hit_rate["options"]["tooltip"]["mode"] == "multi"
-    hit_targets = {
-        target["legendFormat"]: target["expr"] for target in hit_rate["targets"]
-    }
-    assert set(hit_targets) == {"HBM", "Cache", "Mooncake", "Posix"}
-    expected_hits = {
-        "HBM": "ucm:gpu_hbm_hit_blocks_total",
-        "Cache": "ucm:cache_lookup_hit_blocks_total",
-        "Mooncake": "ucm:mooncake_lookup_hit_blocks_total",
-        "Posix": "ucm:posix_lookup_hit_blocks_total",
-    }
-    for legend, metric in expected_hits.items():
-        assert metric in hit_targets[legend]
-        assert "ucm:total_prefix_query_blocks_total" in hit_targets[legend]
-        assert "or vector(0)" not in hit_targets[legend]
-    assert all(target["interval"] == "1m" for target in hit_rate["targets"])
+    assert "KV Cache Block Hit Rate by Store" not in panels
 
     pie = panels["Store Health"]
     assert pie["type"] == "piechart"
@@ -1771,6 +1755,7 @@ def test_ucm_overview_keeps_vllm_summary_and_adds_block_hit_and_health_views():
     assert any(item["id"] == "groupingToMatrix" for item in details["transformations"])
 
     trend = panels["Healthy and Unhealthy Store Count"]
+    assert trend["gridPos"]["y"] == 8
     assert {target["legendFormat"] for target in trend["targets"]} == {
         "Healthy",
         "Unhealthy",
@@ -1783,8 +1768,10 @@ def test_ucm_overview_keeps_vllm_summary_and_adds_block_hit_and_health_views():
     details_row = panels["Store Probe Details"]
     assert details_row["type"] == "row"
     assert details_row["collapsed"] is True
+    assert details_row["gridPos"]["y"] == 16
     nested = {panel["title"]: panel for panel in details_row["panels"]}
     assert set(nested) == {"Posix Health Probes", "Mooncake Health Probes"}
+    assert all(panel["gridPos"]["y"] == 17 for panel in nested.values())
     assert all(len(panel["targets"]) == 2 for panel in nested.values())
     for panel in nested.values():
         defaults = panel["fieldConfig"]["defaults"]
@@ -1794,6 +1781,10 @@ def test_ucm_overview_keeps_vllm_summary_and_adds_block_hit_and_health_views():
             assert "sum(increase(" in target["expr"]
             assert "[$__rate_interval]" in target["expr"]
             assert "sum(rate(" not in target["expr"]
+    assert panels["Prefix Cache Query Tokens"]["gridPos"]["y"] == 25
+    assert panels["GPU/HBM Prefix Hit Tokens"]["gridPos"]["y"] == 25
+    assert panels["UCM Prefix Hit Tokens"]["gridPos"]["y"] == 25
+    assert panels["Prefix Cache Query Breakdown"]["gridPos"]["y"] == 29
 
 
 def test_ucm_dashboards_use_engine_and_worker_rank_filters():

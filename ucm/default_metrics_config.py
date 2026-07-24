@@ -33,6 +33,10 @@ _COUNTER_METRICS = [
         "Total shards dispatched by Cache load (num blocks * shards_per_block)",
     ),
     (
+        "cache_load_ready_shards_total",
+        "Shards whose Cache buffer was ready immediately after lookup during load",
+    ),
+    (
         "cache_load_backend_shards_total",
         (
             "Shards that descended to the backend on load (true cache miss at the "

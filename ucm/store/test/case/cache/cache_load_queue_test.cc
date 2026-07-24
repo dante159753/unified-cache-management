@@ -27,6 +27,7 @@
 #include "detail/mock_store.h"
 #include "detail/random.h"
 #include "detail/types_helper.h"
+#include "metrics_api.h"
 
 class UCCacheLoadQueueTest : public testing::Test {
 public:
@@ -41,6 +42,10 @@ public:
 TEST_F(UCCacheLoadQueueTest, LoadSameBlockTwice)
 {
     using namespace UC::CacheStore;
+    UC::Metrics::SetUp();
+    UC::Metrics::CreateStats("cache_load_ready_shards_total", "counter");
+    UC::Metrics::CreateStats("cache_load_shards_total", "counter");
+    UC::Metrics::GetAllStatsAndClear();
     UC::Test::Detail::MockStore backend;
     EXPECT_CALL(backend, Load).WillOnce(testing::Invoke(NextId));
     EXPECT_CALL(backend, Wait).WillOnce(testing::Return(UC::Status::OK()));
@@ -73,11 +78,19 @@ TEST_F(UCCacheLoadQueueTest, LoadSameBlockTwice)
     loadQ.Submit(task1, waiter1);
     waiter1->Wait();
     ASSERT_FALSE(failureSet.Contains(task1->id));
+    auto firstStats = UC::Metrics::GetAllStatsAndClear();
+    const auto& firstCounters = std::get<0>(firstStats);
+    EXPECT_EQ(firstCounters.at("cache_load_ready_shards_total"), 0);
+    EXPECT_EQ(firstCounters.at("cache_load_shards_total"), 1);
     auto task2 = std::make_shared<TransTask>(TransTask::Type::LOAD, desc);
     auto waiter2 = std::make_shared<UC::Latch>();
     loadQ.Submit(task2, waiter2);
     waiter2->Wait();
     ASSERT_FALSE(failureSet.Contains(task2->id));
+    auto secondStats = UC::Metrics::GetAllStatsAndClear();
+    const auto& secondCounters = std::get<0>(secondStats);
+    EXPECT_EQ(secondCounters.at("cache_load_ready_shards_total"), 1);
+    EXPECT_EQ(secondCounters.at("cache_load_shards_total"), 1);
 }
 
 TEST_F(UCCacheLoadQueueTest, LoadWhileBackendSubmitFailed)

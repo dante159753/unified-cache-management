@@ -32,6 +32,8 @@ counter:
     documentation: "Total blocks dumped by the Cache stage"
   - name: "cache_load_shards_total"
     documentation: "Total shards dispatched by Cache load (num blocks * shards_per_block)"
+  - name: "cache_load_ready_shards_total"
+    documentation: "Shards whose Cache buffer was ready immediately after lookup during load"
   - name: "cache_load_backend_shards_total"
     documentation: "Shards that descended to the backend on load (true cache miss at the buffer-allocation stage; aka backend-load count)"
   - name: "cache_dump_shards_total"
