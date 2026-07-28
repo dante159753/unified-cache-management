@@ -1,6 +1,29 @@
 set(YUANRONG_SDK_ROOT "" CACHE PATH "Path to the YuanRong DataSystem SDK")
 set(YUANRONG_INCLUDE_DIR "" CACHE PATH "Path to YuanRong DataSystem headers")
 set(YUANRONG_LIBRARY "" CACHE FILEPATH "Path to libdatasystem.so")
+set(YUANRONG_ASCEND_ROOT "$ENV{ASCEND_HOME_PATH}" CACHE PATH "Path to Ascend toolkit")
+file(GLOB YUANRONG_ASCEND_CANN_ROOTS LIST_DIRECTORIES true "/usr/local/Ascend/cann-*")
+
+find_path(YUANRONG_ASCEND_ACL_INCLUDE_DIR
+    NAMES acl/acl.h
+    HINTS
+        "${YUANRONG_ASCEND_ROOT}"
+        ${YUANRONG_ASCEND_CANN_ROOTS}
+    PATHS
+        /usr/local/Ascend/ascend-toolkit/latest
+        /usr/local/Ascend/latest
+    PATH_SUFFIXES include
+)
+find_library(YUANRONG_ASCEND_ACL_LIBRARY
+    NAMES ascendcl
+    HINTS
+        "${YUANRONG_ASCEND_ROOT}"
+        ${YUANRONG_ASCEND_CANN_ROOTS}
+    PATHS
+        /usr/local/Ascend/ascend-toolkit/latest
+        /usr/local/Ascend/latest
+    PATH_SUFFIXES lib64 lib
+)
 
 if(NOT YUANRONG_SDK_ROOT)
     find_package(Python COMPONENTS Interpreter QUIET)
@@ -41,12 +64,17 @@ if(NOT YUANRONG_LIBRARY AND YUANRONG_SDK_ROOT)
 endif()
 
 if(EXISTS "${YUANRONG_INCLUDE_DIR}/datasystem/hetero_client.h"
-   AND YUANRONG_LIBRARY)
+   AND YUANRONG_LIBRARY
+   AND YUANRONG_ASCEND_ACL_INCLUDE_DIR
+   AND YUANRONG_ASCEND_ACL_LIBRARY)
     file(GLOB_RECURSE YUANRONG_STORE_SOURCES "./cc/*.cc")
     add_library(yuanrongstore SHARED ${YUANRONG_STORE_SOURCES})
     target_include_directories(yuanrongstore PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/cc
         ${YUANRONG_INCLUDE_DIR}
+    )
+    target_include_directories(yuanrongstore SYSTEM PRIVATE
+        ${YUANRONG_ASCEND_ACL_INCLUDE_DIR}
     )
     target_link_libraries(yuanrongstore PUBLIC
         storeintf
@@ -54,6 +82,7 @@ if(EXISTS "${YUANRONG_INCLUDE_DIR}/datasystem/hetero_client.h"
         fmt
         trans
         ${YUANRONG_LIBRARY}
+        ${YUANRONG_ASCEND_ACL_LIBRARY}
     )
     get_filename_component(YUANRONG_LIBRARY_DIR "${YUANRONG_LIBRARY}" DIRECTORY)
     set_target_properties(yuanrongstore PROPERTIES
@@ -67,4 +96,6 @@ else()
     message(STATUS "yuanrongstore: skipping build - YuanRong SDK not found")
     message(STATUS "  YUANRONG_INCLUDE_DIR=${YUANRONG_INCLUDE_DIR}")
     message(STATUS "  YUANRONG_LIBRARY=${YUANRONG_LIBRARY}")
+    message(STATUS "  YUANRONG_ASCEND_ACL_INCLUDE_DIR=${YUANRONG_ASCEND_ACL_INCLUDE_DIR}")
+    message(STATUS "  YUANRONG_ASCEND_ACL_LIBRARY=${YUANRONG_ASCEND_ACL_LIBRARY}")
 endif()
