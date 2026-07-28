@@ -22,6 +22,7 @@
  * SOFTWARE.
  * */
 #include "dump_queue.h"
+#include <acl/acl_rt.h>
 #include <algorithm>
 #include <chrono>
 #include <exception>
@@ -57,9 +58,6 @@ Status DumpQueue::Setup(const Config& config, TaskIdSet* failureSet,
     Trans::Device validationDevice;
     auto validationStatus = validationDevice.Setup(config_.deviceId);
     if (validationStatus.Failure()) { return validationStatus; }
-    if (!validationDevice.MakeSharedStream()) {
-        return Status::Error("failed to create YuanRong prerequisite stream");
-    }
 
     try {
         std::promise<Status> d2hStarted;
@@ -86,13 +84,6 @@ Status DumpQueue::Setup(const Config& config, TaskIdSet* failureSet,
                         worker.reset();
                         UC_ERROR("Failed({}) to initialize YuanRong prerequisite worker.",
                                  e.what());
-                    }
-                    if (worker && worker->status.Success()) {
-                        worker->prerequisiteStream = worker->device.MakeSharedStream();
-                        if (!worker->prerequisiteStream) {
-                            worker->status =
-                                Status::Error("failed to create YuanRong prerequisite stream");
-                        }
                     }
                     return true;
                 })
@@ -223,9 +214,16 @@ void DumpQueue::RunPrerequisite(DumpTaskContext& context,
     context.prerequisiteStart = NowTime::Now();
     auto status = Status::OK();
     if (context.task->desc.prerequisiteHandle != 0) {
-        status = worker->prerequisiteStream->WaitEvent(
-            reinterpret_cast<void*>(context.task->desc.prerequisiteHandle));
-        if (status.Success()) { status = worker->prerequisiteStream->Synchronized(); }
+        auto event = reinterpret_cast<aclrtEvent>(context.task->desc.prerequisiteHandle);
+        UC_DEBUG("YuanRong dump task({}) waiting for prerequisite event({}).", context.task->id,
+                 context.task->desc.prerequisiteHandle);
+        auto ret = aclrtSynchronizeEvent(event);
+        if (ret != ACL_SUCCESS) {
+            status = Status{ret, fmt::format("aclrtSynchronizeEvent failed, ret={}", ret)};
+        } else {
+            UC_DEBUG("YuanRong dump task({}) prerequisite event({}) completed.",
+                     context.task->id, context.task->desc.prerequisiteHandle);
+        }
     }
     context.prerequisiteEnd = NowTime::Now();
     if (status.Failure()) {

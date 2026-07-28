@@ -63,7 +63,6 @@ class DumpQueue {
     struct WorkerContext {
         Status status{Status::OK()};
         Trans::Device device;
-        std::shared_ptr<Trans::Stream> prerequisiteStream;
     };
 
     struct PersistenceTask {
