@@ -189,38 +189,38 @@ TEST(YuanRongHelperTest, DeduplicateYuanRongObjectsKeepsFirstShardForEachKey)
     EXPECT_EQ(desc[1].addrs[0], tensor1.data());
 }
 
-TEST(YuanRongHelperTest, FailedIndexesHandlesTotalFailureAndPartialFailure)
+TEST(YuanRongHelperTest, FilterH2dFailedIndexesHandlesTotalFailureAndPartialFailure)
 {
     using namespace UC::YuanRongStore;
 
     std::vector<std::string> keys{"k0", "k1", "k2"};
 
-    EXPECT_TRUE(FailedIndexes(keys, {}, false).empty());
+    EXPECT_TRUE(FilterH2dFailedIndexes(keys, {}, false).empty());
 
-    auto all = FailedIndexes(keys, {}, true);
+    auto all = FilterH2dFailedIndexes(keys, {}, true);
     ASSERT_EQ(all.size(), 3);
     EXPECT_EQ(all[0], 0);
     EXPECT_EQ(all[1], 1);
     EXPECT_EQ(all[2], 2);
 
-    auto partial = FailedIndexes(keys, {"k2", "k0"}, false);
+    auto partial = FilterH2dFailedIndexes(keys, {"k2", "k0"}, false);
     ASSERT_EQ(partial.size(), 2);
     EXPECT_EQ(partial[0], 0);
     EXPECT_EQ(partial[1], 2);
 }
 
-TEST(YuanRongHelperTest, PartitionExistencePreservesOriginalIndexes)
+TEST(YuanRongHelperTest, SplitByExistencePreservesOriginalIndexes)
 {
     using namespace UC::YuanRongStore;
 
     std::vector<size_t> hitIndexes;
     std::vector<size_t> missIndexes;
-    PartitionExistence({true, false, true, false, false}, hitIndexes, missIndexes);
+    SplitByExistence({true, false, true, false, false}, hitIndexes, missIndexes);
 
     EXPECT_EQ(hitIndexes, (std::vector<size_t>{0, 2}));
     EXPECT_EQ(missIndexes, (std::vector<size_t>{1, 3, 4}));
 
-    PartitionExistence({}, hitIndexes, missIndexes);
+    SplitByExistence({}, hitIndexes, missIndexes);
     EXPECT_TRUE(hitIndexes.empty());
     EXPECT_TRUE(missIndexes.empty());
 }
@@ -241,7 +241,7 @@ TEST(YuanRongHelperTest, TieredPrefixMapsBackendMissToOriginalIndex)
     EXPECT_TRUE(ResolveTieredPrefixHit(10, missIndexes, 3, result).Failure());
 }
 
-TEST(YuanRongHelperTest, SelectYuanRongObjectsByKeysKeepsInputOrderAndAlignedShards)
+TEST(YuanRongHelperTest, FilterKeysByLocalSetKeysKeepsInputOrderAndAlignedShards)
 {
     using namespace UC::YuanRongStore;
 
@@ -254,7 +254,7 @@ TEST(YuanRongHelperTest, SelectYuanRongObjectsByKeysKeepsInputOrderAndAlignedSha
     desc.push_back(UC::Detail::Shard{MakeBlock({0x02}), 20, {tensor1.data()}});
     desc.push_back(UC::Detail::Shard{MakeBlock({0x03}), 30, {tensor2.data()}});
 
-    auto status = SelectYuanRongObjectsByKeys({"key-c", "key-a"}, keys, desc);
+    auto status = FilterKeysByLocalSetKeys({"key-c", "key-a"}, keys, desc);
 
     ASSERT_TRUE(status.Success()) << status.ToString();
     ASSERT_EQ(keys.size(), 2);
@@ -267,7 +267,7 @@ TEST(YuanRongHelperTest, SelectYuanRongObjectsByKeysKeepsInputOrderAndAlignedSha
     EXPECT_EQ(desc[1].addrs[0], tensor2.data());
 }
 
-TEST(YuanRongHelperTest, SelectYuanRongObjectsByKeysRejectsInvalidOutput)
+TEST(YuanRongHelperTest, FilterKeysByLocalSetKeysRejectsInvalidOutput)
 {
     using namespace UC::YuanRongStore;
 
@@ -280,11 +280,11 @@ TEST(YuanRongHelperTest, SelectYuanRongObjectsByKeysRejectsInvalidOutput)
     auto duplicateKeys = keys;
     auto duplicateDesc = desc;
     EXPECT_TRUE(
-        SelectYuanRongObjectsByKeys({"key-a", "key-a"}, duplicateKeys, duplicateDesc).Failure());
+        FilterKeysByLocalSetKeys({"key-a", "key-a"}, duplicateKeys, duplicateDesc).Failure());
 
     auto unknownKeys = keys;
     auto unknownDesc = desc;
-    EXPECT_TRUE(SelectYuanRongObjectsByKeys({"key-c"}, unknownKeys, unknownDesc).Failure());
+    EXPECT_TRUE(FilterKeysByLocalSetKeys({"key-c"}, unknownKeys, unknownDesc).Failure());
 }
 
 TEST(YuanRongHelperTest, RecoveryBatchRangesCoverAllIndexesWithoutOverlap)

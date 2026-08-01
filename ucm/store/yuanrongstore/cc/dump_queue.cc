@@ -184,7 +184,7 @@ void DumpQueue::PersistenceStage()
         PersistenceTask task;
         const bool hasTask = persistence_.TryPop(task);
         if (hasTask) { Persist(task, inflightBytes, inflight); }
-        PollCompletions(inflightBytes, inflight);
+        ReclaimCompletedInflight(inflightBytes, inflight);
 
         // The producer has already stopped before stopPersistence_ is set, so an
         // empty pop here means the persistence queue has been fully drained.
@@ -272,7 +272,8 @@ Status DumpQueue::DumpReadyTask(TaskPtr task, double prerequisiteQueueWaitMs, do
     if (s.Failure()) { return s; }
     if (keys.empty()) { return Status::OK(); }
     DeduplicateYuanRongObjects(keys, blobLists, &task->desc);
-    const auto totalBytes = TotalBlobBytes(blobLists);
+    const auto totalMb =
+        static_cast<double>(config_.objectSize) * keys.size() / (1024.0 * 1024.0);
 
     datasystem::SetParam setParam;
     setParam.writeMode = datasystem::WriteMode::NONE_L2_CACHE_EVICT;
@@ -283,10 +284,10 @@ Status DumpQueue::DumpReadyTask(TaskPtr task, double prerequisiteQueueWaitMs, do
     auto dumpStatus = heteroClient_->MSetD2H(keys, blobLists, setParam, &localSetKeys);
     auto publishEnd = NowTime::Now();
     UC_INFO(
-        "YuanRong dump task({}) MSetD2H keys={}, local_set={}, bytes={}, "
-        "prereq_queue={:.3f}ms, prereq={:.3f}ms, d2h_queue={:.3f}ms, "
-        "d2h={:.3f}ms, status={}.",
-        task->id, keys.size(), localSetKeys.size(), totalBytes, prerequisiteQueueWaitMs,
+        "YuanRong dump task({}) MSetD2H keys={}, local_set={}, total_mb={:.3f}, "
+        "prereq_queue_wait={:.3f}ms, prereq_event_wait={:.3f}ms, ready_queue_wait={:.3f}ms, "
+        "d2h_transfer={:.3f}ms, status={}.",
+        task->id, keys.size(), localSetKeys.size(), totalMb, prerequisiteQueueWaitMs,
         prerequisiteMs, d2hQueueWaitMs, (publishEnd - d2hStart) * 1e3, dumpStatus.ToString());
     if (localSetKeys.empty()) {
         if (dumpStatus.IsError()) {
@@ -299,13 +300,12 @@ Status DumpQueue::DumpReadyTask(TaskPtr task, double prerequisiteQueueWaitMs, do
         return Status::OK();
     }
 
-    s = SelectYuanRongObjectsByKeys(localSetKeys, keys, task->desc);
+    s = FilterKeysByLocalSetKeys(localSetKeys, keys, task->desc);
     if (s.Failure()) { return s; }
     if (dumpStatus.IsError()) {
         UC_WARN(
-            "YuanRong MSetD2H partially failed but confirmed ({} keys) published locally; "
-            "persisting the confirmed keys only: {}",
-            keys.size(), dumpStatus.ToString());
+            "YuanRong dump task({}) MSetD2H partially failed, success local set keys: {}, failed reason: {}",
+            task->id, keys.size(), dumpStatus.ToString());
     }
     if (backend_ == nullptr) {
         UC_DEBUG("YuanRong dump task({}) finished without backend, local_set={}, total={:.3f}ms.",
@@ -337,7 +337,7 @@ void DumpQueue::Persist(const PersistenceTask& task, size_t& inflightBytes,
         const auto end = std::min(begin + config_.posixDumpBatchSize, task.keys.size());
         const size_t batchBytes = config_.objectSize * (end - begin);
         while (inflightBytes > maxInflightBytes - batchBytes) {
-            PollCompletions(inflightBytes, inflight);
+            ReclaimCompletedInflight(inflightBytes, inflight);
             if (inflightBytes <= maxInflightBytes - batchBytes) { break; }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
@@ -346,7 +346,7 @@ void DumpQueue::Persist(const PersistenceTask& task, size_t& inflightBytes,
             UC_WARN("Background Posix persistence for YuanRong task({}) skipped batch [{},{}): {}.",
                     task.ownerTaskId, begin, end, status);
         }
-        PollCompletions(inflightBytes, inflight);
+        ReclaimCompletedInflight(inflightBytes, inflight);
     }
 }
 
@@ -391,7 +391,7 @@ Status DumpQueue::PersistBatch(const PersistenceTask& task, size_t begin, size_t
 
     std::vector<datasystem::Optional<datasystem::ReadOnlyBuffer>> buffers;
     auto kvGetStart = NowTime::Now();
-    auto getStatus = kvClient_->Get(keys, buffers, static_cast<int32_t>(config_.timeoutMs));
+    auto getStatus = kvClient_->Get(keys, buffers, 0);
     auto kvGetEnd = NowTime::Now();
     if (getStatus.IsError() || buffers.size() != keys.size()) {
         releaseReservedBytes(batchBytes);
@@ -471,16 +471,17 @@ Status DumpQueue::PersistBatch(const PersistenceTask& task, size_t begin, size_t
     inflight.push_back(PersistenceContext{task.ownerTaskId, backendResult.Value(), persistedBytes,
                                           std::move(lockedBuffers)});
     UC_INFO(
-        "Background Posix persistence for YuanRong task({}) submitted keys={}, bytes={}, "
+        "Background Posix persistence for YuanRong task({}) submitted keys={}, total_mb={:.3f}, "
         "queue_wait={:.3f}ms, get_meta={:.3f}ms, kv_get={:.3f}ms, prepare_submit={:.3f}ms, "
-        "inflight_bytes={}.",
-        task.ownerTaskId, persistedKeys, persistedBytes,
+        "inflight_mb={:.3f}.",
+        task.ownerTaskId, persistedKeys, static_cast<double>(persistedBytes) / (1024.0 * 1024.0),
         (persistenceStart - task.enqueueTime) * 1e3, (metaEnd - metaStart) * 1e3,
-        (kvGetEnd - kvGetStart) * 1e3, (backendSubmitEnd - kvGetEnd) * 1e3, inflightBytes);
+        (kvGetEnd - kvGetStart) * 1e3, (backendSubmitEnd - kvGetEnd) * 1e3,
+        static_cast<double>(inflightBytes) / (1024.0 * 1024.0));
     return Status::OK();
 }
 
-void DumpQueue::PollCompletions(size_t& inflightBytes, std::list<PersistenceContext>& inflight)
+void DumpQueue::ReclaimCompletedInflight(size_t& inflightBytes, std::list<PersistenceContext>& inflight)
 {
     for (auto it = inflight.begin(); it != inflight.end();) {
         auto result = backend_->Check(it->backendTaskId);

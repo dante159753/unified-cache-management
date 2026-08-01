@@ -15,7 +15,7 @@ ucm_connectors:
       yuanrong_port: 18481
       yuanrong_namespace: "ucm_model"
       yuanrong_enable_remote_h2d: true
-      yuanrong_timeout_ms: 60000
+      yuanrong_timeout_ms: 20000
       yuanrong_waiting_queue_depth: 8192
       yuanrong_load_worker_count: 4
       # Workers blocked waiting for vLLM prerequisite events.
