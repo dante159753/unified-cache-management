@@ -32,6 +32,8 @@
 namespace UC::YuanRongStore {
 
 inline constexpr size_t kPersistenceQueueDepth = 128;
+inline constexpr size_t kDefaultMemoryAlignment = 64;
+inline constexpr size_t kDirectIoMemoryAlignment = 4096;
 
 struct Config {
     std::string host{"127.0.0.1"};
@@ -45,7 +47,7 @@ struct Config {
     size_t shardSize{0};
     size_t blockSize{0};
     size_t objectSize{0};
-    size_t memoryAlignment{64};
+    size_t memoryAlignment{kDefaultMemoryAlignment};
 
     size_t timeoutMs{60000};
     size_t waitingQueueDepth{8192};

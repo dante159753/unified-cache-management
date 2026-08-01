@@ -45,6 +45,7 @@ TEST(YuanRongConfigTest, UsesConservativeDefaults)
     UC::YuanRongStore::Config config;
 
     EXPECT_EQ(config.dumpPrerequisiteWorkerCount, 2);
+    EXPECT_EQ(config.memoryAlignment, UC::YuanRongStore::kDefaultMemoryAlignment);
     EXPECT_EQ(config.posixDumpBatchSize, 0);
     EXPECT_EQ(config.posixMaxInflightGb, 1);
 }

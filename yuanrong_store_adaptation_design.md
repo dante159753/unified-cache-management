@@ -293,8 +293,8 @@ stateDiagram-v2
 1. 所有 YuanRong Worker 配置相同的 `memory_alignment=4096`。
 2. 保持 `oc_metadata_header=true`，以支持共享内存 read latch 生命周期。
 3. SDK Client 从 Worker 注册响应同步 alignment，不新增 UCM ConnectOptions 参数。
-4. UCM 配置 `yuanrong_memory_alignment: 4096`，仅用于解析 header、构造回填对象和
-   对齐校验；该值必须与 Worker 一致。
+4. UCM 根据 `io_direct` 自动使用 4096 alignment，用于解析 header、构造回填对象和
+   对齐校验。
 5. payload 地址和 `payload_size` 必须满足 4096 对齐。
 
 ### 4.5 资源生命周期
@@ -335,7 +335,6 @@ ucm_connectors:
       posix_capacity_gb: 1024
       posix_io_engine: "psync"
       io_direct: false
-      yuanrong_memory_alignment: 64
 
 enable_event_sync: true
 use_layerwise: false
@@ -374,7 +373,6 @@ backfill 和 persistence 相关配置。
 | `yuanrong_backfill_worker_count` | `1` | 异步回填 worker 数 |
 | `yuanrong_backfill_queue_depth` | `128` | 异步回填队列深度 |
 | `yuanrong_posix_max_inflight_gb` | `1` | 每进程后台 Posix Dump 持有 Buffer 上限 |
-| `yuanrong_memory_alignment` | `64` | UCM composed object 对齐；Direct IO 使用 4096 |
 
 `yuanrong_host_buffer_count=0` 时，UCM 根据 object size、Load 双批流水线、回填并发
 和容量上限自动推导完整 batch 数。显式设置时必须不小于

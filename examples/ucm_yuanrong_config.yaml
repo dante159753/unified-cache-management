@@ -4,7 +4,8 @@
 # For YuanRong|Posix with io_direct enabled, start every YuanRong worker with
 # memory_alignment=4096. Keep oc_metadata_header enabled so the asynchronous
 # Posix dump can hold a read latch. The SDK obtains memory_alignment from the
-# worker during registration; UCM uses yuanrong_memory_alignment for Posix.
+# worker during registration; UCM derives it from io_direct (4096 when enabled,
+# otherwise 64).
 
 ucm_connectors:
   - ucm_connector_name: "UcmPipelineStore"
@@ -37,7 +38,6 @@ ucm_connectors:
       # "aio" is supported when io_direct is true; "psync" supports either mode.
       posix_io_engine: "psync"
       io_direct: false
-      yuanrong_memory_alignment: 64
 
 enable_event_sync: true
 use_layerwise: false

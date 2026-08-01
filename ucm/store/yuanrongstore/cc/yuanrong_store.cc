@@ -265,7 +265,6 @@ private:
         input.GetNumbers("tensor_size_list", config.tensorSizes);
         input.GetNumber("shard_size", config.shardSize);
         input.GetNumber("block_size", config.blockSize);
-        input.GetNumber("yuanrong_memory_alignment", config.memoryAlignment);
         input.GetNumber("yuanrong_timeout_ms", config.timeoutMs);
         input.GetNumber("yuanrong_waiting_queue_depth", config.waitingQueueDepth);
         input.GetNumber("yuanrong_load_worker_count", config.loadWorkerCount);
@@ -283,6 +282,8 @@ private:
         input.Get("io_direct", config.ioDirect);
         input.Get("posix_io_engine", config.posixIoEngine);
         input.Get("store_backend", config.storeBackend);
+        config.memoryAlignment =
+            config.ioDirect ? kDirectIoMemoryAlignment : kDefaultMemoryAlignment;
         config.objectSize =
             std::accumulate(config.tensorSizes.begin(), config.tensorSizes.end(), size_t{0});
         DeriveHostBufferCount(config);
@@ -337,11 +338,6 @@ private:
         }
         if (config.timeoutMs > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
             return Status::InvalidParam("yuanrong_timeout_ms is too large");
-        }
-        if (config.memoryAlignment == 0 || config.memoryAlignment > 4096 ||
-            (config.memoryAlignment & (config.memoryAlignment - 1)) != 0) {
-            return Status::InvalidParam(
-                "yuanrong_memory_alignment must be a power of two in (0, 4096]");
         }
         if (config.waitingQueueDepth <= 1) {
             return Status::InvalidParam("yuanrong_waiting_queue_depth({}) must be greater than 1",
@@ -424,12 +420,7 @@ private:
             }
         }
         if (config.ioDirect && config.storeBackend != nullptr) {
-            constexpr size_t directIoAlignment = 4096;
-            if (config.memoryAlignment != directIoAlignment) {
-                return Status::InvalidParam(
-                    "YuanRong|Posix io_direct requires yuanrong_memory_alignment=4096");
-            }
-            if (config.objectSize % directIoAlignment != 0) {
+            if (config.objectSize % kDirectIoMemoryAlignment != 0) {
                 return Status::InvalidParam(
                     "YuanRong object size must be aligned to 4096 bytes for io_direct");
             }
