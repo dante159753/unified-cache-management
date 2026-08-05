@@ -745,21 +745,15 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             return False
 
         layer_to_specs = layer_name_to_kv_cache_spec(kv_cache_config)
-        for raw_tensor in kv_cache_config.kv_cache_tensors:
-            shared_specs = [
-                spec
-                for layer_name in raw_tensor.shared_by
-                for spec in layer_to_specs.get(layer_name, [])
-            ]
-            if any(
-                isinstance(spec, FullAttentionSpec) for spec in shared_specs
-            ) and any(
-                isinstance(spec, MambaSpec) and spec.mamba_cache_mode == "align"
-                for spec in shared_specs
-            ):
-                return True
-
-        return False
+        all_specs = [spec for specs in layer_to_specs.values() for spec in specs]
+        has_full_attention = any(
+            isinstance(spec, FullAttentionSpec) for spec in all_specs
+        )
+        has_aligned_mamba = any(
+            isinstance(spec, MambaSpec) and spec.mamba_cache_mode == "align"
+            for spec in all_specs
+        )
+        return has_full_attention and has_aligned_mamba
 
     def __init__(
         self,
@@ -849,6 +843,11 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             config["shard_size"] = shard_size * self.blocks_per_chunk
             config["block_size"] = block_size * self.blocks_per_chunk
             config["local_rank_size"] = self.tp_size if self.is_mla else 1
+            if self._allgather_store_enabled:
+                config["allgather_rank"] = self.tp_rank % self.tp_size
+                config["allgather_world_size"] = self.tp_size
+                config["allgather_replicated_data"] = self.is_mla
+                config["allgather_layerwise"] = self.use_layerwise
             buffer_addrs = kv_cache_layout.base_ptrs.reshape(-1).tolist()
             buffer_sizes = kv_cache_layout.buffer_sizes.reshape(-1).tolist()
             gpu_kv_buffer_set = set()

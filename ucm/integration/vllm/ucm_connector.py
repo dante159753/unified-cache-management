@@ -1043,6 +1043,9 @@ class UCMDirectConnector(KVConnectorBase_V1):
         self.launch_config = ucm_config.get_config()
         self.connector_configs = self.launch_config.get("ucm_connectors", [])
         assert len(self.connector_configs) > 0, "no storage connector name in config."
+        self._allgather_store_enabled = (
+            self.connector_configs[0].get("ucm_connector_name") == "UcmAllGatherStore"
+        )
         share_buffer_enable = (
             self.connector_configs[0]
             .get("ucm_connector_config", {})
@@ -1101,6 +1104,38 @@ class UCMDirectConnector(KVConnectorBase_V1):
 
     def get_block_size(self) -> int:
         return self.block_size
+
+    def shutdown(self) -> None:
+        release_prepared = getattr(self, "_release_prepared_load_batch", None)
+        if callable(release_prepared):
+            try:
+                release_prepared()
+            except Exception as e:
+                logger.error(
+                    f"release prepared load batch failed during shutdown. "
+                    f"{type(e).__name__}: {e}"
+                )
+        try:
+            self._flush_pending_dump_tasks()
+        except Exception as e:
+            logger.error(
+                f"flush pending dump tasks failed during shutdown. "
+                f"{type(e).__name__}: {e}"
+            )
+
+        closed = set()
+        for name in ("store", "rope_store", "fa_store", "wa_store"):
+            store = getattr(self, name, None)
+            if store is None or id(store) in closed:
+                continue
+            closed.add(id(store))
+            try:
+                store.close()
+            except Exception as e:
+                logger.error(
+                    f"close {name} failed during shutdown. " f"{type(e).__name__}: {e}"
+                )
+            setattr(self, name, None)
 
     def _get_full_hit_recompute_tokens(self) -> int:
         cached = getattr(self, "_recompute_tokens", None)
@@ -1217,6 +1252,11 @@ class UCMDirectConnector(KVConnectorBase_V1):
                     f"store_block_size={store_block_size}."
                 )
             config["local_rank_size"] = self.tp_size if self.is_mla else 1
+            if self._allgather_store_enabled:
+                config["allgather_rank"] = self.tp_rank % self.tp_size
+                config["allgather_world_size"] = self.tp_size
+                config["allgather_replicated_data"] = self.is_mla
+                config["allgather_layerwise"] = kv_cache_layout.use_layerwise
             buffer_addrs = kv_cache_layout.base_ptrs.reshape(-1).tolist()
             buffer_sizes = kv_cache_layout.buffer_sizes.reshape(-1).tolist()
             gpu_kv_buffer_set = set()
@@ -1769,7 +1809,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
         }
         self._async_dump_req_ids.update(metadata_dump_request_ids)
 
-        if self.is_mla and self.tp_rank != 0:
+        if self.is_mla and self.tp_rank != 0 and not self._allgather_store_enabled:
             return
 
         is_save = False
@@ -1783,6 +1823,17 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 continue
 
             ucm_block_ids, vllm_block_ids = request.dump_block_ids
+            if self._allgather_store_enabled:
+                owned_pairs = [
+                    (ucm_block_id, vllm_block_id)
+                    for ucm_block_id, vllm_block_id in zip(
+                        ucm_block_ids, vllm_block_ids
+                    )
+                    if self.store.owns(ucm_block_id)
+                ]
+                if not owned_pairs:
+                    continue
+                ucm_block_ids, vllm_block_ids = map(list, zip(*owned_pairs))
             if self._skip_null_vllm_blocks:
                 ucm_block_ids, vllm_block_ids = _drop_null_vllm_blocks(
                     ucm_block_ids,
@@ -1797,7 +1848,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
             num_saved_block += len(ucm_block_ids)
             num_saved_request += 1
             store_block_ids = ucm_block_ids
-            if self.tp_rank != 0:
+            if self.tp_rank != 0 and not self.is_mla:
                 store_block_ids = [
                     self.request_hasher(block_id) for block_id in ucm_block_ids
                 ]
@@ -1982,7 +2033,8 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         self.is_save = False
         self.need_load = False
         self.dump_total_ptrs: np.ndarray | None = None
-        self.request_data: list[tuple[str, list, list, np.ndarray]] = []
+        self.request_data: list[tuple[str, list, list, np.ndarray, Any]] = []
+        self._prepared_load_batch: Any = None
         self._failure_req_ids: set[str] = set()
         self._layerwise_prev_wait_end: Optional[float] = None
         self._layerwise_batch_start: Optional[float] = None
@@ -2101,7 +2153,11 @@ class UCMLayerWiseConnector(UCMDirectConnector):
 
         metadata = self._get_connector_metadata()
         block_ids_by_request = {
-            request_id: set(metadata.request_meta[request_id].dump_block_ids[0])
+            request_id: {
+                block_id
+                for block_id in metadata.request_meta[request_id].dump_block_ids[0]
+                if not self._allgather_store_enabled or self.store.owns(block_id)
+            }
             for request_id in dump_request_ids
         }
         local_layer_id = layer_id - self.first_layer_id
@@ -2169,6 +2225,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
             ucm_block_ids,
             store_block_ids,
             total_ptrs,
+            prepared_load,
         ) in self.request_data:
             if request_id in self._failure_req_ids:
                 continue
@@ -2181,6 +2238,8 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                     store_block_ids,
                     shard_indexs,
                     layer_ptrs,
+                    prepared_load,
+                    local_row,
                 )
                 self.load_tasks[layer_id][request_id] = task
             except Exception as e:
@@ -2196,9 +2255,16 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 self._failure_req_ids.add(request_id)
                 self._connector_worker_meta.mark_failed(request_id)
 
+    def _release_prepared_load_batch(self) -> None:
+        if self._prepared_load_batch is None:
+            return
+        self.store.release_prepared_load_batch(self._prepared_load_batch)
+        self._prepared_load_batch = None
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         self._layerwise_batch_start = time.perf_counter()
         metadata = self._get_connector_metadata()
+        self._release_prepared_load_batch()
         self.load_tasks.clear()
         self.request_data.clear()
         self._failure_req_ids.clear()
@@ -2222,8 +2288,31 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 vllm_block_ids, layer_first=True
             )
             self.request_data.append(
-                (request_id, ucm_block_ids, store_block_ids, total_ptrs)
+                (request_id, ucm_block_ids, store_block_ids, total_ptrs, None)
             )
+
+        if self._allgather_store_enabled and self.request_data:
+            try:
+                self._prepared_load_batch, prepared_requests = (
+                    self.store.prepare_load_batch(
+                        [
+                            (store_block_ids, total_ptrs)
+                            for _, _, store_block_ids, total_ptrs, _ in (
+                                self.request_data
+                            )
+                        ]
+                    )
+                )
+                self.request_data = [
+                    (*request[:4], prepared)
+                    for request, prepared in zip(self.request_data, prepared_requests)
+                ]
+            except Exception as e:
+                logger.error(
+                    "prepare all-gather load batch failed; falling back to "
+                    f"per-layer metadata. {type(e).__name__}: {e}"
+                )
+                self._prepared_load_batch = None
 
         if self.need_load:
             first_submit_start = time.perf_counter()
@@ -2279,6 +2368,8 @@ class UCMLayerWiseConnector(UCMDirectConnector):
             self._submit_request_load_tasks_for_layer(
                 next_layer_id, next_local_row, metadata
             )
+        else:
+            self._release_prepared_load_batch()
 
         blocking_ms = (wait_end - wait_start) * 1000
         self._layerwise_batch_wait_blocking_total_ms += blocking_ms
@@ -2305,7 +2396,11 @@ class UCMLayerWiseConnector(UCMDirectConnector):
     ) -> None:
         if not self._connector_metadata:
             return
-        if self.is_mla and self.tp_rank % self.tp_size != 0:
+        if (
+            self.is_mla
+            and self.tp_rank % self.tp_size != 0
+            and not self._allgather_store_enabled
+        ):
             return
 
         metadata = self._get_connector_metadata()
@@ -2318,11 +2413,22 @@ class UCMLayerWiseConnector(UCMDirectConnector):
             if len(request.dump_block_ids[0]) == 0:
                 continue
 
+            ucm_block_ids, vllm_block_ids = request.dump_block_ids
+            if self._allgather_store_enabled:
+                owned_pairs = [
+                    (ucm_block_id, vllm_block_id)
+                    for ucm_block_id, vllm_block_id in zip(
+                        ucm_block_ids, vllm_block_ids
+                    )
+                    if self.store.owns(ucm_block_id)
+                ]
+                if not owned_pairs:
+                    continue
+                ucm_block_ids, vllm_block_ids = map(list, zip(*owned_pairs))
             self.is_save = True
             dump_request_ids.add(request_id)
-            ucm_block_ids, vllm_block_ids = request.dump_block_ids
             store_block_ids = ucm_block_ids
-            if self.tp_rank % self.tp_size != 0:
+            if self.tp_rank % self.tp_size != 0 and not self.is_mla:
                 store_block_ids = [
                     self.request_hasher(block_id) for block_id in ucm_block_ids
                 ]
@@ -2784,6 +2890,17 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
             self.connector = UCMLayerWiseConnector(vllm_config, role, kv_cache_config)
         else:
             self.connector = UCMDirectConnector(vllm_config, role, kv_cache_config)
+
+    def shutdown(self) -> None:
+        connector = getattr(self, "connector", None)
+        if connector is None:
+            return
+        try:
+            shutdown = getattr(connector, "shutdown", None)
+            if callable(shutdown):
+                shutdown()
+        finally:
+            self.connector = None
 
     def get_block_size(self) -> int:
         return self.connector.get_block_size()

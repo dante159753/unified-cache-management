@@ -738,6 +738,11 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 )
             # MLA stores aggregate TP shards under one logical rank group.
             config["local_rank_size"] = self.tp_size if self.is_mla else 1
+            if self._allgather_store_enabled:
+                config["allgather_rank"] = self.tp_rank % self.tp_size
+                config["allgather_world_size"] = self.tp_size
+                config["allgather_replicated_data"] = True
+                config["allgather_layerwise"] = False
             if cpu_affinity_cores:
                 config["cpu_affinity_cores"] = list(cpu_affinity_cores)
         else:
@@ -1353,7 +1358,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         dump_request_ids: tuple[str] = ()
         fa_dump_blocks_by_request: dict[str, set[bytes]] = {}
         wa_dump_blocks_by_request: dict[str, set[bytes]] = {}
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not self._allgather_store_enabled:
             # Split FA rows by canonical block index. Block-wise WA follows the same
             # TP key slice; chunk-wise WA assigns one final boundary per request.
             wa_dump_ring_idx = 0

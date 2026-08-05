@@ -97,6 +97,13 @@ class UcmPipelineStore(UcmKVStoreBaseV1):
     def cc_store(self) -> int:
         return self.store_.Self()
 
+    def close(self) -> None:
+        if self.store_ is None:
+            return
+        store = self.store_
+        self.store_ = None
+        store.Close()
+
     def lookup(self, block_ids: List[bytes]) -> List[bool]:
         flat = np.frombuffer(b"".join(block_ids), dtype=np.uint8)
         res = self.store_.Lookup(flat)

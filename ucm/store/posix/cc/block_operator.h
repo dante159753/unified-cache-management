@@ -36,8 +36,10 @@
 #include <sys/stat.h>
 #include <thread>
 #include "logger/logger.h"
+#include "metrics_api.h"
 #include "space_layout.h"
 #include "thread/cpu_affinity.h"
+#include "time/now_time.h"
 #include "type/types.h"
 
 namespace UC::PosixStore {
@@ -86,6 +88,8 @@ public:
         int32_t flags;
         OpenCallback callback;
         uint64_t tag{0};
+        bool dump{false};
+        double enqueueTp{0};
     };
     struct CommitTask {
         Detail::BlockId id;
@@ -120,9 +124,17 @@ public:
     void Submit(std::list<OpenTask>&& tasks)
     {
         auto& q = openQueue_;
-        std::lock_guard<std::mutex> lock{q.mutex};
-        q.queue.splice(q.queue.end(), tasks);
-        q.cv.notify_all();
+        const auto now = NowTime::Now();
+        for (auto& task : tasks) { task.enqueueTp = now; }
+        size_t depth;
+        {
+            std::lock_guard<std::mutex> lock{q.mutex};
+            q.queue.splice(q.queue.end(), tasks);
+            depth = q.queue.size();
+            q.cv.notify_all();
+        }
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("posix_open_queue_depth"),
+                                 static_cast<double>(depth));
     }
     void Submit(CommitTask&& task)
     {
@@ -163,6 +175,7 @@ private:
         constexpr const auto mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
         for (;;) {
             OpenTask task;
+            size_t queueDepth;
             {
                 std::unique_lock<std::mutex> lock{openQueue_.mutex};
                 openQueue_.cv.wait(lock, [this] { return stop_ || !openQueue_.queue.empty(); });
@@ -170,7 +183,12 @@ private:
                 if (openQueue_.queue.empty()) { continue; }
                 task = std::move(openQueue_.queue.front());
                 openQueue_.queue.pop_front();
+                queueDepth = openQueue_.queue.size();
             }
+            const auto pickupTp = NowTime::Now();
+            RecordOpenQueueWait(task.dump, (pickupTp - task.enqueueTp) * 1e3);
+            UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("posix_open_queue_depth"),
+                                     static_cast<double>(queueDepth));
             const auto path = layout_->DataFilePath(task.id, task.activated);
 #ifdef UCM_ENABLE_TEST_HOOKS
             auto hook = TestHooks::GetOpenHook();
@@ -178,9 +196,24 @@ private:
 #else
             auto fd = ::open(path.c_str(), task.flags, mode);
 #endif
+            RecordOpenDuration(task.dump, (NowTime::Now() - pickupTp) * 1e3);
             auto err = (fd < 0) ? errno : 0;
             if (task.callback) { task.callback(OpenResult{fd, err}); }
         }
+    }
+
+    static void RecordOpenQueueWait(bool dump, double durationMs)
+    {
+        static UC::Metrics::CachedMetric loadMetric{"posix_load_open_queue_wait_ms"};
+        static UC::Metrics::CachedMetric dumpMetric{"posix_dump_open_queue_wait_ms"};
+        UC::Metrics::UpdateStats(dump ? dumpMetric : loadMetric, durationMs);
+    }
+
+    static void RecordOpenDuration(bool dump, double durationMs)
+    {
+        static UC::Metrics::CachedMetric loadMetric{"posix_load_open_duration_ms"};
+        static UC::Metrics::CachedMetric dumpMetric{"posix_dump_open_duration_ms"};
+        UC::Metrics::UpdateStats(dump ? dumpMetric : loadMetric, durationMs);
     }
     void CommitWorkerLoop()
     {

@@ -54,6 +54,9 @@ class UcmKVStoreBaseV1(ABC):
         """
         self.config = config
 
+    def close(self) -> None:
+        pass
+
     @abstractmethod
     def cc_store(self) -> int:
         """Return a low-level C/C++ pointer to the underlying store.

@@ -61,7 +61,11 @@ void LoadQueue::Submit(TaskPtr task, WaiterPtr waiter)
 {
     waiter->Up();
     auto success = waiting_.TryPush({task, waiter});
-    if (success) { return; }
+    if (success) {
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_waiting_queue_depth"),
+                                 static_cast<double>(waiting_.ApproxSize()));
+        return;
+    }
     UC_ERROR("Waiting queue full, submit load task({}) failed.", task->id);
     UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_queue_full_total"), 1.0);
     failureSet_->Insert(task->id);
@@ -135,6 +139,7 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
             continue;
         }
         shardTask.waiter = (i + 1 < nShard) ? nullptr : waiter;
+        shardTask.transferEnqueueTp = NowTime::Now();
         running_.Push(std::move(shardTask));
     }
     if (taskLaunch) {
@@ -146,8 +151,14 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
             pendingTasks.back().launchBoundary = true;
             pendingTasks.back().waiter = waiter;
         }
-        for (auto& shardTask : readyTasks) { running_.Push(std::move(shardTask)); }
-        for (auto& shardTask : pendingTasks) { running_.Push(std::move(shardTask)); }
+        for (auto& shardTask : readyTasks) {
+            shardTask.transferEnqueueTp = NowTime::Now();
+            running_.Push(std::move(shardTask));
+        }
+        for (auto& shardTask : pendingTasks) {
+            shardTask.transferEnqueueTp = NowTime::Now();
+            running_.Push(std::move(shardTask));
+        }
     }
     auto tpDispatch = NowTime::Now();
     UC_DEBUG("Cache task({}) dispatch shards({}), wait={:.3f}ms, cost={:.3f}ms.", task->id, nShard,
@@ -160,6 +171,8 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
                              static_cast<double>(backendSubmitCount));
     UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_shards_total"),
                              static_cast<double>(nShard));
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_transfer_queue_depth"),
+                             static_cast<double>(running_.ApproxSize()));
 }
 
 void LoadQueue::TransferStage(std::promise<Status>& started)
@@ -180,6 +193,11 @@ void LoadQueue::TransferStage(std::promise<Status>& started)
 
 void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& task)
 {
+    const auto transferPickupTp = NowTime::Now();
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_transfer_queue_wait_ms"),
+                             (transferPickupTp - task.transferEnqueueTp) * 1e3);
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_backend_wait_queue_depth"),
+                             static_cast<double>(running_.ApproxSize()));
     auto parentTask = task.task;
     const auto taskHandle = parentTask->id;
     if (failureSet_->Contains(taskHandle)) {
@@ -213,6 +231,7 @@ void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& task)
         }
 
         if (cacheSdmaDirect_) {
+            UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_h2d_batch_shards"), 1.0);
             s = HostToDeviceAsync(stream, task.bufferHandle.DeviceData(), task.shard.addrs.data());
             auto tpH2dSubmitted = NowTime::Now();
             if (s.Failure()) [[unlikely]] {
@@ -239,6 +258,7 @@ void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& task)
             break;
         }
 
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_h2d_batch_shards"), 1.0);
         s = HostToDeviceAsync(stream, task.bufferHandle.Data(), task.shard.addrs.data());
         auto tpH2dSubmitted = NowTime::Now();
         if (s.Failure()) [[unlikely]] {
@@ -317,6 +337,8 @@ Status LoadQueue::HostToDeviceTaskAsync(CopyStream& stream, std::vector<ShardTas
 Status LoadQueue::FlushSdmaDirectTaskBatch(CopyStream& stream)
 {
     if (holder_.empty()) { return Status::OK(); }
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_h2d_batch_shards"),
+                             static_cast<double>(holder_.size()));
     auto tpH2dSubmitStart = NowTime::Now();
     auto s = HostToDeviceTaskAsync(stream, holder_);
     auto tpH2dSubmitted = NowTime::Now();

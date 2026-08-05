@@ -125,6 +125,13 @@ _COUNTER_METRICS = [
         "Number of Posix AIO task or submit timeouts",
     ),
     (
+        "posix_aio_eagain_total",
+        (
+            "Number of Posix AIO submit attempts rejected with EAGAIN because the "
+            "kernel queue was saturated"
+        ),
+    ),
+    (
         "posix_io_timeout_total",
         "Number of Posix synchronous worker task timeouts",
     ),
@@ -420,6 +427,32 @@ _HISTOGRAM_METRICS = [
         [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
     ),
     (
+        "cache_load_waiting_queue_depth",
+        "Cache load dispatcher queue depth sampled after task submission",
+        [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024],
+    ),
+    (
+        "cache_load_transfer_queue_depth",
+        "Cache load transfer queue depth sampled after a task's shards are dispatched",
+        [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
+    ),
+    (
+        "cache_load_transfer_queue_wait_ms",
+        (
+            "Per-shard time from transfer queue insertion until the transfer thread "
+            "picks it up (ms)"
+        ),
+        [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "cache_backend_wait_queue_depth",
+        (
+            "Number of later shards queued when the transfer thread starts waiting "
+            "for the current shard backend completion"
+        ),
+        [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
+    ),
+    (
         "cache_shard_backend_wait_ms",
         (
             "Cache load per-shard time spent in WaitBackendTaskReady before H2D submit "
@@ -443,6 +476,11 @@ _HISTOGRAM_METRICS = [
             "cache_shard_backend_wait_ms => storage read is the bottleneck."
         ),
         [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "cache_h2d_batch_shards",
+        "Number of shards included in one Cache H2D launch",
+        [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024],
     ),
     (
         "cache_dump_mkbuf_duration_ms",
@@ -523,6 +561,69 @@ _HISTOGRAM_METRICS = [
         [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
     ),
     (
+        "posix_open_queue_depth",
+        "Posix open worker queue depth sampled on submission and worker pickup",
+        [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
+    ),
+    (
+        "posix_load_open_queue_wait_ms",
+        "Per-shard load time spent waiting for a Posix open worker (ms)",
+        [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "posix_dump_open_queue_wait_ms",
+        "Per-shard dump time spent waiting for a Posix open worker (ms)",
+        [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "posix_load_open_duration_ms",
+        "Posix load open syscall duration per shard (ms)",
+        [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50],
+    ),
+    (
+        "posix_dump_open_duration_ms",
+        "Posix dump open syscall duration per shard (ms)",
+        [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50],
+    ),
+    (
+        "posix_load_aio_submit_ms",
+        "Posix load io_submit duration including EAGAIN retry delay (ms)",
+        [0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100],
+    ),
+    (
+        "posix_dump_aio_submit_ms",
+        "Posix dump io_submit duration including EAGAIN retry delay (ms)",
+        [0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100],
+    ),
+    (
+        "posix_load_io_completion_latency_ms",
+        "Posix load latency from AIO request construction until its completion callback starts (ms)",
+        [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "posix_dump_io_completion_latency_ms",
+        "Posix dump latency from AIO request construction until its completion callback starts (ms)",
+        [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "posix_aio_inflight_depth",
+        "Posix AIO in-flight IO count sampled at submit and completion",
+        [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
+    ),
+    (
+        "posix_aio_completion_batch_size",
+        "Number of AIO completions harvested in one io_getevents batch",
+        [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
+    ),
+    (
+        "posix_aio_callback_batch_ms",
+        (
+            "Time spent executing callbacks and bookkeeping for one harvested AIO "
+            "completion batch (ms)"
+        ),
+        [0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50],
+    ),
+    (
         "mooncake_load_duration_ms",
         "End-to-end Mooncake load task duration (ms)",
         [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
@@ -601,6 +702,41 @@ _HISTOGRAM_METRICS = [
         "mooncake_dump_backend_wait_duration_ms",
         "Mooncake dump time waiting for backend archive completion (ms)",
         [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000],
+    ),
+    (
+        "allgather_load_task_queue_depth",
+        "AllGather load task FIFO depth sampled after enqueue",
+        [1, 2, 4, 8, 16, 32, 64, 128],
+    ),
+    (
+        "allgather_load_windows",
+        "Number of fused windows processed by one AllGather load task",
+        [0, 1, 2, 4, 8, 16, 32, 64],
+    ),
+    (
+        "allgather_load_inner_wait_ms",
+        "Total time one AllGather task waits for inner Cache or Posix loads (ms)",
+        [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "allgather_load_collective_submit_ms",
+        "Total CPU time in all_gather_into_tensor calls for one load task (ms)",
+        [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100],
+    ),
+    (
+        "allgather_load_scatter_submit_ms",
+        "Total CPU time submitting compact scatter kernels for one load task (ms)",
+        [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100],
+    ),
+    (
+        "allgather_load_sync_ms",
+        "Final current-stream synchronization time after AllGather and compact scatter (ms)",
+        [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200],
+    ),
+    (
+        "allgather_load_slot_reclaim_wait_ms",
+        "Time blocked reclaiming a fused load slot whose completion event has not fired (ms)",
+        [0, 0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50],
     ),
     (
         "layerwise_batch_total_ms",
