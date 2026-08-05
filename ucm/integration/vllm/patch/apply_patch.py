@@ -126,6 +126,11 @@ def get_supported_versions() -> list[str]:
     ]
 
 
+def _should_apply_generic_load_failure_patch(version: str) -> bool:
+    major, minor, *_ = version.split(".")
+    return (int(major), int(minor)) >= (0, 18)
+
+
 def apply_all_patches() -> None:
     """Apply all vLLM patches based on detected version."""
     version: Optional[str] = None
@@ -178,8 +183,7 @@ def apply_all_patches() -> None:
             case _:
                 pass
 
-        major, minor, *_ = version.split(".")
-        if (int(major), int(minor)) >= (0, 18):
+        if _should_apply_generic_load_failure_patch(version):
             logger.info("UCM patching vllm for load-failure recovery...")
             import ucm.integration.vllm.patch.load_failure_patch
 

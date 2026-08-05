@@ -733,6 +733,8 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
     specialization for shared KV tensor pages.
     """
 
+    _supports_async_load = True
+
     @classmethod
     def supports_kv_cache_layout(cls, kv_cache_config) -> bool:
         if kv_cache_config is None:
@@ -1019,17 +1021,20 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             f"total_tokens: {len(request.all_token_ids)}"
         )
 
+        do_async_load = self.load_async and external_hit_tokens > 0
+
         self.requests_meta[request.request_id] = HLARequestMeta(
             ucm_block_ids=primary_block_ids,
             hbm_hit_block_num=hbm_hit_block_num,
             total_hit_block_num=total_hit_block_num,
             num_token_ids=len(request.all_token_ids),
             token_processed=num_total_hit_tokens,
+            do_async_load=do_async_load,
             group_ucm_block_ids=group_ucm_block_ids,
             group_vllm_block_ids=[[] for _ in range(self.group_manager.num_groups)],
         )
 
-        return external_hit_tokens, False
+        return external_hit_tokens, do_async_load
 
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
@@ -1045,6 +1050,12 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                 f"HLA group count {self.group_manager.num_groups}"
             )
         req_meta.group_vllm_block_ids = [list(group) for group in block_ids]
+        if not req_meta.do_async_load:
+            return
+        if num_external_tokens == 0:
+            req_meta.do_async_load = False
+            return
+        req_meta.load_async_pending = True
 
     def _generate_hla_dispatch_meta(
         self,
@@ -1201,6 +1212,33 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             (dump_ucm_block_ids, dump_vllm_block_ids),
         )
 
+    def _build_async_load_dispatch_meta(
+        self,
+        requests_dispatch_meta: dict[str, RequestDispatchMeta],
+    ) -> None:
+        assert self.group_manager is not None
+        empty_per_group: tuple[list[int], ...] = tuple(
+            [] for _ in range(self.group_manager.num_groups)
+        )
+        for request_id, req_meta in self.requests_meta.items():
+            if not req_meta.load_async_pending:
+                continue
+            assert isinstance(req_meta, HLARequestMeta)
+            req_meta.load_async_pending = False
+            req_meta.async_loaded = True
+            dispatch_meta = self._generate_hla_dispatch_meta(
+                req_meta,
+                0,
+                empty_per_group,
+                request_id=request_id,
+            )
+            dispatch_meta.is_async_load = True
+            requests_dispatch_meta[request_id] = dispatch_meta
+            logger.info(
+                f"request {request_id} async HLA load dispatched, "
+                f"blocks: {len(dispatch_meta.load_block_ids[0])}"
+            )
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
@@ -1209,6 +1247,7 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         empty_per_group: tuple[list[int], ...] = tuple([] for _ in range(num_groups))
 
         requests_dispatch_meta: dict[str, RequestDispatchMeta] = {}
+        self._build_async_load_dispatch_meta(requests_dispatch_meta)
 
         for request in scheduler_output.scheduled_new_reqs:
             request_id = request.req_id
@@ -1220,6 +1259,7 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                 req_meta,
                 scheduler_output.num_scheduled_tokens[request_id],
                 request.block_ids,
+                self._consume_async_loaded(req_meta, True),
                 request_id=request_id,
                 incoming_block_ids_are_full=True,
             )
@@ -1249,7 +1289,7 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                     req_meta,
                     scheduler_output.num_scheduled_tokens[request_id],
                     new_block_ids,
-                    resumed_from_preemption,
+                    self._consume_async_loaded(req_meta, resumed_from_preemption),
                     request_id=request_id,
                     incoming_block_ids_are_full=resumed_from_preemption,
                 )
@@ -1264,7 +1304,9 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                     req_meta,
                     scheduler_output.num_scheduled_tokens[request_id],
                     request.new_block_ids,
-                    request.resumed_from_preemption,
+                    self._consume_async_loaded(
+                        req_meta, request.resumed_from_preemption
+                    ),
                     request_id=request_id,
                     incoming_block_ids_are_full=request.resumed_from_preemption,
                 )
@@ -1375,6 +1417,8 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
 
 class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnector):
     """Layerwise connector for full-attention + linear-attention hybrid layouts."""
+
+    _supports_async_load = False
 
     def __init__(
         self,

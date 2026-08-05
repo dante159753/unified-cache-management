@@ -1,6 +1,28 @@
 from collections.abc import Iterable
+from functools import wraps
 
 from vllm.v1.request import Request, RequestStatus
+
+_ASYNC_HYBRID_LOAD_REQUESTS: set[str] = set()
+
+
+def make_allocate_slots_patch(original_allocate_slots):
+    @wraps(original_allocate_slots)
+    def allocate_slots(self, request, num_new_tokens, *args, **kwargs):
+        request_id = request.request_id
+        if request_id not in _ASYNC_HYBRID_LOAD_REQUESTS:
+            return original_allocate_slots(
+                self, request, num_new_tokens, *args, **kwargs
+            )
+        _ASYNC_HYBRID_LOAD_REQUESTS.discard(request_id)
+        if not kwargs.get("delay_cache_blocks", False):
+            return original_allocate_slots(
+                self, request, num_new_tokens, *args, **kwargs
+            )
+        return original_allocate_slots(self, request, 0, *args, **kwargs)
+
+    setattr(allocate_slots, "_ucm_async_hybrid_load_patch", True)
+    return allocate_slots
 
 
 class Scheduler:
@@ -11,6 +33,11 @@ class Scheduler:
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
     ) -> int:
+        if num_new_tokens == 0 and num_external_computed_tokens > 0:
+            # Pass vLLM's zero-token early exit; allocate_slots restores the
+            # actual new-token count to zero before delayed block allocation.
+            _ASYNC_HYBRID_LOAD_REQUESTS.add(request.request_id)
+            return 1
         num_computed_tokens = (
             request.num_computed_tokens
             + num_new_local_computed_tokens

@@ -123,6 +123,8 @@ class UCMBlendConnector(UCMDirectConnector):
     This Connector process chunk hash and prefix cache
     """
 
+    _supports_async_load = False
+
     def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole):
         super().__init__(vllm_config, role)
         ucm_sparse_config = self.launch_config.get("ucm_sparse_config", [])

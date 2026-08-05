@@ -55,6 +55,22 @@ def patch_core_sched_scheduler(mod):
     )
 
 
+@when_imported("vllm.v1.core.kv_cache_manager")
+def patch_core_kv_cache_manager_for_async_hybrid_load(mod):
+    logger.debug(f"Patched {mod} called")
+
+    from ucm.integration.vllm.patch.v0180.vllm.pc.v1.core.sched import scheduler
+
+    original = mod.KVCacheManager.allocate_slots
+    if getattr(original, "_ucm_async_hybrid_load_patch", False):
+        return
+    patch_or_inject(
+        mod.KVCacheManager,
+        "allocate_slots",
+        scheduler.make_allocate_slots_patch(original),
+    )
+
+
 @when_imported("vllm.v1.worker.gpu_model_runner")
 def patch_worker_gpu_model_runner(mod):
     logger.debug(f"Patched {mod} called")
