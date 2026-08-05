@@ -1184,7 +1184,8 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
         if task.passthrough:
             return self._inner.check(task.inner_task)
         if task.operation == "load":
-            return False
+            self._wait_queued_load(task)
+            return True
         for window in task.dump_windows:
             if window.completed:
                 continue

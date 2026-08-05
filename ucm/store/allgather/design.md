@@ -105,7 +105,8 @@ Layerwise shards are much smaller; the 256 MiB default normally retains W=32.
 ## Load pipeline
 
 `load_data` immediately submits up to `Kl` owner-local PipelineStore loads, so
-POSIX/H2D starts before `wait`. `wait` processes windows in deterministic order:
+POSIX/H2D starts before completion. `wait` processes windows in deterministic
+order:
 
 1. wait for the owner-local PipelineStore load, if any;
 2. AllGather the fixed send payload into the slot receive payload;
@@ -125,6 +126,10 @@ there is no device-wide or current-stream synchronization. Concurrent load
 tasks exceeding the configured pipeline depth remain in a FIFO queue. Finishing
 the head task primes the next task, preserving identical collective order on all
 TP ranks while bounding temporary HBM by the configured slot count.
+
+Async vLLM loads complete through `check`. A load check drives the same FIFO
+completion path as `wait`, because owner-local readiness differs by rank and all
+ranks must enter every payload collective in identical order.
 
 On an owner failure, the affected rank skips local scatter but still enters all
 payload collectives with its valid staging allocation, preserving collective
