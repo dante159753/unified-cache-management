@@ -127,9 +127,22 @@ tasks exceeding the configured pipeline depth remain in a FIFO queue. Finishing
 the head task primes the next task, preserving identical collective order on all
 TP ranks while bounding temporary HBM by the configured slot count.
 
-Async vLLM loads complete through `check`. A load check drives the same FIFO
-completion path as `wait`, because owner-local readiness differs by rank and all
-ranks must enter every payload collective in identical order.
+Async vLLM loads are progressed by one dedicated FIFO worker per rank. FA and
+WA stores on the same worker share this progressor, so their collective order
+is identical on every TP rank. The worker sleeps on a condition variable while
+idle and performs owner I/O waits,
+AllGather, compact scatter, and stream completion on a dedicated NPU stream
+outside the scheduler thread. Metadata uploads record an event on the caller's
+stream; the progress stream waits for that event before scatter.
+`check` only reads task completion state and never waits for I/O or the device.
+`wait` blocks on the same completion condition. Keeping one progress worker per
+rank preserves identical collective order when owner-local readiness differs.
+The shared progressor owns one dedicated HCCL process group with the same TP
+membership, so its background collectives cannot interleave with model
+collectives on the vLLM TP group. The group is initialized with a barrier on
+the worker thread before the progress thread can issue its first collective.
+Its HCCL buffer defaults to 32 MiB instead of the runtime's 200 MiB default;
+`allgather_hccl_buffer_mb` can override it for larger transfer windows.
 
 On an owner failure, the affected rank skips local scatter but still enters all
 payload collectives with its valid staging allocation, preserving collective
@@ -189,9 +202,12 @@ CacheStore/POSIX implementation.
 ## Constraints
 
 - All TP ranks must call load waits in the same order.
-- One Store instance is worker-thread local; pool mutation is not thread-safe.
-- The caller must enqueue KV consumers on the same current NPU stream after
-  `wait`, as vLLM does. The recorded completion event protects slot reuse.
+- Load-pool mutation is owned by the per-rank progress worker. Submission,
+  completion state, and prepared metadata lifetime are protected by its
+  condition lock.
+- A completed load has synchronized the progress worker's current NPU stream,
+  so KV consumers may run on the caller's current stream. The recorded
+  completion event protects slot reuse.
 - Address `0` entries are metadata-only ghost tensors and are skipped.
 - Direct-I/O tail padding is gathered and persisted but never scattered into
   model tensors.

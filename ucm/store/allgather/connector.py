@@ -1,4 +1,5 @@
 import copy
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -21,6 +22,7 @@ _MAX_AIV_CORES = 40
 _COPY_CHUNK_BYTES = 32 * 1024
 _DESCRIPTOR_BYTES = 3 * np.dtype(np.int64).itemsize
 _CHUNK_LAYOUT_FIELDS = 4
+_DEFAULT_HCCL_BUFFER_MB = 32
 
 
 @dataclass
@@ -84,6 +86,7 @@ class _PreparedLoadBatch:
     arena: _LoadMetadataArena
     host_destination_tensor: torch.Tensor
     host_route_tensor: torch.Tensor
+    metadata_event: object = None
     released: bool = False
     active_tasks: int = 0
 
@@ -131,10 +134,137 @@ class AllGatherTask(Task):
     host_destination_tensor: Optional[torch.Tensor] = None
     host_route_tensor: Optional[torch.Tensor] = None
     prepared_batch: Optional[_PreparedLoadBatch] = None
+    metadata_event: object = None
     dump_windows: List[_DumpWindow] = field(default_factory=list)
     passthrough: bool = False
     completed: bool = False
     terminal_error: Optional[BaseException] = None
+
+
+class _LoadProgressManager:
+    def __init__(
+        self,
+        device_id: int,
+        group: object = None,
+        registry_key: object = None,
+        owns_group: bool = False,
+    ) -> None:
+        self.group = group
+        self.registry_key = registry_key
+        self._owns_group = owns_group
+        self._device_id = device_id
+        self._condition = threading.Condition()
+        self._queue = deque()
+        self._connectors = set()
+        self._stop = False
+        self._error = None
+        self._thread = None
+
+    @property
+    def error(self) -> Optional[BaseException]:
+        with self._condition:
+            return self._error
+
+    def register(self, connector: "UcmAllGatherStore") -> None:
+        with self._condition:
+            self._connectors.add(connector)
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._loop,
+                    name=f"ucm-allgather-load-{self._device_id}",
+                    daemon=True,
+                )
+                self._thread.start()
+
+    def submit(self, connector: "UcmAllGatherStore", task: AllGatherTask) -> None:
+        with self._condition:
+            if self._error is not None:
+                raise self._error
+            self._queue.append((connector, task))
+            self._condition.notify()
+
+    def release(self, connector: "UcmAllGatherStore") -> None:
+        thread = None
+        with self._condition:
+            self._connectors.remove(connector)
+            if not self._connectors:
+                self._stop = True
+                self._condition.notify_all()
+                thread = self._thread
+        if thread is None:
+            return
+        thread.join()
+        if self._owns_group and self.group is not None:
+            dist.destroy_process_group(self.group)
+        if self.registry_key is not None:
+            with _SHARED_PROGRESS_MANAGERS_LOCK:
+                current = _SHARED_PROGRESS_MANAGERS.get(self.registry_key)
+                if current is self:
+                    del _SHARED_PROGRESS_MANAGERS[self.registry_key]
+
+    def _loop(self) -> None:
+        try:
+            torch.npu.set_device(self._device_id)
+            progress_stream = torch.npu.Stream()
+            with torch.npu.stream(progress_stream):
+                while True:
+                    with self._condition:
+                        while not self._queue and not self._stop:
+                            self._condition.wait()
+                        if self._stop:
+                            return
+                        connector, task = self._queue.popleft()
+                    connector._finish_load_task(task)
+        except BaseException as error:
+            logger.exception("allgather load progressor failed")
+            with self._condition:
+                self._error = error
+                self._queue.clear()
+                connectors = list(self._connectors)
+                self._condition.notify_all()
+            for connector in connectors:
+                connector._abort_load_tasks(error)
+
+
+_SHARED_PROGRESS_MANAGERS = {}
+_SHARED_PROGRESS_MANAGERS_LOCK = threading.Lock()
+
+
+def _acquire_shared_progress_manager(
+    device_id: int, hccl_buffer_mb: int
+) -> _LoadProgressManager:
+    from vllm.distributed.parallel_state import get_tp_group
+
+    tp_group = get_tp_group()
+    backend = getattr(tp_group, "backend", None)
+    if backend is None:
+        backend = dist.get_backend(tp_group.device_group)
+    group_ranks = tuple(tuple(ranks) for ranks in tp_group.group_ranks)
+    key = (device_id, str(backend), group_ranks, hccl_buffer_mb)
+    with _SHARED_PROGRESS_MANAGERS_LOCK:
+        manager = _SHARED_PROGRESS_MANAGERS.get(key)
+        if manager is not None:
+            return manager
+        local_group = None
+        pg_options = None
+        if "hccl" in str(backend).lower():
+            import torch_npu
+
+            pg_options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+            pg_options.hccl_config = {"hccl_buffer_size": hccl_buffer_mb}
+        for ranks in group_ranks:
+            group = dist.new_group(list(ranks), backend=backend, pg_options=pg_options)
+            if tp_group.rank in ranks:
+                local_group = group
+        dist.barrier(group=local_group)
+        manager = _LoadProgressManager(
+            device_id,
+            group=local_group,
+            registry_key=key,
+            owns_group=True,
+        )
+        _SHARED_PROGRESS_MANAGERS[key] = manager
+        return manager
 
 
 class _FusedBufferPool:
@@ -333,13 +463,17 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
         self._shard_size = int(config.get("shard_size", 0))
         self._logical_size = sum(self._tensor_sizes)
         self._device_id = int(config.get("device_id", -1))
+        self._hccl_buffer_mb = 0
         self._device = create_device() if self._worker else None
         self._copy_op = None
         self._tp_group = None
+        self._load_progress_manager = None
         self._pool = None
         self._active_dump_windows = deque()
         self._load_tasks = deque()
         self._unprimed_load_tasks = deque()
+        self._load_condition = threading.Condition()
+        self._load_progress_error = None
         self._load_metadata_arenas = []
         self._closed = False
 
@@ -366,12 +500,23 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
 
             self._copy_op = ucm_segmented_copy
             if self._collective_enabled:
+                hccl_buffer_mb = int(
+                    config.get("allgather_hccl_buffer_mb", _DEFAULT_HCCL_BUFFER_MB)
+                )
+                if hccl_buffer_mb <= 0:
+                    raise ValueError("allgather_hccl_buffer_mb must be positive")
+                self._hccl_buffer_mb = hccl_buffer_mb
                 if injected_group is None:
-                    from vllm.distributed.parallel_state import get_tp_group
-
-                    self._tp_group = get_tp_group().device_group
+                    self._load_progress_manager = _acquire_shared_progress_manager(
+                        self._device_id, hccl_buffer_mb
+                    )
                 else:
-                    self._tp_group = injected_group
+                    self._load_progress_manager = _LoadProgressManager(
+                        self._device_id, group=injected_group
+                    )
+                self._tp_group = self._load_progress_manager.group
+            else:
+                self._load_progress_manager = _LoadProgressManager(self._device_id)
 
             chunk_layout = []
             source_offset = 0
@@ -414,10 +559,13 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
                 "UcmAllGatherStore uses rank-private CacheStore host memory: "
                 f"rank={self._rank}, world_size={self._world_size}, "
                 f"shard_size={self._shard_size}, layerwise={layerwise}, "
-                f"mode={'allgather' if self._collective_enabled else 'local-coalesced'}"
+                f"mode={'allgather' if self._collective_enabled else 'local-coalesced'}, "
+                f"hccl_buffer_mb={self._hccl_buffer_mb}"
             )
 
         self._inner = UcmPipelineStore(inner_config)
+        if self._worker:
+            self._load_progress_manager.register(self)
 
     def close(self) -> None:
         if self._closed:
@@ -425,8 +573,9 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
         self._closed = True
         error = None
         if self._worker:
-            while self._load_tasks:
-                self._finish_next_load_task()
+            with self._load_condition:
+                while self._load_tasks:
+                    self._load_condition.wait()
             for window in list(self._active_dump_windows):
                 try:
                     self._finish_dump_window(window)
@@ -435,6 +584,11 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
                         error = current_error
             try:
                 torch.npu.synchronize(self._device_id)
+            except BaseException as current_error:
+                if error is None:
+                    error = current_error
+            try:
+                self._load_progress_manager.release(self)
             except BaseException as current_error:
                 if error is None:
                     error = current_error
@@ -449,6 +603,7 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
         self._load_metadata_arenas.clear()
         self._pool = None
         self._copy_op = None
+        self._load_progress_manager = None
         self._tp_group = None
         self._device = None
         if error is not None:
@@ -579,6 +734,8 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
         )
         task.destination_buffer.copy_(task.host_destination_tensor)
         task.route_buffer.copy_(task.host_route_tensor)
+        task.metadata_event = torch.npu.Event()
+        task.metadata_event.record(torch.npu.current_stream())
 
     def _compact_scatter(
         self, task: AllGatherTask, window: _LoadWindow, slot: _LoadSlot
@@ -702,20 +859,21 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
     def _acquire_load_metadata_arena(
         self, destination_rows: int, route_rows: int
     ) -> _LoadMetadataArena:
-        candidates = [
-            arena
-            for arena in self._load_metadata_arenas
-            if not arena.in_use
-            and arena.destination_capacity >= destination_rows
-            and arena.route_capacity >= route_rows
-        ]
-        if candidates:
-            arena = min(
-                candidates,
-                key=lambda item: item.destination_capacity + item.route_capacity,
-            )
-            arena.in_use = True
-            return arena
+        with self._load_condition:
+            candidates = [
+                arena
+                for arena in self._load_metadata_arenas
+                if not arena.in_use
+                and arena.destination_capacity >= destination_rows
+                and arena.route_capacity >= route_rows
+            ]
+            if candidates:
+                arena = min(
+                    candidates,
+                    key=lambda item: item.destination_capacity + item.route_capacity,
+                )
+                arena.in_use = True
+                return arena
 
         destination_capacity = self._metadata_capacity(destination_rows)
         route_capacity = self._metadata_capacity(route_rows)
@@ -734,7 +892,8 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
             route_capacity=route_capacity,
             in_use=True,
         )
-        self._load_metadata_arenas.append(arena)
+        with self._load_condition:
+            self._load_metadata_arenas.append(arena)
         return arena
 
     def prepare_load_batch(
@@ -794,7 +953,9 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
             arena=arena,
             host_destination_tensor=host_destination_tensor,
             host_route_tensor=host_route_tensor,
+            metadata_event=torch.npu.Event(),
         )
+        batch.metadata_event.record(torch.npu.current_stream())
         prepared_requests = [
             PreparedLoadRequest(
                 batch=batch,
@@ -814,11 +975,12 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
         return batch, prepared_requests
 
     def release_prepared_load_batch(self, batch: _PreparedLoadBatch) -> None:
-        if batch.released:
-            return
-        batch.released = True
-        if batch.active_tasks == 0:
-            batch.arena.in_use = False
+        with self._load_condition:
+            if batch.released:
+                return
+            batch.released = True
+            if batch.active_tasks == 0:
+                batch.arena.in_use = False
 
     @staticmethod
     def _build_load_windows(
@@ -875,12 +1037,22 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
             self._unprimed_load_tasks.popleft()
 
     def _queue_load_task(self, task: AllGatherTask) -> AllGatherTask:
-        self._load_tasks.append(task)
-        self._unprimed_load_tasks.append(task)
-        ucmmetrics.update_stats(
-            {"allgather_load_task_queue_depth": float(len(self._load_tasks))}
-        )
-        self._prime_queued_loads()
+        manager_error = self._load_progress_manager.error
+        with self._load_condition:
+            progress_error = self._load_progress_error or manager_error
+            if progress_error is not None:
+                task.terminal_error = progress_error
+                task.completed = True
+                self._release_prepared_task(task)
+                return task
+            self._load_tasks.append(task)
+            self._unprimed_load_tasks.append(task)
+            queue_depth = len(self._load_tasks)
+        try:
+            self._load_progress_manager.submit(self, task)
+        except BaseException as error:
+            self._abort_load_tasks(error)
+        ucmmetrics.update_stats({"allgather_load_task_queue_depth": float(queue_depth)})
         return task
 
     def _remove_unprimed_load_task(self, task: AllGatherTask) -> None:
@@ -888,6 +1060,14 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
             if pending is task:
                 del self._unprimed_load_tasks[index]
                 break
+
+    @staticmethod
+    def _release_prepared_task(task: AllGatherTask) -> None:
+        if task.prepared_batch is None:
+            return
+        task.prepared_batch.active_tasks -= 1
+        if task.prepared_batch.active_tasks == 0 and task.prepared_batch.released:
+            task.prepared_batch.arena.in_use = False
 
     def load_data_prepared(
         self,
@@ -897,8 +1077,6 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
     ) -> Task:
         if prepared.store_id != id(self):
             raise ValueError("prepared load belongs to a different store")
-        if prepared.batch.released:
-            raise RuntimeError("prepared load batch has already been released")
         if layer_index < 0 or layer_index >= prepared.layer_count:
             raise IndexError(
                 f"prepared load layer {layer_index} is outside "
@@ -915,11 +1093,18 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
             destination_buffer=prepared.batch.arena.destination_buffer,
             route_buffer=prepared.batch.arena.route_buffer,
             prepared_batch=prepared.batch,
+            metadata_event=prepared.batch.metadata_event,
         )
         if not task.load_windows:
-            task.completed = True
+            with self._load_condition:
+                if prepared.batch.released:
+                    raise RuntimeError("prepared load batch has already been released")
+                task.completed = True
             return task
-        prepared.batch.active_tasks += 1
+        with self._load_condition:
+            if prepared.batch.released:
+                raise RuntimeError("prepared load batch has already been released")
+            prepared.batch.active_tasks += 1
         return self._queue_load_task(task)
 
     def load_data(
@@ -1082,6 +1267,8 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
         collective_submit_ms = 0.0
         scatter_submit_ms = 0.0
         window_count = 0
+        if task.metadata_event is not None:
+            torch.npu.current_stream().wait_event(task.metadata_event)
         while task.active_load_windows:
             window = task.active_load_windows.popleft()
             window_count += 1
@@ -1117,7 +1304,8 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
                 raise
             self._pool.complete_load(slot)
             window.completed = True
-            self._prime_queued_loads()
+            with self._load_condition:
+                self._prime_queued_loads()
 
         sync_start = time.perf_counter()
         torch.npu.current_stream().synchronize()
@@ -1134,28 +1322,45 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
         if task.load_error is not None:
             raise task.load_error
 
-    def _finish_next_load_task(self) -> None:
-        task = self._load_tasks[0]
-        try:
+    def _finish_load_task(self, task: AllGatherTask) -> None:
+        with self._load_condition:
+            if not self._load_tasks or self._load_tasks[0] is not task:
+                raise RuntimeError("allgather load progress order mismatch")
             self._prime_queued_loads()
+        try:
             self._wait_load(task)
         except BaseException as error:
             self._drain_load_windows(task.active_load_windows)
-            self._remove_unprimed_load_task(task)
+            with self._load_condition:
+                self._remove_unprimed_load_task(task)
             task.terminal_error = error
-        task.completed = True
-        self._load_tasks.popleft()
-        if task.prepared_batch is not None:
-            task.prepared_batch.active_tasks -= 1
-            if task.prepared_batch.active_tasks == 0 and task.prepared_batch.released:
-                task.prepared_batch.arena.in_use = False
-        self._prime_queued_loads()
+        with self._load_condition:
+            task.completed = True
+            self._load_tasks.popleft()
+            self._release_prepared_task(task)
+            self._prime_queued_loads()
+            self._load_condition.notify_all()
+
+    def _abort_load_tasks(self, error: BaseException) -> None:
+        with self._load_condition:
+            self._load_progress_error = error
+            tasks = list(self._load_tasks)
+            self._load_tasks.clear()
+            self._unprimed_load_tasks.clear()
+        for task in tasks:
+            self._drain_load_windows(task.active_load_windows)
+            task.terminal_error = error
+            task.completed = True
+            self._release_prepared_task(task)
+        with self._load_condition:
+            self._load_condition.notify_all()
 
     def _wait_queued_load(self, task: AllGatherTask) -> None:
-        while not task.completed:
-            if not self._load_tasks:
-                raise RuntimeError("allgather load task is not queued")
-            self._finish_next_load_task()
+        with self._load_condition:
+            while not task.completed:
+                if not any(pending is task for pending in self._load_tasks):
+                    raise RuntimeError("allgather load task is not queued")
+                self._load_condition.wait()
         if task.terminal_error is not None:
             raise task.terminal_error
 
@@ -1184,8 +1389,7 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
         if task.passthrough:
             return self._inner.check(task.inner_task)
         if task.operation == "load":
-            self._wait_queued_load(task)
-            return True
+            return task.completed
         for window in task.dump_windows:
             if window.completed:
                 continue
