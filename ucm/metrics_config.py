@@ -144,6 +144,17 @@ def get_vllm_connector_metric_definitions(
     ]
 
 
+def get_multiproc_metric_definitions(
+    config: dict[str, Any] | None,
+) -> list[MetricDefinition]:
+    definitions = get_metric_definitions(config)
+    configured = (config or {}).get("multiproc_include_metrics")
+    if configured is None:
+        return definitions
+    included = {str(name) for name in configured}
+    return [definition for definition in definitions if definition.name in included]
+
+
 def setup_ucm_metrics(config: dict[str, Any] | None) -> list[MetricDefinition]:
     definitions = get_metric_definitions(config)
     if not definitions:

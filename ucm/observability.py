@@ -34,7 +34,7 @@ from ucm.logger import init_logger
 from ucm.metrics_config import (
     MULTIPROC_CONSUMER,
     consumer_enabled,
-    get_metric_definitions,
+    get_multiproc_metric_definitions,
     load_metrics_config,
     multiproc_metric_name,
     setup_ucm_metrics,
@@ -59,7 +59,8 @@ class PrometheusStatsLogger:
             logger.warning("Metrics are already registered, skipping re-registration.")
             return
         self.config = load_metrics_config(config_path)
-        self.metric_definitions = get_metric_definitions(self.config)
+        self.metric_definitions = get_multiproc_metric_definitions(self.config)
+        self.metric_names = {definition.name for definition in self.metric_definitions}
         if not self.metric_definitions:
             return
         if not consumer_enabled(self.config, MULTIPROC_CONSUMER):
@@ -104,7 +105,7 @@ class PrometheusStatsLogger:
 
         for cfg in cfg_list:
             name = cfg.get("name")
-            if not name:
+            if not name or name not in self.metric_names:
                 continue
             doc = cfg.get("documentation", "")
             prometheus_name = multiproc_metric_name(self.config, name)

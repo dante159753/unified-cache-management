@@ -460,6 +460,10 @@ class UCMDirectConnector(KVConnectorBase_V1):
             )
             self._vllm_metrics_enabled = bool(self._vllm_metric_definitions)
 
+        self._yuanrong_resource_reporter = None
+        if role == KVConnectorRole.SCHEDULER:
+            self._start_yuanrong_resource_reporter()
+
         self.persist_token_threshold = self.launch_config.get(
             "persist_token_threshold", 0
         )
@@ -475,6 +479,35 @@ class UCMDirectConnector(KVConnectorBase_V1):
     @staticmethod
     def _record_counter(name: str, value: float = 1.0) -> None:
         _record_counter(name, value)
+
+    def _start_yuanrong_resource_reporter(self) -> None:
+        config = self.connector_configs[0]["ucm_connector_config"]
+        pipeline = config.get("store_pipeline", "")
+        log_path = config.get("yuanrong_resource_log_path", "")
+        enabled = config.get("yuanrong_resource_metrics_enable", bool(log_path))
+        if not enabled or "YuanRong" not in pipeline or not log_path:
+            return
+        if not self.metrics_config or not consumer_enabled(
+            self.metrics_config, MULTIPROC_CONSUMER
+        ):
+            logger.warning(
+                "YuanRong resource metrics require the multiproc metrics consumer"
+            )
+            return
+
+        from ucm.integration.vllm.yuanrong_resource_reporter import (
+            YuanRongResourceReporter,
+        )
+
+        endpoint = (
+            f"{config.get('yuanrong_host', '')}:{config.get('yuanrong_port', '')}"
+        )
+        self._yuanrong_resource_reporter = YuanRongResourceReporter(
+            log_path=log_path,
+            endpoint=endpoint,
+            interval_sec=config.get("yuanrong_resource_metrics_interval_sec", 15),
+        )
+        self._yuanrong_resource_reporter.start()
 
     def _apply_sdma_direct_launch_granularity(self, config: dict[str, Any]) -> None:
         if "cache_sdma_direct_launch_granularity" in config:

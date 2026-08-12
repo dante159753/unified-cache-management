@@ -28,12 +28,29 @@
 #include <fmt/format.h>
 #include <future>
 #include "logger/logger.h"
+#include "metrics_api.h"
 #ifdef __linux__
 #include "thread/cpu_affinity.h"
 #endif
 #include "yuanrong_helper.h"
 
 namespace UC::YuanRongStore {
+
+void LoadQueue::LoadStats::Record() const
+{
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("yuanrong_load_success_shards_total"),
+                             static_cast<double>(yuanrongSuccess));
+    UC::Metrics::UpdateStats(
+        NAME_TO_METRIC_ID("yuanrong_lookup_miss_posix_load_success_shards_total"),
+        static_cast<double>(lookupMissPosixSuccess));
+    UC::Metrics::UpdateStats(
+        NAME_TO_METRIC_ID("yuanrong_load_fallback_posix_load_success_shards_total"),
+        static_cast<double>(loadFallbackPosixSuccess));
+    const auto succeeded = yuanrongSuccess + lookupMissPosixSuccess + loadFallbackPosixSuccess;
+    const auto failed = requested > succeeded ? requested - succeeded : 0;
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("yuanrong_load_failed_shards_total"),
+                             static_cast<double>(failed));
+}
 
 LoadQueue::~LoadQueue() { Close(); }
 
@@ -160,7 +177,9 @@ void LoadQueue::RunOne(CopyStream& stream, TaskPair&& pair)
     auto& task = pair.first;
     auto& waiter = pair.second;
     if (!failureSet_->Contains(task->id)) {
-        auto s = LoadOne(stream, task);
+        LoadStats stats{task->desc.size()};
+        auto s = LoadOne(stream, task, stats);
+        stats.Record();
         if (s.Failure()) {
             UC_ERROR("YuanRong load task({}) failed: {}.", task->id, s);
             failureSet_->Insert(task->id);
@@ -169,7 +188,7 @@ void LoadQueue::RunOne(CopyStream& stream, TaskPair&& pair)
     waiter->Done();
 }
 
-Status LoadQueue::LoadOne(CopyStream& stream, TaskPtr task)
+Status LoadQueue::LoadOne(CopyStream& stream, TaskPtr task, LoadStats& stats)
 {
     auto taskStart = NowTime::Now();
     std::vector<std::string> keys;
@@ -178,19 +197,21 @@ Status LoadQueue::LoadOne(CopyStream& stream, TaskPtr task)
     if (s.Failure()) { return s; }
     if (keys.empty()) { return Status::OK(); }
 
-    if (backend_ == nullptr) { return LoadThenRecover(stream, task, keys, blobLists, taskStart); }
+    if (backend_ == nullptr) {
+        return LoadThenRecover(stream, task, keys, blobLists, taskStart, stats);
+    }
 
     auto existStart = NowTime::Now();
     std::vector<bool> exists;
     auto existStatus = heteroClient_->Exist(keys, exists);
-    auto existEnd = NowTime::Now();
+    auto existFinished = NowTime::Now();
     if (existStatus.IsError() || exists.size() != keys.size()) {
         UC_WARN(
             "YuanRong load task({}) Exist cannot split keys, result={}/{}, cost={:.3f}ms, "
             "status={}; falling back to MGetH2D-first load.",
-            task->id, exists.size(), keys.size(), (existEnd - existStart) * 1e3,
+            task->id, exists.size(), keys.size(), (existFinished - existStart) * 1e3,
             existStatus.ToString());
-        return LoadThenRecover(stream, task, keys, blobLists, taskStart);
+        return LoadThenRecover(stream, task, keys, blobLists, taskStart, stats);
     }
 
     std::vector<size_t> hitIndexes;
@@ -198,12 +219,15 @@ Status LoadQueue::LoadOne(CopyStream& stream, TaskPtr task)
     PartitionExistence(exists, hitIndexes, missIndexes);
     UC_INFO("YuanRong load task({}) Exist keys={}, hit={}, miss={}, cost={:.3f}ms, status={}.",
             task->id, keys.size(), hitIndexes.size(), missIndexes.size(),
-            (existEnd - existStart) * 1e3, existStatus.ToString());
+            (existFinished - existStart) * 1e3, existStatus.ToString());
 
     if (hitIndexes.empty()) {
-        return RecoverFromBackend(stream, task, keys, blobLists, missIndexes);
+        return RecoverFromBackend(stream, task, keys, blobLists, missIndexes,
+                                  RecoverySource::LOOKUP_MISS, stats);
     }
-    if (missIndexes.empty()) { return LoadThenRecover(stream, task, keys, blobLists, taskStart); }
+    if (missIndexes.empty()) {
+        return LoadThenRecover(stream, task, keys, blobLists, taskStart, stats);
+    }
 
     std::vector<std::string> hitKeys;
     std::vector<datasystem::DeviceBlobList> hitBlobLists;
@@ -223,7 +247,8 @@ Status LoadQueue::LoadOne(CopyStream& stream, TaskPtr task)
     }
 
     auto backendStart = NowTime::Now();
-    auto backendStatus = RecoverFromBackend(stream, task, keys, blobLists, missIndexes);
+    auto backendStatus = RecoverFromBackend(stream, task, keys, blobLists, missIndexes,
+                                            RecoverySource::LOOKUP_MISS, stats);
     auto backendEnd = NowTime::Now();
 
     std::vector<std::string> failedHitKeys;
@@ -251,6 +276,7 @@ Status LoadQueue::LoadOne(CopyStream& stream, TaskPtr task)
     std::vector<size_t> racedMissIndexes;
     racedMissIndexes.reserve(failedHitSubsetIndexes.size());
     for (auto index : failedHitSubsetIndexes) { racedMissIndexes.push_back(hitIndexes[index]); }
+    stats.yuanrongSuccess += hitIndexes.size() - racedMissIndexes.size();
     UC_INFO(
         "YuanRong load task({}) parallel AsyncMGetH2D keys={}, bytes={}, raced_miss={}, "
         "window={:.3f}ms, join_wait={:.3f}ms, Posix={:.3f}ms, rc={}.",
@@ -261,7 +287,8 @@ Status LoadQueue::LoadOne(CopyStream& stream, TaskPtr task)
     auto firstFailure = std::move(backendStatus);
 
     if (!racedMissIndexes.empty()) {
-        auto status = RecoverFromBackend(stream, task, keys, blobLists, racedMissIndexes);
+        auto status = RecoverFromBackend(stream, task, keys, blobLists, racedMissIndexes,
+                                         RecoverySource::LOAD_FALLBACK, stats);
         if (firstFailure.Success() && status.Failure()) { firstFailure = std::move(status); }
     }
     UC_INFO(
@@ -275,7 +302,7 @@ Status LoadQueue::LoadOne(CopyStream& stream, TaskPtr task)
 Status LoadQueue::LoadThenRecover(CopyStream& stream, TaskPtr task,
                                   const std::vector<std::string>& keys,
                                   const std::vector<datasystem::DeviceBlobList>& blobLists,
-                                  double taskStart)
+                                  double taskStart, LoadStats& stats)
 {
     std::vector<std::string> failedKeys;
     constexpr int32_t mgetTimeoutMs = 0;
@@ -283,6 +310,7 @@ Status LoadQueue::LoadThenRecover(CopyStream& stream, TaskPtr task,
     auto rc = heteroClient_->MGetH2D(keys, blobLists, failedKeys, mgetTimeoutMs);
     auto getEnd = NowTime::Now();
     auto missIndexes = FailedIndexes(keys, failedKeys, rc.IsError());
+    stats.yuanrongSuccess += keys.size() - missIndexes.size();
     const auto totalBytes = config_.objectSize * keys.size();
     UC_INFO(
         "YuanRong load task({}) MGetH2D keys={}, bytes={}, miss={}, cost={:.3f}ms, "
@@ -301,7 +329,8 @@ Status LoadQueue::LoadThenRecover(CopyStream& stream, TaskPtr task,
                         missIndexes.size(), keys.size(), keys[missIndexes.front()], rc.ToString()));
     }
     auto recoverStart = NowTime::Now();
-    auto recoverStatus = RecoverFromBackend(stream, task, keys, blobLists, missIndexes);
+    auto recoverStatus = RecoverFromBackend(stream, task, keys, blobLists, missIndexes,
+                                            RecoverySource::LOAD_FALLBACK, stats);
     auto recoverEnd = NowTime::Now();
     UC_INFO(
         "YuanRong load task({}) recovered miss={}, posix load={:.3f}ms, total={:.3f}ms, "
@@ -314,7 +343,8 @@ Status LoadQueue::LoadThenRecover(CopyStream& stream, TaskPtr task,
 Status LoadQueue::RecoverFromBackend(CopyStream& stream, TaskPtr task,
                                      const std::vector<std::string>& keys,
                                      const std::vector<datasystem::DeviceBlobList>& blobLists,
-                                     const std::vector<size_t>& missIndexes)
+                                     const std::vector<size_t>& missIndexes, RecoverySource source,
+                                     LoadStats& stats)
 {
     auto ranges = RecoveryBatchRanges(missIndexes.size(), config_.recoveryBatchSize);
     if (ranges.empty()) { return Status::OK(); }
@@ -342,6 +372,11 @@ Status LoadQueue::RecoverFromBackend(CopyStream& stream, TaskPtr task,
         UC_INFO("YuanRong host load task({}) finalizing batch({}/{},{} blocks).", task->id, i + 1,
                 ranges.size(), current.indexes.size());
         auto status = FinalizeHostBatch(stream, blobLists, current);
+        if (status.Success()) {
+            auto& success = source == RecoverySource::LOOKUP_MISS ? stats.lookupMissPosixSuccess
+                                                                  : stats.loadFallbackPosixSuccess;
+            success += current.indexes.size();
+        }
         if (firstFailure.Success() && status.Failure()) { firstFailure = std::move(status); }
 
         if (next.valid()) {

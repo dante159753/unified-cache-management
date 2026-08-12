@@ -360,9 +360,15 @@ from ucm.integration.vllm.ucm_connector import (
     UCMConnector,
     UCMDirectConnector,
 )
+from ucm.integration.vllm.yuanrong_resource_reporter import (
+    YuanRongResourceReporter,
+    counter_deltas,
+    parse_yuanrong_resource_snapshot,
+)
 from ucm.metrics_config import (
     consumer_enabled,
     get_metric_definitions,
+    get_multiproc_metric_definitions,
     get_vllm_connector_metric_definitions,
     multiproc_metric_name,
     setup_ucm_metrics,
@@ -482,6 +488,128 @@ def test_config_definitions_register_enable_list_and_metric_names():
         ("cache_load_duration_ms", "histogram", (1, 5)),
         ("interval_lookup_hit_rates", "histogram", (0.1, 0.5, 1.0)),
     ]
+
+
+def test_multiproc_metric_allowlist_filters_definitions():
+    config = _metrics_config()
+    config["multiproc_include_metrics"] = ["cache_lookup_hit_rate"]
+
+    definitions = get_multiproc_metric_definitions(config)
+
+    assert [definition.name for definition in definitions] == ["cache_lookup_hit_rate"]
+
+
+def test_yuanrong_resource_snapshot_parse_and_counter_reset():
+    line = json.dumps(
+        {
+            "time": "2023-06-02T14:58:32+00:00",
+            "event": "resource_snapshot",
+            "version": "v0",
+            "metrics": {
+                "oc_hit_num": {
+                    "mem_hit_num": 13,
+                    "remote_hit_num": 5,
+                    "disk_hit_num": 7,
+                    "l2_hit_num": 0,
+                },
+                "shared_memory": {
+                    "physical_memory_usage": 25,
+                    "total_limit": 100,
+                },
+                "spill_hard_disk": {
+                    "physical_space_usage": 30,
+                    "total_limit": 200,
+                },
+            },
+        }
+    )
+
+    snapshot = parse_yuanrong_resource_snapshot(line)
+
+    assert snapshot.counters == {
+        "yuanrong_local_dram_load_hits_total": 13.0,
+        "yuanrong_remote_load_hits_total": 5.0,
+        "yuanrong_local_ssd_load_hits_total": 7.0,
+        "yuanrong_l2_load_hits_total": 0.0,
+    }
+    assert snapshot.gauges["yuanrong_dram_usage_ratio"] == 0.25
+    assert snapshot.gauges["yuanrong_ssd_usage_ratio"] == 0.15
+    assert snapshot.timestamp == 1685717912.0
+    assert counter_deltas(
+        snapshot.counters,
+        {
+            "yuanrong_local_dram_load_hits_total": 10,
+            "yuanrong_remote_load_hits_total": 8,
+            "yuanrong_local_ssd_load_hits_total": 1,
+            "yuanrong_l2_load_hits_total": 0,
+        },
+    ) == {
+        "yuanrong_local_dram_load_hits_total": 3.0,
+        "yuanrong_remote_load_hits_total": 5.0,
+        "yuanrong_local_ssd_load_hits_total": 6.0,
+        "yuanrong_l2_load_hits_total": 0.0,
+    }
+
+
+def test_yuanrong_resource_reporter_ignores_partial_tail(tmp_path):
+    complete = '{"event":"resource_snapshot","version":"v0"}'
+    log_path = tmp_path / "kv_resource.log"
+    log_path.write_bytes((complete + '\n{"event":').encode())
+    reporter = YuanRongResourceReporter(
+        str(log_path), "127.0.0.1:18481", shared_memory_dir=str(tmp_path)
+    )
+
+    assert reporter._read_latest_complete_line() == complete
+
+
+def test_yuanrong_resource_reporter_baselines_then_emits_deltas(tmp_path):
+    _reset_fakes()
+    log_path = tmp_path / "kv_resource.log"
+
+    def write_snapshot(mem_hits, disk_hits):
+        log_path.write_text(
+            json.dumps(
+                {
+                    "time": "2023-06-02T14:58:32+00:00",
+                    "event": "resource_snapshot",
+                    "version": "v0",
+                    "metrics": {
+                        "oc_hit_num": {
+                            "mem_hit_num": mem_hits,
+                            "remote_hit_num": 3,
+                            "disk_hit_num": disk_hits,
+                            "l2_hit_num": 0,
+                        },
+                        "shared_memory": {
+                            "physical_memory_usage": 25,
+                            "total_limit": 100,
+                        },
+                        "spill_hard_disk": {
+                            "physical_space_usage": 30,
+                            "total_limit": 200,
+                        },
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    reporter = YuanRongResourceReporter(
+        str(log_path), "127.0.0.1:18481", shared_memory_dir=str(tmp_path)
+    )
+    write_snapshot(10, 4)
+    reporter._collect_once()
+    first = fake_ucmmetrics.updated[-1]
+    assert first["yuanrong_local_dram_load_hits_total"] == 0
+    assert first["yuanrong_local_ssd_load_hits_total"] == 0
+    assert first["yuanrong_dram_used_bytes"] == 25
+
+    write_snapshot(15, 6)
+    reporter._collect_once()
+    second = fake_ucmmetrics.updated[-1]
+    assert second["yuanrong_local_dram_load_hits_total"] == 5
+    assert second["yuanrong_local_ssd_load_hits_total"] == 2
 
 
 def test_setup_ucm_metrics_logs_registered_metrics(monkeypatch):
@@ -965,6 +1093,25 @@ def test_multiproc_logger_respects_consumer_switch():
     assert FakeCounter.created == {}
 
 
+def test_multiproc_logger_registers_only_allowlisted_metrics(tmp_path):
+    _reset_fakes()
+    import ucm.observability as observability
+
+    config = _metrics_config()
+    config["multiproc_dir"] = str(tmp_path)
+    config["multiproc_include_metrics"] = ["cache_lookup_hit_rate"]
+    observability._metric_mappings.clear()
+    observability.load_metrics_config = lambda _: config
+    observability.threading.Thread = FakeThread
+
+    logger = observability.PrometheusStatsLogger("model-a", "worker-0", "unused.yaml")
+
+    assert logger.thread.started
+    assert FakeCounter.created == {}
+    assert set(FakeGauge.created) == {"ucm_multiproc:cache_lookup_hit_rate"}
+    assert FakeHistogram.created == {}
+
+
 def test_ucm_connector_get_kv_connector_stats_forwards_to_inner_connector():
     expected = UCMConnectorStats(worker_rank=2)
     inner = SimpleNamespace(get_kv_connector_stats=lambda: expected)
@@ -974,7 +1121,7 @@ def test_ucm_connector_get_kv_connector_stats_forwards_to_inner_connector():
     assert connector.get_kv_connector_stats() is expected
 
 
-def test_example_metrics_config_defaults_to_vllm_connector_metrics():
+def test_example_metrics_config_enables_selective_multiproc_metrics():
     text = (REPO_ROOT / "examples" / "metrics" / "metrics_configs.yaml").read_text(
         encoding="utf-8"
     )
@@ -983,11 +1130,11 @@ def test_example_metrics_config_defaults_to_vllm_connector_metrics():
     assert 'name: "cache_d2h_callback_wait_ms"' not in text
     assert 'name: "save_speed"' not in text
     assert '# multiproc_dir: "/vllm-workspace"' in text
-    assert '# multiproc_prefix: "ucm_multiproc:"' in text
+    assert 'multiproc_prefix: "ucm:"' in text
     assert 'vllm_connector_prefix: "ucm:"' in text
-    assert "# multiproc: true" in text
+    assert "multiproc_include_metrics:" in text
     assert re.search(r"^\s+vllm_connector:\s+true$", text, re.MULTILINE)
-    assert not re.search(r"^\s+multiproc:\s+true$", text, re.MULTILINE)
+    assert re.search(r"^\s+multiproc:\s+true$", text, re.MULTILINE)
 
 
 def test_connector_dashboard_direct_connector_layout_and_metrics():
@@ -1082,29 +1229,56 @@ def test_vllm_dashboard_uses_combined_prefix_cache_hit_rate_breakdown():
     assert panel["fieldConfig"]["defaults"]["min"] == 0
     assert panel["fieldConfig"]["defaults"]["max"] == 1
     assert panel["gridPos"] == {"h": 8, "w": 24, "x": 0, "y": 24}
-    assert len(panel["targets"]) == 2
+    assert len(panel["targets"]) == 5
 
-    expected = [
-        (
-            "GPU Prefix Cache",
+    expected = {
+        "HBM": {
             "vllm:prefix_cache_hits_total",
             "vllm:prefix_cache_queries_total",
-        ),
-        (
-            "Connector Prefix Cache",
-            "vllm:external_prefix_cache_hits_total",
-            "vllm:external_prefix_cache_queries_total",
-        ),
-    ]
-    for target, (legend, hits, queries) in zip(panel["targets"], expected):
+        },
+        "YuanRong DRAM": {
+            "ucm:yuanrong_load_success_shards_total",
+            "ucm:yuanrong_local_dram_load_hits_total",
+            "ucm:yuanrong_remote_load_hits_total",
+        },
+        "YuanRong SSD": {
+            "ucm:yuanrong_load_success_shards_total",
+            "ucm:yuanrong_local_ssd_load_hits_total",
+        },
+        "Cache": {
+            "ucm:cache_load_success_shards_total",
+            "ucm:cache_posix_load_success_shards_total",
+        },
+        "Posix Store": {
+            "ucm:cache_posix_load_success_shards_total",
+            "ucm:yuanrong_lookup_miss_posix_load_success_shards_total",
+            "ucm:yuanrong_load_fallback_posix_load_success_shards_total",
+        },
+    }
+    for target in panel["targets"]:
+        legend = target["legendFormat"]
         assert target["legendFormat"] == legend
         expr = target["expr"]
-        assert hits in expr
-        assert queries in expr
+        for metric_name in expected[legend]:
+            assert metric_name in expr
         assert 'model_name="$model_name"' in expr
         assert 'job=~"$job"' in expr
         assert 'instance="$instance"' in expr
         assert "clamp_min" in expr
+
+    assert "ucm:yuanrong_l2_load_hits_total" not in " ".join(
+        target["expr"] for target in panel["targets"]
+    )
+
+    capacity_panel = panels["Store Capacity Watermark"]
+    assert {target["legendFormat"] for target in capacity_panel["targets"]} == {
+        "YuanRong DRAM",
+        "YuanRong SSD",
+        "Posix Store",
+    }
+    assert capacity_panel["targets"][0]["expr"].startswith("max(")
+    assert capacity_panel["targets"][1]["expr"].startswith("max(")
+    assert capacity_panel["targets"][2]["expr"].startswith("avg(")
 
 
 def test_grafana_dashboards_use_isolated_vllm_ucm_identity():
