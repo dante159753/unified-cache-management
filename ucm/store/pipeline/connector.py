@@ -330,21 +330,7 @@ def _yuanrong_posix_pipeline_builder(
         if shard_size <= 0 or block_size % shard_size != 0:
             raise ValueError("invalid shard_size/block_size for YuanRong|Posix")
         object_size = sum(int(size) for size in tensor_sizes)
-        memory_alignment = int(config.get("yuanrong_memory_alignment", 64))
-        if (
-            memory_alignment <= 0
-            or memory_alignment > 4096
-            or memory_alignment & (memory_alignment - 1)
-        ):
-            raise ValueError(
-                "yuanrong_memory_alignment must be a power of two in (0, 4096]"
-            )
         if config.get("io_direct", False):
-            if memory_alignment != 4096:
-                raise ValueError(
-                    "YuanRong|Posix io_direct requires "
-                    "yuanrong_memory_alignment=4096"
-                )
             if object_size % 4096:
                 raise ValueError(
                     "YuanRong object size must be aligned to 4096 bytes for "

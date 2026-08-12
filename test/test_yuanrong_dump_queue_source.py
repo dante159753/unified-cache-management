@@ -86,7 +86,7 @@ class YuanRongDumpQueueSourceTest(unittest.TestCase):
             dump_one_body,
         )
         self.assertIn(
-            "SelectYuanRongObjectsByKeys(localSetKeys, keys, task->desc)",
+            "FilterKeysByLocalSetKeys(localSetKeys, keys, task->desc)",
             dump_one_body,
         )
         self.assertIn("persisting the confirmed keys only", dump_one_body)
@@ -98,7 +98,7 @@ class YuanRongDumpQueueSourceTest(unittest.TestCase):
 
         empty_pos = dump_one_body.index("if (localSetKeys.empty())")
         error_pos = dump_one_body.index("if (dumpStatus.IsError())", empty_pos)
-        selection_pos = dump_one_body.index("SelectYuanRongObjectsByKeys")
+        selection_pos = dump_one_body.index("FilterKeysByLocalSetKeys")
         partial_pos = dump_one_body.index("partially failed", selection_pos)
         self.assertLess(empty_pos, error_pos)
         self.assertLess(error_pos, selection_pos)
@@ -120,23 +120,42 @@ class YuanRongDumpQueueSourceTest(unittest.TestCase):
         self.assertIn("(backendSubmitEnd - publishEnd) * 1e3", dump_one_body)
         self.assertIn("local_set_keys={}", dump_one_body)
 
+    def test_background_persistence_logs_mebibyte_values(self):
+        persist_body = self._function_body("DumpQueue::PersistBatch")
+
+        self.assertIn("mb={:.3f}", persist_body)
+        self.assertIn("inflight_mb={:.3f}", persist_body)
+        self.assertEqual(persist_body.count("/ (1024.0 * 1024.0)"), 2)
+        self.assertNotIn("inflight_bytes=", persist_body)
+
     def test_yuanrong_load_probes_miss_with_zero_timeout(self):
-        load_one_body = self._function_body("LoadQueue::LoadOne", self.load_source)
+        load_body = self._function_body("LoadQueue::LoadThenRecover", self.load_source)
 
-        self.assertIn("constexpr int32_t mgetTimeoutMs = 0", load_one_body)
+        self.assertIn("constexpr int32_t mgetTimeoutMs = 0", load_body)
         self.assertIn(
-            "MGetH2D(keys, blobLists, failedKeys, mgetTimeoutMs)", load_one_body
+            "MGetH2D(keys, blobLists, failedKeys, mgetTimeoutMs)", load_body
         )
-        self.assertNotIn("firstGetTimeoutMs", load_one_body)
-        self.assertNotIn("missTimeoutMs", load_one_body)
+        self.assertNotIn("firstGetTimeoutMs", load_body)
+        self.assertNotIn("missTimeoutMs", load_body)
 
-    def test_yuanrong_load_logs_total_mget_bytes(self):
+    def test_yuanrong_load_logs_total_mget_mb(self):
+        load_body = self._function_body("LoadQueue::LoadThenRecover", self.load_source)
+
+        self.assertIn("config_.objectSize) * keys.size() / (1024.0 * 1024.0)", load_body)
+        self.assertIn("mode=mget_first", load_body)
+        self.assertIn("h2d_keys={}, h2d_mb={:.3f}", load_body)
+
+    def test_yuanrong_load_emits_one_summary_per_execution_path(self):
         load_one_body = self._function_body("LoadQueue::LoadOne", self.load_source)
+        fallback_body = self._function_body(
+            "LoadQueue::LoadThenRecover", self.load_source
+        )
 
-        self.assertIn("config_.objectSize * keys.size()", load_one_body)
-        self.assertIn("MGetH2D keys={}, bytes={}, miss={}", load_one_body)
+        self.assertEqual(load_one_body.count("mode=parallel"), 1)
+        self.assertEqual(fallback_body.count("mode=mget_first"), 1)
+        self.assertNotIn("recovered keys=", fallback_body)
 
-    def test_yuanrong_posix_miss_h2d_precedes_async_backfill(self):
+    def test_yuanrong_posix_keys_h2d_precedes_async_backfill(self):
         recover_body = self._function_body(
             "LoadQueue::RecoverFromBackend", self.load_source
         )

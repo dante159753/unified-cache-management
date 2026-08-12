@@ -207,19 +207,20 @@ Status LoadQueue::LoadOne(CopyStream& stream, TaskPtr task, LoadStats& stats)
     auto existFinished = NowTime::Now();
     if (existStatus.IsError() || exists.size() != keys.size()) {
         UC_WARN(
-            "YuanRong load task({}) Exist cannot split keys, result={}/{}, cost={:.3f}ms, "
-            "status={}; falling back to MGetH2D-first load.",
-            task->id, exists.size(), keys.size(), (existFinished - existStart) * 1e3,
-            existStatus.ToString());
+            "YuanRong load task({}) Exist unusable (result={}/{}), first_key={}, "
+            "exist_cost={:.3f}ms, status={}; falling back to MGetH2D-first load.",
+            task->id, exists.size(), keys.size(), keys.empty() ? "" : keys.front(),
+            (existFinished - existStart) * 1e3, existStatus.ToString());
         return LoadThenRecover(stream, task, keys, blobLists, taskStart, stats);
     }
 
     std::vector<size_t> hitIndexes;
     std::vector<size_t> missIndexes;
-    PartitionExistence(exists, hitIndexes, missIndexes);
-    UC_INFO("YuanRong load task({}) Exist keys={}, hit={}, miss={}, cost={:.3f}ms, status={}.",
-            task->id, keys.size(), hitIndexes.size(), missIndexes.size(),
-            (existFinished - existStart) * 1e3, existStatus.ToString());
+    SplitByExistence(exists, hitIndexes, missIndexes);
+    UC_INFO(
+        "YuanRong load task({}) Exist keys={}, hit={}, miss={}, exist cost={:.3f}ms, status={}.",
+        task->id, keys.size(), hitIndexes.size(), missIndexes.size(),
+        (existFinished - existStart) * 1e3, existStatus.ToString());
 
     if (hitIndexes.empty()) {
         return RecoverFromBackend(stream, task, keys, blobLists, missIndexes,
@@ -243,7 +244,7 @@ Status LoadQueue::LoadOne(CopyStream& stream, TaskPtr task, LoadStats& stats)
     try {
         getFuture = heteroClient_->AsyncMGetH2D(hitKeys, hitBlobLists, 0);
     } catch (const std::exception& e) {
-        UC_WARN("Failed({}) to start YuanRong AsyncMGetH2D; using sequential mode.", e.what());
+        UC_WARN("Failed({}) to start YuanRong AsyncMGetH2D; using sync mode.", e.what());
     }
 
     auto backendStart = NowTime::Now();
@@ -272,30 +273,30 @@ Status LoadQueue::LoadOne(CopyStream& stream, TaskPtr task, LoadStats& stats)
         getStatusText = status.ToString();
     }
     auto getEnd = NowTime::Now();
-    auto failedHitSubsetIndexes = FailedIndexes(hitKeys, failedHitKeys, getFailed);
-    std::vector<size_t> racedMissIndexes;
-    racedMissIndexes.reserve(failedHitSubsetIndexes.size());
-    for (auto index : failedHitSubsetIndexes) { racedMissIndexes.push_back(hitIndexes[index]); }
-    stats.yuanrongSuccess += hitIndexes.size() - racedMissIndexes.size();
-    UC_INFO(
-        "YuanRong load task({}) parallel AsyncMGetH2D keys={}, bytes={}, raced_miss={}, "
-        "window={:.3f}ms, join_wait={:.3f}ms, Posix={:.3f}ms, rc={}.",
-        task->id, hitKeys.size(), TotalBlobBytes(hitBlobLists), racedMissIndexes.size(),
-        (getEnd - getStart) * 1e3, (getEnd - getWaitStart) * 1e3, (backendEnd - backendStart) * 1e3,
-        getStatusText);
-
+    auto failedHitSubsetIndexes = FilterH2dFailedIndexes(hitKeys, failedHitKeys, getFailed);
+    std::vector<size_t> h2dMissIndexes;
+    h2dMissIndexes.reserve(failedHitSubsetIndexes.size());
+    for (auto index : failedHitSubsetIndexes) { h2dMissIndexes.push_back(hitIndexes[index]); }
+    stats.yuanrongSuccess += hitIndexes.size() - h2dMissIndexes.size();
     auto firstFailure = std::move(backendStatus);
 
-    if (!racedMissIndexes.empty()) {
-        auto status = RecoverFromBackend(stream, task, keys, blobLists, racedMissIndexes,
+    if (!h2dMissIndexes.empty()) {
+        auto status = RecoverFromBackend(stream, task, keys, blobLists, h2dMissIndexes,
                                          RecoverySource::LOAD_FALLBACK, stats);
         if (firstFailure.Success() && status.Failure()) { firstFailure = std::move(status); }
     }
     UC_INFO(
-        "YuanRong load task({}) parallel load finished, hit={}, posix_miss={}, raced_miss={}, "
-        "total={:.3f}ms, status={}.",
-        task->id, hitIndexes.size(), missIndexes.size(), racedMissIndexes.size(),
-        (NowTime::Now() - taskStart) * 1e3, firstFailure.ToString());
+        "YuanRong load task({}) finished, mode=parallel, h2d_keys={}, h2d_mb={:.3f}, "
+        "posix_keys={}, posix_mb={:.3f}, h2d_fallback_keys={}, h2d_window={:.3f}ms, "
+        "join_wait={:.3f}ms, posix_load={:.3f}ms, total={:.3f}ms, h2d_status={}, "
+        "status={}.",
+        task->id, hitIndexes.size(),
+        static_cast<double>(config_.objectSize) * hitIndexes.size() / (1024.0 * 1024.0),
+        missIndexes.size(),
+        static_cast<double>(config_.objectSize) * missIndexes.size() / (1024.0 * 1024.0),
+        h2dMissIndexes.size(), (getEnd - getStart) * 1e3, (getEnd - getWaitStart) * 1e3,
+        (backendEnd - backendStart) * 1e3, (NowTime::Now() - taskStart) * 1e3, getStatusText,
+        firstFailure.ToString());
     return firstFailure;
 }
 
@@ -309,34 +310,32 @@ Status LoadQueue::LoadThenRecover(CopyStream& stream, TaskPtr task,
     auto getStart = NowTime::Now();
     auto rc = heteroClient_->MGetH2D(keys, blobLists, failedKeys, mgetTimeoutMs);
     auto getEnd = NowTime::Now();
-    auto missIndexes = FailedIndexes(keys, failedKeys, rc.IsError());
+    auto missIndexes = FilterH2dFailedIndexes(keys, failedKeys, rc.IsError());
     stats.yuanrongSuccess += keys.size() - missIndexes.size();
-    const auto totalBytes = config_.objectSize * keys.size();
-    UC_INFO(
-        "YuanRong load task({}) MGetH2D keys={}, bytes={}, miss={}, cost={:.3f}ms, "
-        "rc={}.",
-        task->id, keys.size(), totalBytes, missIndexes.size(), (getEnd - getStart) * 1e3,
-        rc.ToString());
-    if (missIndexes.empty()) {
-        UC_DEBUG("YuanRong load task({}) all hit, total={:.3f}ms.", task->id,
-                 (NowTime::Now() - taskStart) * 1e3);
-        return Status::OK();
-    }
-    if (backend_ == nullptr) {
+    const auto totalMb = static_cast<double>(config_.objectSize) * keys.size() / (1024.0 * 1024.0);
+    if (!missIndexes.empty() && backend_ == nullptr) {
         return Status::Error(
             fmt::format("YuanRong MGetH2D miss({}/{}) and no backend is "
                         "configured, first miss key({}): {}",
                         missIndexes.size(), keys.size(), keys[missIndexes.front()], rc.ToString()));
     }
-    auto recoverStart = NowTime::Now();
-    auto recoverStatus = RecoverFromBackend(stream, task, keys, blobLists, missIndexes,
-                                            RecoverySource::LOAD_FALLBACK, stats);
-    auto recoverEnd = NowTime::Now();
+
+    auto loadEnd = getEnd;
+    auto recoverStatus = Status::OK();
+    double recoverCostMs = 0;
+    if (!missIndexes.empty()) {
+        auto recoverStart = NowTime::Now();
+        recoverStatus = RecoverFromBackend(stream, task, keys, blobLists, missIndexes,
+                                           RecoverySource::LOAD_FALLBACK, stats);
+        loadEnd = NowTime::Now();
+        recoverCostMs = (loadEnd - recoverStart) * 1e3;
+    }
     UC_INFO(
-        "YuanRong load task({}) recovered miss={}, posix load={:.3f}ms, total={:.3f}ms, "
-        "status={}.",
-        task->id, missIndexes.size(), (recoverEnd - recoverStart) * 1e3,
-        (recoverEnd - taskStart) * 1e3, recoverStatus.ToString());
+        "YuanRong load task({}) finished, mode=mget_first, h2d_keys={}, h2d_mb={:.3f}, "
+        "posix_keys={}, h2d_load={:.3f}ms, posix_load={:.3f}ms, total={:.3f}ms, "
+        "h2d_status={}, status={}.",
+        task->id, keys.size(), totalMb, missIndexes.size(), (getEnd - getStart) * 1e3,
+        recoverCostMs, (loadEnd - taskStart) * 1e3, rc.ToString(), recoverStatus.ToString());
     return recoverStatus;
 }
 

@@ -132,15 +132,6 @@ inline void DeduplicateYuanRongObjects(std::vector<std::string>& keys,
     if (desc != nullptr) { *desc = std::move(uniqueDesc); }
 }
 
-inline size_t TotalBlobBytes(const std::vector<datasystem::DeviceBlobList>& blobLists)
-{
-    size_t total = 0;
-    for (const auto& blobList : blobLists) {
-        for (const auto& blob : blobList.blobs) { total += blob.size; }
-    }
-    return total;
-}
-
 inline size_t DeriveYuanRongHostBufferCount(size_t objectSize, size_t recoveryBatchSize,
                                             size_t loadWorkerCount, size_t backfillWorkerCount,
                                             uint64_t capacityBytes)
@@ -176,8 +167,8 @@ inline size_t DeriveYuanRongPosixDumpBatchSize(size_t objectSize, uint64_t maxIn
     return std::clamp<size_t>(static_cast<size_t>(keys), 1, maxBatchKeys);
 }
 
-inline Status SelectYuanRongObjectsByKeys(const std::vector<std::string>& selectedKeys,
-                                          std::vector<std::string>& keys, Detail::TaskDesc& desc)
+inline Status FilterKeysByLocalSetKeys(const std::vector<std::string>& selectedKeys,
+                                       std::vector<std::string>& keys, Detail::TaskDesc& desc)
 {
     if (desc.size() != keys.size()) {
         return Status::InvalidParam("YuanRong object selection size mismatch: keys({}), shards({})",
@@ -211,9 +202,9 @@ inline Status SelectYuanRongObjectsByKeys(const std::vector<std::string>& select
     return Status::OK();
 }
 
-inline std::vector<size_t> FailedIndexes(const std::vector<std::string>& keys,
-                                         const std::vector<std::string>& failedKeys,
-                                         bool requestFailed)
+inline std::vector<size_t> FilterH2dFailedIndexes(const std::vector<std::string>& keys,
+                                                  const std::vector<std::string>& failedKeys,
+                                                  bool requestFailed)
 {
     if (failedKeys.empty()) {
         if (!requestFailed) { return {}; }
@@ -230,8 +221,8 @@ inline std::vector<size_t> FailedIndexes(const std::vector<std::string>& keys,
     return result;
 }
 
-inline void PartitionExistence(const std::vector<bool>& exists, std::vector<size_t>& hitIndexes,
-                               std::vector<size_t>& missIndexes)
+inline void SplitByExistence(const std::vector<bool>& exists, std::vector<size_t>& hitIndexes,
+                             std::vector<size_t>& missIndexes)
 {
     hitIndexes.clear();
     missIndexes.clear();

@@ -116,7 +116,7 @@ private:
                  std::list<PersistenceContext>& inflight);
     Status PersistBatch(const PersistenceTask& task, size_t begin, size_t end,
                         size_t& inflightBytes, std::list<PersistenceContext>& inflight);
-    void PollCompletions(size_t& inflightBytes, std::list<PersistenceContext>& inflight);
+    void ReclaimCompletedInflight(size_t& inflightBytes, std::list<PersistenceContext>& inflight);
     void ReleasePersistenceContext(PersistenceContext& context, size_t& inflightBytes);
     static void ReleaseBuffers(
         std::vector<datasystem::Optional<datasystem::ReadOnlyBuffer>>& buffers);

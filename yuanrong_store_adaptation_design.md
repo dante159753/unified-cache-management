@@ -194,7 +194,7 @@ sequenceDiagram
     end
 
     opt H2D 期间发生淘汰
-        L->>P: 恢复 raced miss keys
+        L->>P: 恢复 h2d miss keys
         L->>C: direct H2D
     end
 
@@ -207,7 +207,7 @@ sequenceDiagram
 
 1. `Exist` 将 key 划分为 YuanRong hit 与 Posix miss。
 2. hit 的 `AsyncMGetH2D` 与 miss 的 Posix 恢复并行执行。
-3. `Exist` 后到 H2D 前可能发生淘汰；`MGetH2D.failedKeys` 中的 raced miss 再从
+3. `Exist` 后到 H2D 前可能发生淘汰；`MGetH2D.failedKeys` 中的 h2d miss 再从
    Posix 恢复。
 4. Posix miss 按 `yuanrong_recovery_batch_size` 切批；当前批执行 Wait 和 H2D 时，
    异步准备下一批，形成双批流水线。
@@ -293,8 +293,8 @@ stateDiagram-v2
 1. 所有 YuanRong Worker 配置相同的 `memory_alignment=4096`。
 2. 保持 `oc_metadata_header=true`，以支持共享内存 read latch 生命周期。
 3. SDK Client 从 Worker 注册响应同步 alignment，不新增 UCM ConnectOptions 参数。
-4. UCM 配置 `yuanrong_memory_alignment: 4096`，仅用于解析 header、构造回填对象和
-   对齐校验；该值必须与 Worker 一致。
+4. UCM 根据 `io_direct` 自动使用 4096 alignment，用于解析 header、构造回填对象和
+   对齐校验。
 5. payload 地址和 `payload_size` 必须满足 4096 对齐。
 
 ### 4.5 资源生命周期
@@ -335,7 +335,6 @@ ucm_connectors:
       posix_capacity_gb: 1024
       posix_io_engine: "psync"
       io_direct: false
-      yuanrong_memory_alignment: 64
 
 enable_event_sync: true
 use_layerwise: false
@@ -374,7 +373,6 @@ backfill 和 persistence 相关配置。
 | `yuanrong_backfill_worker_count` | `1` | 异步回填 worker 数 |
 | `yuanrong_backfill_queue_depth` | `128` | 异步回填队列深度 |
 | `yuanrong_posix_max_inflight_gb` | `1` | 每进程后台 Posix Dump 持有 Buffer 上限 |
-| `yuanrong_memory_alignment` | `64` | UCM composed object 对齐；Direct IO 使用 4096 |
 
 `yuanrong_host_buffer_count=0` 时，UCM 根据 object size、Load 双批流水线、回填并发
 和容量上限自动推导完整 batch 数。显式设置时必须不小于
@@ -401,7 +399,7 @@ batch_keys = clamp(target_batch_bytes / payload_size, 1, 32)
 | `MGetH2D` 部分失败且有 Posix | 只恢复 failed key |
 | `MGetH2D` miss 且无 Posix | Load 失败 |
 | Posix Load 或 direct H2D 失败 | Load 失败 |
-| raced miss | 从 Posix 再恢复 |
+| h2d miss | 从 Posix 再恢复 |
 | 回填队列满或 `MCreate/MSet` 失败 | Load 结果不变，仅告警 |
 
 ## 7. 测试范围
@@ -409,7 +407,7 @@ batch_keys = clamp(target_batch_bytes / payload_size, 1, 32)
 至少覆盖：
 
 - `YuanRong`：全 hit、部分 miss、重复 key、Remote H2D 开关。
-- `YuanRong|Posix`：全 hit、全 miss、混合 hit/miss、raced miss。
+- `YuanRong|Posix`：全 hit、全 miss、混合 hit/miss、h2d miss。
 - Dump：partial `outLocalSetKeys`、后台队列满、Posix 异步失败。
 - Load：`failedKeys` 部分失败、批量恢复、异步回填失败。
 - Direct IO：64/4096 alignment、psync/aio 组合、地址和长度不对齐。
