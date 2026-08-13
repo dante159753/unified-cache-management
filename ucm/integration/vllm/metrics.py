@@ -65,9 +65,7 @@ class UCMConnectorStats(KVConnectorStats):
         stats = cls(worker_rank=worker_rank)
         rank = stats._rank_key()
         definitions_by_name = {
-            definition.name: definition
-            for definition in metric_definitions
-            if definition.vllm_connector_enabled
+            definition.name: definition for definition in metric_definitions
         }
 
         for metric_name, value in counter_stats.items():

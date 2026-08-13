@@ -31,7 +31,6 @@ from ucm.shared.metrics import ucmmetrics
 logger = init_logger(__name__)
 
 METRIC_TYPES = ("counter", "gauge", "histogram")
-VLLM_EXCLUDED_METRICS = {"interval_lookup_hit_rates"}
 MULTIPROC_CONSUMER = "multiproc"
 VLLM_CONNECTOR_CONSUMER = "vllm_connector"
 
@@ -45,7 +44,6 @@ class MetricDefinition:
     vllm_connector_name: str = ""
     vllm_connector_buckets: tuple[float, ...] = ()
     vllm_connector_value_scale: float = 1.0
-    vllm_connector_enabled: bool = True
 
 
 def load_metrics_config(config_path: str) -> dict[str, Any]:
@@ -114,7 +112,6 @@ def get_metric_definitions(config: dict[str, Any] | None) -> list[MetricDefiniti
                 vllm_connector_buckets = tuple(
                     float(bucket) for bucket in vllm_connector_buckets
                 )
-            vllm_connector_enabled = _metric_vllm_connector_enabled(name, item)
             definitions.append(
                 MetricDefinition(
                     name=name,
@@ -128,7 +125,6 @@ def get_metric_definitions(config: dict[str, Any] | None) -> list[MetricDefiniti
                     ),
                     vllm_connector_buckets=tuple(vllm_connector_buckets),
                     vllm_connector_value_scale=vllm_connector_scale,
-                    vllm_connector_enabled=vllm_connector_enabled,
                 )
             )
     return definitions
@@ -137,22 +133,13 @@ def get_metric_definitions(config: dict[str, Any] | None) -> list[MetricDefiniti
 def get_vllm_connector_metric_definitions(
     config: dict[str, Any] | None,
 ) -> list[MetricDefinition]:
-    return [
-        definition
-        for definition in get_metric_definitions(config)
-        if definition.vllm_connector_enabled
-    ]
+    return get_metric_definitions(config)
 
 
 def get_multiproc_metric_definitions(
     config: dict[str, Any] | None,
 ) -> list[MetricDefinition]:
-    definitions = get_metric_definitions(config)
-    configured = (config or {}).get("multiproc_include_metrics")
-    if configured is None:
-        return definitions
-    included = {str(name) for name in configured}
-    return [definition for definition in definitions if definition.name in included]
+    return get_metric_definitions(config)
 
 
 def setup_ucm_metrics(config: dict[str, Any] | None) -> list[MetricDefinition]:
@@ -219,12 +206,6 @@ def _as_bool(value: Any, default: bool) -> bool:
     if isinstance(value, str):
         return value.lower() in {"1", "true", "yes", "on"}
     return bool(value)
-
-
-def _metric_vllm_connector_enabled(name: str, item: dict[str, Any]) -> bool:
-    if "vllm_connector_enabled" in item:
-        return _as_bool(item.get("vllm_connector_enabled"), True)
-    return name not in VLLM_EXCLUDED_METRICS
 
 
 def _vllm_connector_value_scale(name: str, item: dict[str, Any]) -> float:

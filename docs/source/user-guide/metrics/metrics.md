@@ -30,12 +30,6 @@ automatically when the metric is registered.
 
 ### 1. Configure UCM Metrics
 
-Set the Prometheus multiprocess directory before starting vLLM:
-
-```bash
-export PROMETHEUS_MULTIPROC_DIR=/vllm-workspace
-```
-
 In the UCM config file used by vLLM, set `metrics_config_path` to the metrics
 configuration file you want to use, for example:
 
@@ -178,12 +172,9 @@ Metrics are configured in `examples/metrics/metrics_configs.yaml`:
 
 ```yaml
 log_interval: 5
-# multiproc_dir: "/vllm-workspace"
-# multiproc_prefix: "ucm_multiproc:"
 vllm_connector_prefix: "ucm:"
 
 consumers:
-  # multiproc: true
   vllm_connector: true
 
 counter:

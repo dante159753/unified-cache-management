@@ -450,10 +450,8 @@ class UCMDirectConnector(KVConnectorBase_V1):
             logger.info(
                 f"metrics_config_path: {metrics_config_path}, set worker_id: {worker_id}"
             )
-        if (
-            role == KVConnectorRole.WORKER
-            and self.metrics_config
-            and consumer_enabled(self.metrics_config, VLLM_CONNECTOR_CONSUMER)
+        if self.metrics_config and consumer_enabled(
+            self.metrics_config, VLLM_CONNECTOR_CONSUMER
         ):
             self._vllm_metric_definitions = get_vllm_connector_metric_definitions(
                 self.metrics_config
@@ -461,7 +459,9 @@ class UCMDirectConnector(KVConnectorBase_V1):
             self._vllm_metrics_enabled = bool(self._vllm_metric_definitions)
 
         self._yuanrong_resource_reporter = None
-        if role == KVConnectorRole.SCHEDULER:
+        if role == KVConnectorRole.SCHEDULER and consumer_enabled(
+            self.metrics_config, VLLM_CONNECTOR_CONSUMER
+        ):
             self._start_yuanrong_resource_reporter()
 
         self.persist_token_threshold = self.launch_config.get(
@@ -488,10 +488,10 @@ class UCMDirectConnector(KVConnectorBase_V1):
         if not enabled or "YuanRong" not in pipeline or not log_path:
             return
         if not self.metrics_config or not consumer_enabled(
-            self.metrics_config, MULTIPROC_CONSUMER
+            self.metrics_config, VLLM_CONNECTOR_CONSUMER
         ):
             logger.warning(
-                "YuanRong resource metrics require the multiproc metrics consumer"
+                "YuanRong resource metrics require the vllm_connector metrics consumer"
             )
             return
 

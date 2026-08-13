@@ -2,32 +2,10 @@
 # This file defines which metrics should be enabled and their configurations
 log_interval: 5  # Interval in seconds for logging metrics
 
-# multiproc_dir: "/vllm-workspace"  # Directory for Prometheus multiprocess mode
-
-multiproc_prefix: "ucm:"
 vllm_connector_prefix: "ucm:"
 
 consumers:
-  multiproc: true
   vllm_connector: true
-
-multiproc_include_metrics:
-  - "yuanrong_local_dram_load_hits_total"
-  - "yuanrong_remote_load_hits_total"
-  - "yuanrong_local_ssd_load_hits_total"
-  - "yuanrong_l2_load_hits_total"
-  - "yuanrong_resource_log_read_errors_total"
-  - "yuanrong_dram_used_bytes"
-  - "yuanrong_dram_capacity_bytes"
-  - "yuanrong_dram_usage_ratio"
-  - "yuanrong_ssd_used_bytes"
-  - "yuanrong_ssd_capacity_bytes"
-  - "yuanrong_ssd_usage_ratio"
-  - "yuanrong_resource_log_last_update_timestamp_seconds"
-  - "yuanrong_resource_log_reporter_leader"
-  - "posix_store_used_bytes"
-  - "posix_store_capacity_bytes"
-  - "posix_store_usage_ratio"
 
 # ============================================================================
 # Common bucket aliases (for readability only - YAML doesn't inline these).
@@ -118,19 +96,14 @@ counter:
     documentation: "YuanRong pipeline load shards that did not complete device delivery"
   - name: "yuanrong_local_dram_load_hits_total"
     documentation: "Estimated YuanRong local DRAM Get hits forwarded from kv_resource.log"
-    vllm_connector_enabled: false
   - name: "yuanrong_remote_load_hits_total"
     documentation: "Estimated YuanRong remote worker Get hits forwarded from kv_resource.log"
-    vllm_connector_enabled: false
   - name: "yuanrong_local_ssd_load_hits_total"
     documentation: "Estimated YuanRong local spill SSD Get hits forwarded from kv_resource.log"
-    vllm_connector_enabled: false
   - name: "yuanrong_l2_load_hits_total"
     documentation: "YuanRong L2 persistence Get hits forwarded from kv_resource.log"
-    vllm_connector_enabled: false
   - name: "yuanrong_resource_log_read_errors_total"
     documentation: "Number of failures opening, reading, or parsing YuanRong kv_resource.log"
-    vllm_connector_enabled: false
 
   # -- Connector layer: per-worker real throughput counters ----------------
   # The connector load_speed histogram samples per-call speed
@@ -164,47 +137,36 @@ gauge:
   - name: "yuanrong_dram_used_bytes"
     documentation: "YuanRong physical shared-memory usage in bytes"
     multiprocess_mode: "livemostrecent"
-    vllm_connector_enabled: false
   - name: "yuanrong_dram_capacity_bytes"
     documentation: "YuanRong shared-memory capacity in bytes"
     multiprocess_mode: "livemostrecent"
-    vllm_connector_enabled: false
   - name: "yuanrong_dram_usage_ratio"
     documentation: "YuanRong physical shared-memory usage ratio"
     multiprocess_mode: "livemostrecent"
-    vllm_connector_enabled: false
   - name: "yuanrong_ssd_used_bytes"
     documentation: "YuanRong physical spill-disk usage in bytes"
     multiprocess_mode: "livemostrecent"
-    vllm_connector_enabled: false
   - name: "yuanrong_ssd_capacity_bytes"
     documentation: "YuanRong spill-disk capacity in bytes"
     multiprocess_mode: "livemostrecent"
-    vllm_connector_enabled: false
   - name: "yuanrong_ssd_usage_ratio"
     documentation: "YuanRong physical spill-disk usage ratio"
     multiprocess_mode: "livemostrecent"
-    vllm_connector_enabled: false
   - name: "yuanrong_resource_log_last_update_timestamp_seconds"
     documentation: "Unix timestamp of the latest YuanRong resource snapshot parsed by UCM"
     multiprocess_mode: "livemostrecent"
-    vllm_connector_enabled: false
   - name: "yuanrong_resource_log_reporter_leader"
-    documentation: "Whether this UCM scheduler is the host YuanRong resource reporter leader"
+    documentation: "Whether this UCM process is the host YuanRong resource reporter leader"
     multiprocess_mode: "livemostrecent"
-    vllm_connector_enabled: false
   - name: "posix_store_used_bytes"
     documentation: "Estimated logical Posix Store usage in bytes from GC sampling"
     multiprocess_mode: "livemostrecent"
-    vllm_connector_enabled: false
   - name: "posix_store_capacity_bytes"
     documentation: "Configured logical Posix Store capacity in bytes"
     multiprocess_mode: "livemostrecent"
-    vllm_connector_enabled: false
   - name: "posix_store_usage_ratio"
     documentation: "Estimated logical Posix Store usage ratio"
     multiprocess_mode: "livemostrecent"
-    vllm_connector_enabled: false
 
 # Histogram metrics configuration
 histogram:

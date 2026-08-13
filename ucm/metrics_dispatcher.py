@@ -32,7 +32,6 @@ from ucm.metrics_config import (
     MetricDefinition,
     consumer_enabled,
     get_metric_definitions,
-    get_multiproc_metric_definitions,
 )
 from ucm.shared.metrics import ucmmetrics
 
@@ -47,10 +46,6 @@ class MetricsDispatcher:
         self._definitions = get_metric_definitions(self.config)
         self._definitions_by_name = {
             definition.name: definition for definition in self._definitions
-        }
-        self._multiproc_names = {
-            definition.name
-            for definition in get_multiproc_metric_definitions(self.config)
         }
         self._enabled = {
             consumer: consumer_enabled(self.config, consumer) for consumer in CONSUMERS
@@ -114,13 +109,6 @@ class MetricsDispatcher:
     ) -> MetricDefinition | None:
         definition = self._definitions_by_name.get(metric_name)
         if definition is None or definition.metric_type != metric_type:
-            return None
-        if (
-            consumer == VLLM_CONNECTOR_CONSUMER
-            and not definition.vllm_connector_enabled
-        ):
-            return None
-        if consumer == MULTIPROC_CONSUMER and metric_name not in self._multiproc_names:
             return None
         return definition
 

@@ -480,7 +480,9 @@ def test_config_definitions_register_enable_list_and_metric_names():
         by_name["cache_load_duration_ms"].vllm_connector_name
         == "ucm:cache_load_duration_ms"
     )
-    assert by_name["interval_lookup_hit_rates"].vllm_connector_enabled is False
+    assert "interval_lookup_hit_rates" in {
+        definition.name for definition in get_vllm_connector_metric_definitions(config)
+    }
     assert fake_ucmmetrics.created == [
         ("load_bytes_total", "counter", ()),
         ("cache_lookup_hit_rate", "gauge", ()),
@@ -490,13 +492,49 @@ def test_config_definitions_register_enable_list_and_metric_names():
     ]
 
 
-def test_multiproc_metric_allowlist_filters_definitions():
+def test_legacy_multiproc_allowlist_does_not_filter_definitions():
     config = _metrics_config()
     config["multiproc_include_metrics"] = ["cache_lookup_hit_rate"]
 
     definitions = get_multiproc_metric_definitions(config)
 
-    assert [definition.name for definition in definitions] == ["cache_lookup_hit_rate"]
+    assert [definition.name for definition in definitions] == [
+        "load_bytes_total",
+        "cache_lookup_hit_rate",
+        "load_duration",
+        "cache_load_duration_ms",
+        "interval_lookup_hit_rates",
+    ]
+
+
+def test_yuanrong_resource_metrics_use_vllm_connector():
+    text = (REPO_ROOT / "examples" / "metrics" / "metrics_configs.yaml").read_text(
+        encoding="utf-8"
+    )
+    expected = {
+        "yuanrong_local_dram_load_hits_total",
+        "yuanrong_remote_load_hits_total",
+        "yuanrong_local_ssd_load_hits_total",
+        "yuanrong_resource_log_read_errors_total",
+        "yuanrong_dram_used_bytes",
+        "yuanrong_dram_capacity_bytes",
+        "yuanrong_dram_usage_ratio",
+        "yuanrong_ssd_used_bytes",
+        "yuanrong_ssd_capacity_bytes",
+        "yuanrong_ssd_usage_ratio",
+        "yuanrong_resource_log_last_update_timestamp_seconds",
+        "yuanrong_resource_log_reporter_leader",
+    }
+    for metric_name in expected:
+        match = re.search(
+            rf'^  - name: "{metric_name}"$(.*?)(?=^  - name:|^# )',
+            text,
+            re.MULTILINE | re.DOTALL,
+        )
+        assert match is not None
+        assert "vllm_connector_enabled: false" not in match.group(1)
+
+    assert "multiproc_include_metrics:" not in text
 
 
 def test_yuanrong_resource_snapshot_parse_and_counter_reset():
@@ -651,7 +689,10 @@ def test_dispatcher_fans_out_single_core_drain_to_independent_consumers():
     assert multiproc_stats[2]["interval_lookup_hit_rates"] == ([1, 0, 0, 0], 0.1)
     assert vllm_stats[0] == {"load_bytes_total": 4096.0}
     assert vllm_stats[1] == {"cache_lookup_hit_rate": 0.5}
-    assert vllm_stats[2] == {"load_duration": ([0, 1, 0], 75.0)}
+    assert vllm_stats[2] == {
+        "load_duration": ([0, 1, 0], 75.0),
+        "interval_lookup_hit_rates": ([1, 0, 0, 0], 0.1),
+    }
     assert dispatcher.get_stats_and_clear("multiproc") == ({}, {}, {})
 
 
@@ -762,7 +803,10 @@ def test_stats_from_ucm_snapshot_preserves_metric_types_and_worker_rank():
         "sum": 150.0,
     }
     assert "not_configured" not in stats.data["counters_by_rank"]["7"]
-    assert "interval_lookup_hit_rates" not in stats.data["histograms_by_rank"]["7"]
+    assert stats.data["histograms_by_rank"]["7"]["interval_lookup_hit_rates"] == {
+        "bucket_counts": [1, 0, 0, 0],
+        "sum": 0.1,
+    }
 
 
 def test_stats_record_aggregate_clone_and_reset_preserve_worker_rank():
@@ -845,7 +889,7 @@ def test_prom_metrics_register_vllm_connector_prefixed_metrics():
     assert all(name.startswith("ucm:") for name in FakeHistogram.created)
     assert capture_logger.infos == [
         "UCM metrics vllm_connector path enabled: "
-        "total=4, counters=1, gauges=1, histograms=2, "
+        "total=5, counters=1, gauges=1, histograms=3, "
         "labels=['model_name', 'engine', 'worker_rank']"
     ]
 
@@ -1093,7 +1137,7 @@ def test_multiproc_logger_respects_consumer_switch():
     assert FakeCounter.created == {}
 
 
-def test_multiproc_logger_registers_only_allowlisted_metrics(tmp_path):
+def test_multiproc_logger_ignores_legacy_metric_allowlist(tmp_path):
     _reset_fakes()
     import ucm.observability as observability
 
@@ -1107,9 +1151,13 @@ def test_multiproc_logger_registers_only_allowlisted_metrics(tmp_path):
     logger = observability.PrometheusStatsLogger("model-a", "worker-0", "unused.yaml")
 
     assert logger.thread.started
-    assert FakeCounter.created == {}
+    assert set(FakeCounter.created) == {"ucm_multiproc:load_bytes_total"}
     assert set(FakeGauge.created) == {"ucm_multiproc:cache_lookup_hit_rate"}
-    assert FakeHistogram.created == {}
+    assert set(FakeHistogram.created) == {
+        "ucm_multiproc:load_duration",
+        "ucm_multiproc:cache_load_duration_ms",
+        "ucm_multiproc:interval_lookup_hit_rates",
+    }
 
 
 def test_ucm_connector_get_kv_connector_stats_forwards_to_inner_connector():
@@ -1121,7 +1169,7 @@ def test_ucm_connector_get_kv_connector_stats_forwards_to_inner_connector():
     assert connector.get_kv_connector_stats() is expected
 
 
-def test_example_metrics_config_enables_selective_multiproc_metrics():
+def test_example_metrics_config_uses_vllm_connector_by_default():
     text = (REPO_ROOT / "examples" / "metrics" / "metrics_configs.yaml").read_text(
         encoding="utf-8"
     )
@@ -1129,12 +1177,11 @@ def test_example_metrics_config_enables_selective_multiproc_metrics():
     assert 'name: "save_completion_wait_duration"' in text
     assert 'name: "cache_d2h_callback_wait_ms"' not in text
     assert 'name: "save_speed"' not in text
-    assert '# multiproc_dir: "/vllm-workspace"' in text
-    assert 'multiproc_prefix: "ucm:"' in text
     assert 'vllm_connector_prefix: "ucm:"' in text
-    assert "multiproc_include_metrics:" in text
+    assert "multiproc_include_metrics:" not in text
+    assert 'multiprocess_mode: "livemostrecent"' in text
     assert re.search(r"^\s+vllm_connector:\s+true$", text, re.MULTILINE)
-    assert re.search(r"^\s+multiproc:\s+true$", text, re.MULTILINE)
+    assert not re.search(r"^\s+multiproc:\s+true$", text, re.MULTILINE)
 
 
 def test_connector_dashboard_direct_connector_layout_and_metrics():

@@ -217,7 +217,7 @@ H_posix = H_external * P / (C + P)
 
 ```mermaid
 flowchart LR
-    Y["YuanRong kv_resource.log"] --> R["scheduler reporter"]
+    Y["YuanRong kv_resource.log"] --> R["UCM scheduler reporter"]
     R <--> S["/dev/shm file lock/state"]
     R --> M["UCM metrics dispatcher"]
     M --> V["vLLM /metrics"]
@@ -242,11 +242,9 @@ flowchart LR
 
 ### 5.3 导出路径
 
-Store Load Counter 继续使用现有 worker -> `vllm_connector` 指标路径。Posix GC Gauge 和 YuanRong 日志指标都在 scheduler 产生，使用 Prometheus multiprocess consumer。
+Store Load Counter 由 worker 产生，YuanRong 日志指标由 scheduler 产生，两者都通过默认启用的 `vllm_connector` consumer 导出，不依赖 Prometheus multiprocess consumer。vLLM scheduler 在聚合 worker connector stats 时会调用 scheduler connector 的 `get_kv_connector_stats()`，将日志指标合并到同一上报路径。抢到主机锁的 scheduler 读取日志，不新起 exporter、不增加端口。
 
-日志 reporter 位于 scheduler 进程，不能只写 scheduler 私有的 C++ snapshot，因为当前 `vllm_connector` 快照由 worker 回传。推荐复用现有 Prometheus multiprocess consumer，把 scheduler leader 的日志指标写入 vLLM 已有 `/metrics`，不新起 exporter、不增加端口。
-
-实现时需要支持按 metric 选择 consumer：日志类指标只走 multiprocess，Store 热路径指标只走 `vllm_connector`，两类指标仍统一使用 `ucm:` 前缀且名称不冲突。
+dispatcher 将所有已定义指标完整发送给每一条已启用的 consumer，不做逐指标过滤。默认配置只开启 `vllm_connector`；用户显式开启 `multiproc` 时，可为两条 consumer 配置不同前缀。Posix GC Gauge 同样由 worker 产生；Grafana 使用 `avg(...)` 展示节点逻辑占用和容量，避免多 worker 求和放大。
 
 ## 6. Grafana 与 metrics view
 

@@ -44,6 +44,21 @@ class TierObservabilitySourceTest(unittest.TestCase):
         self.assertIn('"posix_store_usage_ratio"', source)
         self.assertIn("estimatedFiles", source)
 
+    def test_yuanrong_resource_reporter_runs_in_scheduler(self):
+        source = (REPO_ROOT / "ucm/integration/vllm/ucm_connector.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("role == KVConnectorRole.SCHEDULER and consumer_enabled(", source)
+        self.assertIn("self._start_yuanrong_resource_reporter()", source)
+        self.assertNotIn(
+            "role == KVConnectorRole.WORKER and consumer_enabled(\n"
+            "            self.metrics_config, VLLM_CONNECTOR_CONSUMER\n"
+            "        ):\n"
+            "            self._start_yuanrong_resource_reporter()",
+            source,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
