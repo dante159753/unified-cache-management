@@ -154,6 +154,17 @@ def _use_ucm_connector_cpu_affinity() -> bool:
     )
 
 
+def _set_cache_numa_node(config: dict[str, Any], device, local_rank: int) -> None:
+    if "cache_numa_node" in config or device is None:
+        return
+    get_numa_node = getattr(device, "get_numa_node", None)
+    if get_numa_node is None:
+        return
+    numa_node = get_numa_node(local_rank)
+    if numa_node is not None:
+        config["cache_numa_node"] = int(numa_node)
+
+
 def _worker_generate_unique_id() -> str:
     """Worker-side: broadcast a uuid and write to a per-instance file."""
     world_group = get_world_group()
@@ -1060,9 +1071,17 @@ class UCMDirectConnector(KVConnectorBase_V1):
         self.launch_config = ucm_config.get_config()
         self.connector_configs = self.launch_config.get("ucm_connectors", [])
         assert len(self.connector_configs) > 0, "no storage connector name in config."
-        self._allgather_store_enabled = (
-            self.connector_configs[0].get("ucm_connector_name") == "UcmAllGatherStore"
+        connector_name = self.connector_configs[0].get("ucm_connector_name")
+        connector_pipeline = (
+            self.connector_configs[0]
+            .get("ucm_connector_config", {})
+            .get("store_pipeline", "")
         )
+        self._allgather_store_enabled = connector_name == "UcmAllGatherStore" or (
+            connector_name == "UcmPipelineStore"
+            and "AllGather" in connector_pipeline.split("|")
+        )
+        self._prepared_allgather_load_enabled = connector_name == "UcmAllGatherStore"
         share_buffer_enable = (
             self.connector_configs[0]
             .get("ucm_connector_config", {})
@@ -1261,6 +1280,10 @@ class UCMDirectConnector(KVConnectorBase_V1):
         config["unique_id"] = f"{self.unique_id}"
         if self._role == KVConnectorRole.WORKER:
             config["device_id"] = self.local_rank
+            if self._allgather_store_enabled or not bool(
+                config.get("share_buffer_enable", False)
+            ):
+                _set_cache_numa_node(config, self.device, self.local_rank)
             tensor_size_list = kv_cache_layout.tensor_size_list * self.blocks_per_chunk
             logical_shard_size = kv_cache_layout.shard_size * self.blocks_per_chunk
             logical_block_size = kv_cache_layout.block_size * self.blocks_per_chunk
@@ -1285,6 +1308,11 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 config["allgather_world_size"] = self.tp_size
                 config["allgather_replicated_data"] = self.is_mla
                 config["allgather_layerwise"] = kv_cache_layout.use_layerwise
+                config["allgather_async_completion"] = self.load_async
+                dp_rank = self._vllm_config.parallel_config.data_parallel_rank
+                config["allgather_runtime_key"] = (
+                    f"{self.unique_id}:dp{dp_rank}:device{self.local_rank}"
+                )
             buffer_addrs = kv_cache_layout.base_ptrs.reshape(-1).tolist()
             buffer_sizes = kv_cache_layout.buffer_sizes.reshape(-1).tolist()
             gpu_kv_buffer_set = set()
@@ -2461,7 +2489,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 (request_id, ucm_block_ids, store_block_ids, total_ptrs, None)
             )
 
-        if self._allgather_store_enabled and self.request_data:
+        if self._prepared_allgather_load_enabled and self.request_data:
             try:
                 self._prepared_load_batch, prepared_requests = (
                     self.store.prepare_load_batch(

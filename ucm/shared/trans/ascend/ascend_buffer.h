@@ -33,6 +33,7 @@ public:
     std::shared_ptr<void> MakeDeviceBuffer(size_t size) override;
     std::shared_ptr<void> MakeHostBuffer(size_t size) override;
     std::shared_ptr<void> MakeHostBuffer4DirectIo(size_t size) override;
+    std::shared_ptr<void> MakeHostBufferOnNuma(size_t size, int32_t numaNode) override;
 };
 
 }  // namespace UC::Trans

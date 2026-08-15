@@ -33,6 +33,8 @@ struct Config {
     std::string uniqueId{};
     size_t bufferNumber{1048576};
     bool shareBufferEnable{true};
+    bool alwaysHit{false};
+    bool failLoad{false};
 };
 
 }  // namespace UC::FakeStore

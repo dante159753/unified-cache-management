@@ -23,7 +23,13 @@
  * */
 #include "ascend_buffer.h"
 #include <acl/acl.h>
+#include <cerrno>
+#include <climits>
+#include <linux/mempolicy.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <vector>
 #include "logger/logger.h"
 
 namespace UC::Trans {
@@ -36,6 +42,22 @@ class HostHugePages : public std::enable_shared_from_this<HostHugePages> {
     static constexpr auto GIGANTIC_PAGE_FLAG = 30 << MAP_HUGE_SHIFT;
     size_t size_;
     void* buffer_;
+    int32_t numaNode_;
+
+    static bool BindToNuma(void* buffer, size_t size, int32_t numaNode)
+    {
+        if (numaNode < 0) { return true; }
+        constexpr auto bitsPerWord = sizeof(unsigned long) * CHAR_BIT;
+        const auto node = static_cast<size_t>(numaNode);
+        std::vector<unsigned long> nodeMask(node / bitsPerWord + 1, 0);
+        nodeMask[node / bitsPerWord] |= 1UL << (node % bitsPerWord);
+        const auto maxNode = nodeMask.size() * bitsPerWord;
+        const auto ret = syscall(SYS_mbind, buffer, size, MPOL_BIND, nodeMask.data(), maxNode, 0);
+        if (ret == 0) { return true; }
+        UC_ERROR("Failed to bind host buffer({}) to NUMA node({}): {}.", size, numaNode,
+                 errno);
+        return false;
+    }
 
     static void* MMapWithTLB(size_t& size, bool useGiganticPages)
     {
@@ -69,10 +91,13 @@ class HostHugePages : public std::enable_shared_from_this<HostHugePages> {
     }
 
 public:
-    HostHugePages(size_t size, ConstructorKey) : size_(size), buffer_(MAP_FAILED) {}
-    static std::shared_ptr<HostHugePages> Create(size_t size)
+    HostHugePages(size_t size, int32_t numaNode, ConstructorKey)
+        : size_(size), buffer_(MAP_FAILED), numaNode_(numaNode)
     {
-        return std::make_shared<HostHugePages>(size, ConstructorKey{});
+    }
+    static std::shared_ptr<HostHugePages> Create(size_t size, int32_t numaNode = -1)
+    {
+        return std::make_shared<HostHugePages>(size, numaNode, ConstructorKey{});
     }
     ~HostHugePages()
     {
@@ -92,6 +117,11 @@ public:
         if (buffer_ == MAP_FAILED) { buffer_ = MMapWithAdvice(size_); }
         if (buffer_ == MAP_FAILED) {
             UC_ERROR("Failed to make host buffer({}).", size_);
+            return nullptr;
+        }
+        if (!BindToNuma(buffer_, size_, numaNode_)) {
+            munmap(buffer_, size_);
+            buffer_ = MAP_FAILED;
             return nullptr;
         }
         std::memset(buffer_, 0, size_);
@@ -128,6 +158,15 @@ std::shared_ptr<void> Trans::AscendBuffer::MakeHostBuffer4DirectIo(size_t size)
 {
     try {
         return HostHugePages::Create(size)->Data();
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+std::shared_ptr<void> Trans::AscendBuffer::MakeHostBufferOnNuma(size_t size, int32_t numaNode)
+{
+    try {
+        return HostHugePages::Create(size, numaNode)->Data();
     } catch (...) {
         return nullptr;
     }

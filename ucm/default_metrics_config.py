@@ -739,6 +739,61 @@ _HISTOGRAM_METRICS = [
         [0, 0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50],
     ),
     (
+        "allgather_task_queue_depth",
+        "AllGather tasks retained by one Store after enqueue",
+        [1, 2, 4, 8, 16, 32, 64, 128],
+    ),
+    (
+        "allgather_task_queue_wait_ms",
+        "Time from AllGather task submission until its shared runtime starts it (ms)",
+        [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "allgather_load_backend_submit_ms",
+        "Total backend load submission time for one AllGather load task (ms)",
+        [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50],
+    ),
+    (
+        "allgather_load_collective_device_ms",
+        "Sampled device execution time for AllGather collectives in one load task (ms)",
+        [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100],
+    ),
+    (
+        "allgather_load_scatter_device_ms",
+        "Sampled device execution time for compact scatter in one load task (ms)",
+        [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100],
+    ),
+    (
+        "allgather_load_total_ms",
+        "AllGather load runtime duration excluding shared FIFO wait (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "allgather_dump_windows",
+        "Number of fused windows processed by one AllGather dump task",
+        [0, 1, 2, 4, 8, 16, 32, 64],
+    ),
+    (
+        "allgather_dump_backend_submit_ms",
+        "Total backend dump submission time for one AllGather dump task (ms)",
+        [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50],
+    ),
+    (
+        "allgather_dump_backend_wait_ms",
+        "Total backend wait time for one AllGather dump task (ms)",
+        [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "allgather_dump_sync_ms",
+        "Final AllGather dump progress-stream synchronization time (ms)",
+        [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100],
+    ),
+    (
+        "allgather_dump_total_ms",
+        "AllGather dump runtime duration excluding shared FIFO wait (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
         "layerwise_batch_total_ms",
         (
             "Layerwise batch wall-clock time from start_load_kv entry to wait_for_save "

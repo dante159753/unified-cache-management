@@ -130,6 +130,7 @@ class LocalBufferStrategy : public BufferStrategy {
 
     bool ioDirect_{false};
     bool mapHostToDevice_{false};
+    int32_t numaNode_{-1};
     BufferHeader header_;
     LocalMutex bucketLocks_[nHashTableBucket];
     std::unique_ptr<LocalLock[]> nodeLocks_;
@@ -140,10 +141,11 @@ class LocalBufferStrategy : public BufferStrategy {
 
 public:
     LocalBufferStrategy(int32_t deviceId, size_t nodeSize, size_t totalSize, size_t reservedNumber,
-                        bool ioDirect, bool mapHostToDevice)
+                        bool ioDirect, bool mapHostToDevice, int32_t numaNode)
         : BufferStrategy(deviceId, nodeSize, totalSize, reservedNumber),
           ioDirect_(ioDirect),
-          mapHostToDevice_(mapHostToDevice)
+          mapHostToDevice_(mapHostToDevice),
+          numaNode_(numaNode)
     {
     }
     ~LocalBufferStrategy() override
@@ -176,24 +178,32 @@ public:
             UC_ERROR("Failed to make buffer on device({}).", deviceId);
             return Status::Error();
         }
-        data_ = ioDirect_ ? buffer->MakeHostBuffer4DirectIo(nodeSize * nNode)
-                          : buffer->MakeHostBuffer(nodeSize * nNode);
+        const auto dataSize = nodeSize * nNode;
+        const auto registeredAllocation = ioDirect_ || numaNode_ >= 0;
+        data_ = numaNode_ >= 0   ? buffer->MakeHostBufferOnNuma(dataSize, numaNode_)
+                : ioDirect_      ? buffer->MakeHostBuffer4DirectIo(dataSize)
+                                 : buffer->MakeHostBuffer(dataSize);
         if (!data_) [[unlikely]] {
-            UC_ERROR("Failed to make pinned({}) for device({}).", nodeSize * nNode, deviceId);
+            UC_ERROR("Failed to make pinned({}) for device({}) on NUMA node({}).", dataSize,
+                     deviceId, numaNode_);
             return Status::OutOfMemory();
+        }
+        if (numaNode_ >= 0) {
+            UC_INFO("Bound CacheStore host buffer({}) for device({}) to NUMA node({}).", dataSize,
+                    deviceId, numaNode_);
         }
         if (mapHostToDevice_) {
             void* deviceData = nullptr;
             auto s = Status::OK();
-            if (ioDirect_) {
+            if (registeredAllocation) {
                 s = Trans::Buffer::GetHostDevicePointer(data_.get(), &deviceData);
             } else {
-                s = Trans::Buffer::RegisterHostBuffer(data_.get(), nodeSize * nNode, &deviceData);
+                s = Trans::Buffer::RegisterHostBuffer(data_.get(), dataSize, &deviceData);
                 registeredMappedHost_ = s.Success();
             }
             if (s.Failure()) [[unlikely]] {
                 UC_ERROR("Failed({}) to map pinned host buffer({}) to device({}).", s,
-                         nodeSize * nNode, deviceId);
+                         dataSize, deviceId);
                 return s;
             }
             dataOnDevice_ = static_cast<std::byte*>(deviceData);
@@ -505,7 +515,8 @@ Status TransBuffer::Setup(const Config& config)
         if (!config.shareBufferEnable) {
             strategy_ = std::make_shared<LocalBufferStrategy>(
                 config.deviceId, config.shardSize, config.bufferCapacity,
-                config.loadExclusiveBufferNumber, config.ioDirect, config.cacheSdmaDirect);
+                config.loadExclusiveBufferNumber, config.ioDirect, config.cacheSdmaDirect,
+                config.numaNode);
         } else if (config.deviceId >= 0) {
             strategy_ = std::make_shared<SharedBufferStrategy>(
                 config.uniqueId, config.deviceId, config.shardSize, config.bufferCapacity,

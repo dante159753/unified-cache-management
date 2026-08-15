@@ -34,6 +34,7 @@ from ucm.integration.vllm.ucm_connector import (
     UCMDirectConnector,
     _drop_null_vllm_blocks,
     _record_counter,
+    _set_cache_numa_node,
     _short_list,
     _use_ucm_connector_cpu_affinity,
 )
@@ -826,6 +827,10 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         config["unique_id"] = f"{self.unique_id}{unique_id_suffix}"
         if self._role == KVConnectorRole.WORKER:
             config["device_id"] = self.local_rank
+            if self._allgather_store_enabled or not bool(
+                config.get("share_buffer_enable", False)
+            ):
+                _set_cache_numa_node(config, self.device, self.local_rank)
             tensor_size_list = _normalize_tensor_size_list(
                 tensor_size_list_override
                 if tensor_size_list_override is not None
@@ -850,6 +855,7 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                 config["allgather_world_size"] = self.tp_size
                 config["allgather_replicated_data"] = self.is_mla
                 config["allgather_layerwise"] = self.use_layerwise
+                config["allgather_async_completion"] = self.load_async
             buffer_addrs = kv_cache_layout.base_ptrs.reshape(-1).tolist()
             buffer_sizes = kv_cache_layout.buffer_sizes.reshape(-1).tolist()
             gpu_kv_buffer_set = set()

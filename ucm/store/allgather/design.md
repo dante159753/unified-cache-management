@@ -141,7 +141,7 @@ The shared progressor owns one dedicated HCCL process group with the same TP
 membership, so its background collectives cannot interleave with model
 collectives on the vLLM TP group. The group is initialized with a barrier on
 the worker thread before the progress thread can issue its first collective.
-Its HCCL buffer defaults to 32 MiB instead of the runtime's 200 MiB default;
+Its HCCL buffer defaults to 8 MiB instead of the runtime's 200 MiB default;
 `allgather_hccl_buffer_mb` can override it for larger transfer windows.
 
 On an owner failure, the affected rank skips local scatter but still enters all

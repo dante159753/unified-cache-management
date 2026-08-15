@@ -40,6 +40,8 @@ public:
         inConfig.Get("unique_id", config.uniqueId);
         inConfig.GetNumber("buffer_number", config.bufferNumber);
         inConfig.Get("share_buffer_enable", config.shareBufferEnable);
+        inConfig.Get("fake_always_hit", config.alwaysHit);
+        inConfig.Get("fake_fail_load", config.failLoad);
         auto s = CheckConfig(config);
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed to check config params: {}.", s);
@@ -47,12 +49,15 @@ public:
         }
         s = metaMgr_.Setup(config);
         if (s.Failure()) [[unlikely]] { return s; }
+        alwaysHit_ = config.alwaysHit;
+        failLoad_ = config.failLoad;
         ShowConfig(config);
         return Status::OK();
     }
     std::string Readme() const override { return "FakeStore"; }
     Expected<std::vector<uint8_t>> Lookup(const Detail::BlockId* blocks, size_t num) override
     {
+        if (alwaysHit_) { return std::vector<uint8_t>(num, true); }
         std::vector<uint8_t> founds(num);
         StopWatch sw;
         std::transform(blocks, blocks + num, founds.begin(),
@@ -62,6 +67,7 @@ public:
     }
     Expected<ssize_t> LookupOnPrefix(const Detail::BlockId* blocks, size_t num) override
     {
+        if (alwaysHit_) { return static_cast<ssize_t>(num) - 1; }
         ssize_t index = -1;
         StopWatch sw;
         for (size_t i = 0; i < num && metaMgr_.Exist(blocks[i]); i++) {
@@ -71,7 +77,11 @@ public:
         return index;
     }
     void Prefetch(const Detail::BlockId* blocks, size_t num) override {}
-    Expected<Detail::TaskHandle> Load(Detail::TaskDesc task) override { return NextId(); }
+    Expected<Detail::TaskHandle> Load(Detail::TaskDesc task) override
+    {
+        if (failLoad_) { return Status::Error("injected fake load failure"); }
+        return NextId();
+    }
     Expected<Detail::TaskHandle> Dump(Detail::TaskDesc task) override
     {
         StopWatch sw;
@@ -107,7 +117,12 @@ private:
         UC_INFO("Set {}::UniqueId to {}.", ns, config.uniqueId);
         UC_INFO("Set {}::BufferNumber to {}.", ns, config.bufferNumber);
         UC_INFO("Set {}::ShareBufferEnable to {}.", ns, config.shareBufferEnable);
+        UC_INFO("Set {}::AlwaysHit to {}.", ns, config.alwaysHit);
+        UC_INFO("Set {}::FailLoad to {}.", ns, config.failLoad);
     }
+
+    bool alwaysHit_{false};
+    bool failLoad_{false};
 };
 
 }  // namespace UC::FakeStore
