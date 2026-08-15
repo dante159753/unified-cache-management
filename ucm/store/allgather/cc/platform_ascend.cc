@@ -178,7 +178,7 @@ public:
         HcclCommConfig config{};
         HcclCommConfigInit(&config);
         config.hcclBufferSize = bufferMb;
-        config.hcclOpExpansionMode = 1;
+        config.hcclOpExpansionMode = 3;
         return HcclStatus(HcclCommInitRootInfoConfig(
                               worldSize, &info, rank, &config,
                               reinterpret_cast<HcclComm*>(collective)),
