@@ -59,11 +59,12 @@ if(UCM_RUNTIME_ASCEND_FAMILY)
     set(ASCEND_CANN_PACKAGE_PATH ${ASCEND_HOME_PATH})
     if(NOT SOC_VERSION)
         if(RUNTIME_ENVIRONMENT STREQUAL "ascend-a3")
-            set(SOC_VERSION ascend910_93)
+            set(SOC_VERSION ascend910_9392)
         else()
             set(SOC_VERSION ascend910b3)
         endif()
     endif()
+    message(STATUS "AllGather AscendC SOC_VERSION=${SOC_VERSION}")
     include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 
     ascendc_library(ucm_segmented_copy_kernels SHARED
