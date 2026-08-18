@@ -168,9 +168,7 @@ def calculate_vllm_reservation(worker: Any) -> int:
             )
         ]
 
-    from ucm.store.allgather.native_loader import load_allgather_runtime
-
-    ucm_allgather_runtime = load_allgather_runtime()
+    from ucm.store.allgather import ucm_allgather_runtime
 
     total = sum(
         int(

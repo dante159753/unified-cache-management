@@ -3,6 +3,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -533,9 +534,15 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
                 raise ValueError(
                     "tensor_size_list must be non-empty and fit within shard_size"
                 )
-            from ucm.store.allgather.native_loader import load_segmented_copy
+            library_dir = Path(__file__).parent
+            for library in (
+                "libucm_segmented_copy_kernels.so",
+                "libucm_compact_scatter_kernels.so",
+            ):
+                torch.ops.load_library(str(library_dir / library))
+            from ucm.store.allgather import ucm_segmented_copy
 
-            self._copy_op = load_segmented_copy()
+            self._copy_op = ucm_segmented_copy
             if self._collective_enabled:
                 hccl_buffer_mb = int(
                     config.get("allgather_hccl_buffer_mb", _DEFAULT_HCCL_BUFFER_MB)
