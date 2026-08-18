@@ -24,8 +24,6 @@
 #
 import array
 import copy
-import ctypes
-import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,26 +32,14 @@ from typing import Callable, Dict, List
 import numpy as np
 import torch
 
+from ucm.store.native_loader import _preload_library
 from ucm.store.pipeline import ucmpipelinestore
 from ucm.store.ucmstore_v1 import Task, UcmKVStoreBaseV1
 
-_preloaded_libraries: Dict[Path, ctypes.CDLL] = {}
 _allgather_root_infos: Dict[str, List[int]] = {}
 _allgather_root_infos_lock = threading.Lock()
 StoreNotFoundError = ucmpipelinestore.StoreNotFoundError
 StoreUnhealthyError = ucmpipelinestore.StoreUnhealthyError
-
-
-def _preload_library(path: Path) -> None:
-    if os.name != "posix" or not path.exists():
-        return
-    resolved = path.resolve()
-    if resolved in _preloaded_libraries:
-        return
-    _preloaded_libraries[resolved] = ctypes.CDLL(
-        str(resolved),
-        mode=getattr(os, "RTLD_NOW", 0) | getattr(os, "RTLD_GLOBAL", 0),
-    )
 
 
 def _preload_metrics(store_dir: Path) -> None:
@@ -248,7 +234,9 @@ def _allgather_root_info(config: Dict[str, object]) -> List[int]:
         import torch.distributed as dist
         from vllm.distributed.parallel_state import get_tp_group
 
-        from ucm.store.allgather import ucm_allgather_runtime
+        from ucm.store.allgather.native_loader import load_allgather_runtime
+
+        ucm_allgather_runtime = load_allgather_runtime()
 
         tp_group = get_tp_group()
         group = tp_group.device_group
@@ -313,9 +301,10 @@ def _stack_allgather_stage(
     cache_config: Dict[str, object],
     allgather_config: Dict[str, object],
 ) -> None:
+    from ucm.store.allgather.native_loader import preload_allgather_kernels
+
     _preload_metrics(store_dir)
-    _preload_library(store_dir / "allgather/libucm_segmented_copy_kernels.so")
-    _preload_library(store_dir / "allgather/libucm_compact_scatter_kernels.so")
+    preload_allgather_kernels()
     pipeline.Stack("Cache", str(store_dir / "cache/libcachestore.so"), cache_config)
     pipeline.Stack(
         "AllGather",

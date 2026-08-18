@@ -58,7 +58,11 @@ if(UCM_RUNTIME_ASCEND_FAMILY)
 
     set(ASCEND_CANN_PACKAGE_PATH ${ASCEND_HOME_PATH})
     if(NOT SOC_VERSION)
-        set(SOC_VERSION ascend910b3)
+        if(RUNTIME_ENVIRONMENT STREQUAL "ascend-a3")
+            set(SOC_VERSION ascend910_93)
+        else()
+            set(SOC_VERSION ascend910b3)
+        endif()
     endif()
     include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 

@@ -158,7 +158,9 @@ def _synchronize(torch, device_type: str) -> None:
 def _broadcast_root_info(
     torch, dist, rank: int, device: str, group_count: int
 ) -> list[int]:
-    from ucm.store.allgather import ucm_allgather_runtime
+    from ucm.store.allgather.native_loader import load_allgather_runtime
+
+    ucm_allgather_runtime = load_allgather_runtime()
 
     size = int(ucm_allgather_runtime.root_info_size())
     result = []

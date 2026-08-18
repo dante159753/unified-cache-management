@@ -5,7 +5,9 @@ import argparse
 import torch
 import torch_npu  # noqa: F401
 
-from ucm.store.allgather import ucm_segmented_copy
+from ucm.store.allgather.native_loader import load_segmented_copy
+
+ucm_segmented_copy = load_segmented_copy()
 
 
 def main() -> None:
