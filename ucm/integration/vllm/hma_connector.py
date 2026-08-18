@@ -20,11 +20,18 @@ from ucm.integration.vllm.device import create_device
 from ucm.integration.vllm.ucm_connector import (
     PendingLoadTask,
     UCMDirectConnector,
+    _set_cache_numa_node,
     _use_ucm_connector_cpu_affinity,
 )
 from ucm.logger import init_logger
 from ucm.shared.metrics import ucmmetrics
 from ucm.sparse.utils import round_up
+from ucm.store.allgather.memory_plan import (
+    DEFAULT_FA_LOAD_GROUPS,
+    DEFAULT_FA_LOAD_SLOTS,
+    DEFAULT_WA_LOAD_GROUPS,
+    DEFAULT_WA_LOAD_SLOTS,
+)
 from ucm.store.factory_v1 import UcmConnectorFactoryV1
 from ucm.store.ucmstore_v1 import Task, UcmKVStoreBaseV1
 
@@ -728,10 +735,40 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
 
         name, module_path, config = self._base_store_config(store_suffix)
         self._set_default_shm_buffer_capacity(config)
+        suffix = label.lower()
+        for setting in (
+            "allgather_window_blocks_per_rank",
+            "allgather_load_slots",
+            "allgather_load_groups",
+            "allgather_dump_slots",
+        ):
+            stage_key = f"{setting}_{suffix}"
+            if stage_key in config:
+                config[setting] = int(config[stage_key])
+        if self._allgather_store_enabled:
+            default_slots = (
+                DEFAULT_FA_LOAD_SLOTS if suffix == "fa" else DEFAULT_WA_LOAD_SLOTS
+            )
+            default_groups = (
+                DEFAULT_FA_LOAD_GROUPS if suffix == "fa" else DEFAULT_WA_LOAD_GROUPS
+            )
+            config.setdefault("allgather_load_slots", default_slots)
+            stage_group_key = f"allgather_load_groups_{suffix}"
+            group_is_explicit = (
+                stage_group_key in config or "allgather_load_groups" in config
+            )
+            if not group_is_explicit:
+                config["allgather_load_groups"] = min(
+                    default_groups, int(config["allgather_load_slots"])
+                )
         if self._role == KVConnectorRole.WORKER:
             if tensor_size_list is None:
                 raise RuntimeError(f"Worker FAWA {label} store needs tensor sizes.")
             config["device_id"] = self.local_rank
+            if self._allgather_store_enabled or not bool(
+                config.get("share_buffer_enable", False)
+            ):
+                _set_cache_numa_node(config, self.device, self.local_rank)
             config["tensor_size_list"] = tensor_size_list
             # io_direct requires shard and block sizes to be 4KB aligned.
             aligned_size = 4096
@@ -750,6 +787,12 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 config["allgather_world_size"] = self.tp_size
                 config["allgather_replicated_data"] = True
                 config["allgather_layerwise"] = False
+                config["allgather_async_completion"] = self.load_async
+                dp_rank = self._vllm_config.parallel_config.data_parallel_rank
+                config["allgather_runtime_key"] = (
+                    f"{self.unique_id}:dp{dp_rank}:device{self.local_rank}:"
+                    f"{store_suffix}"
+                )
             if cpu_affinity_cores:
                 config["cpu_affinity_cores"] = list(cpu_affinity_cores)
         else:

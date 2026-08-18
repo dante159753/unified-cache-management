@@ -187,6 +187,14 @@ def apply_all_patches() -> None:
             logger.info("UCM patching vllm for load-failure recovery...")
             import ucm.integration.vllm.patch.load_failure_patch
 
+        from vllm.platforms import current_platform
+
+        if current_platform.is_cuda_alike():
+            logger.info(
+                "UCM patching vLLM CUDA worker for AllGather memory reservation..."
+            )
+            import ucm.integration.vllm.patch.gpu_worker_memory_reservation_patch
+
         # vllm_ascend patches
         match ascend_version:
             case "0.11.0":
@@ -233,6 +241,7 @@ def apply_all_patches() -> None:
                 import ucm.integration.vllm.patch.v0230.vllm_ascend.ascend_hybrid_cache_patch
                 import ucm.integration.vllm.patch.v0230.vllm_ascend.cpu_binding_patch
                 import ucm.integration.vllm.patch.v0230.vllm_ascend.sfa_kv_transfer_patch
+                import ucm.integration.vllm.patch.v0230.vllm_ascend.worker_memory_reservation_patch
             case _:
                 pass
 

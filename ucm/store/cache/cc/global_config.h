@@ -44,6 +44,7 @@ struct Config {
     StoreV1* storeBackend{};
     std::string uniqueId{};
     int32_t deviceId{-1};
+    int32_t numaNode{-1};
     std::vector<size_t> tensorSizes{};
     size_t shardSize{0};
     size_t blockSize{0};

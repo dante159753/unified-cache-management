@@ -33,6 +33,8 @@ PipelineStore configuration plus:
 | `allgather_rank` | required | Rank in the TP device group |
 | `allgather_world_size` | required | TP group size |
 | `allgather_replicated_data` | false | Enables hash ownership and TP AllGather for replicated layouts; false selects rank-local transfer aggregation |
+| `allgather_scatter_only` | false | For replicated layouts, keeps hash-partitioned dump but loads every block from shared CacheStore and skips TP AllGather |
+| `allgather_collective_mode` | `host` | Collective engine: `host`, `aicpu_ts`, `aiv`, or `auto` |
 
 The actual window is reduced if the requested window does not fit the budget.
 Initialization fails when even one block per rank cannot fit. The store logs
@@ -48,6 +50,11 @@ without exchanging metadata.
 
 In rank-local aggregation mode the effective storage world size is one, so all
 local blocks are owned and window slots follow input order.
+
+In scatter-only mode, dump ownership remains hash-partitioned across TP ranks,
+but load ownership has an effective world size of one. Each rank loads the full
+window from shared CacheStore into its local fused send buffer and scatters it
+without allocating a receive buffer or creating a collective communicator.
 
 All collectives use fixed tensors:
 
@@ -93,6 +100,8 @@ For TP size `T`, window `W`, shard bytes `S`, load slots `Kl`, and dump slots
 ```text
 Kl * (T + 1) * W * S + Kd * W * S
 ```
+
+Scatter-only payload memory is `Kl * W * S + Kd * W * S`.
 
 Persistent descriptor and offset buffers are included in the hard capacity
 calculation. Load-task metadata uses
@@ -141,8 +150,13 @@ The shared progressor owns one dedicated HCCL process group with the same TP
 membership, so its background collectives cannot interleave with model
 collectives on the vLLM TP group. The group is initialized with a barrier on
 the worker thread before the progress thread can issue its first collective.
-Its HCCL buffer defaults to 32 MiB instead of the runtime's 200 MiB default;
+Its HCCL buffer defaults to 8 MiB instead of the runtime's 200 MiB default;
 `allgather_hccl_buffer_mb` can override it for larger transfer windows.
+The collective engine is configured on the UCM communicator rather than through
+the process-wide `HCCL_OP_EXPANSION_MODE`. `aicpu_ts` selects
+`hcclOpExpansionMode=2`, the non-AIV high-bandwidth mode available on Atlas A3.
+`host` preserves the Atlas A2 behavior, while `auto` delegates to the platform
+default.
 
 On an owner failure, the affected rank skips local scatter but still enters all
 payload collectives with its valid staging allocation, preserving collective

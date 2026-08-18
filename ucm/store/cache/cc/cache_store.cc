@@ -127,6 +127,7 @@ private:
         config.Get("unique_id", param.uniqueId);
         config.Get("cache_load_backend_only", param.cacheLoadBackendOnly);
         config.GetNumber("device_id", param.deviceId);
+        config.GetNumber("cache_numa_node", param.numaNode);
         size_t tensorSize = 0;
         config.GetNumber("tensor_size", tensorSize);
         config.GetNumber("shard_size", param.shardSize);
@@ -176,6 +177,9 @@ private:
         if (config.deviceId < -1) {
             return Status::InvalidParam("invalid device({})", config.deviceId);
         }
+        if (config.numaNode < -1) {
+            return Status::InvalidParam("invalid NUMA node({})", config.numaNode);
+        }
         if (config.uniqueId.empty()) { return Status::InvalidParam("invalid unique id"); }
         auto s =
             Trans::GdrKVBufferConfig::Validate(config.gpuKvBufferAddrs, config.gpuKvBufferSizes);
@@ -222,6 +226,7 @@ private:
         UC_INFO("Set {}::UniqueId to {}.", ns, config.uniqueId);
         UC_INFO("Set {}::CacheLoadBackendOnly to {}.", ns, config.cacheLoadBackendOnly);
         UC_INFO("Set {}::DeviceId to {}.", ns, config.deviceId);
+        UC_INFO("Set {}::NumaNode to {}.", ns, config.numaNode);
         const auto& v = config.tensorSizes;
         if (v.empty()) {
             UC_INFO("Set {}::TensorSizes to [].", ns);

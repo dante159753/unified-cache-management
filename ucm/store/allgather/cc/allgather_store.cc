@@ -1,0 +1,1257 @@
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cctype>
+#include <cstdint>
+#include <cstring>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <numeric>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include "allgather_runtime.h"
+#include "platform_runtime.h"
+#include "logger/logger.h"
+#include "metrics_api.h"
+#include "memory_plan.h"
+#include "ucmstore_v1.h"
+
+namespace UC::AllGatherStore {
+namespace {
+
+constexpr uint32_t kDefaultCollectiveBufferMb = 8;
+constexpr size_t kDefaultLoadSlots = 2;
+constexpr size_t kDefaultDumpSlots = 2;
+using Clock = std::chrono::steady_clock;
+
+Status ParseCollectiveMode(const std::string& value, uint32_t* mode,
+                           std::string* canonical)
+{
+    std::string normalized = value;
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    if (normalized == "auto" || normalized == "default") {
+        *mode = 0;
+        *canonical = "auto";
+    } else if (normalized == "host" || normalized == "host_ts") {
+        *mode = 1;
+        *canonical = "host";
+    } else if (normalized == "aicpu" || normalized == "ai_cpu" ||
+               normalized == "aicpu_ts" || normalized == "ai_cpu_ts") {
+        *mode = 2;
+        *canonical = "aicpu_ts";
+    } else if (normalized == "aiv") {
+        *mode = 3;
+        *canonical = "aiv";
+    } else {
+        return Status::InvalidParam(
+            "invalid allgather collective mode({}); expected auto, host, aicpu_ts, or aiv",
+            value);
+    }
+    return Status::OK();
+}
+
+double Milliseconds(Clock::duration duration)
+{
+    return std::chrono::duration<double, std::milli>(duration).count();
+}
+
+int64_t Microseconds(Clock::time_point point)
+{
+    if (point == Clock::time_point{}) { return 0; }
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               point.time_since_epoch())
+        .count();
+}
+
+struct DeviceBuffer {
+    std::shared_ptr<PlatformRuntime> platform;
+    void* data{nullptr};
+    size_t size{0};
+
+    DeviceBuffer() = default;
+    DeviceBuffer(const DeviceBuffer&) = delete;
+    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+    DeviceBuffer(DeviceBuffer&& other) noexcept
+        : platform(std::move(other.platform)), data(other.data), size(other.size)
+    {
+        other.data = nullptr;
+        other.size = 0;
+    }
+    DeviceBuffer& operator=(DeviceBuffer&& other) noexcept
+    {
+        if (this == &other) { return *this; }
+        Reset();
+        platform = std::move(other.platform);
+        data = other.data;
+        size = other.size;
+        other.data = nullptr;
+        other.size = 0;
+        return *this;
+    }
+    ~DeviceBuffer() { Reset(); }
+
+    Status Allocate(std::shared_ptr<PlatformRuntime> value, size_t bytes, bool zero = false)
+    {
+        if (bytes == 0) { return Status::OK(); }
+        platform = std::move(value);
+        auto status = platform->AllocateDevice(&data, bytes, zero);
+        if (status.Success()) { size = bytes; }
+        return status;
+    }
+
+    void Reset()
+    {
+        if (data != nullptr && platform != nullptr) { platform->FreeDevice(data); }
+        data = nullptr;
+        size = 0;
+    }
+};
+
+template <typename T>
+struct HostBuffer {
+    std::shared_ptr<PlatformRuntime> platform;
+    T* data{nullptr};
+    size_t count{0};
+
+    HostBuffer() = default;
+    HostBuffer(const HostBuffer&) = delete;
+    HostBuffer& operator=(const HostBuffer&) = delete;
+    ~HostBuffer()
+    {
+        if (data != nullptr && platform != nullptr) { platform->FreeHost(data); }
+    }
+    Status Allocate(std::shared_ptr<PlatformRuntime> value, size_t elements)
+    {
+        platform = std::move(value);
+        auto status = platform->AllocateHost(reinterpret_cast<void**>(&data),
+                                             elements * sizeof(T));
+        if (status.Success()) { count = elements; }
+        return status;
+    }
+};
+
+struct LoadSlot {
+    std::shared_ptr<PlatformRuntime> platform;
+    DeviceBuffer send;
+    DeviceBuffer receive;
+    DeviceBuffer destinations;
+    DeviceBuffer routes;
+    HostBuffer<uint64_t> hostDestinations;
+    HostBuffer<uint32_t> hostRoutes;
+    EventHandle completion{nullptr};
+    bool recorded{false};
+
+    ~LoadSlot()
+    {
+        if (completion != nullptr && platform != nullptr) {
+            platform->DestroyEvent(completion);
+        }
+    }
+};
+
+struct DumpSlot {
+    std::shared_ptr<PlatformRuntime> platform;
+    DeviceBuffer send;
+    DeviceBuffer descriptors;
+    DeviceBuffer offsets;
+    HostBuffer<uint64_t> hostDescriptors;
+    HostBuffer<uint32_t> hostOffsets;
+    EventHandle ready{nullptr};
+
+    ~DumpSlot()
+    {
+        if (ready != nullptr && platform != nullptr) { platform->DestroyEvent(ready); }
+    }
+};
+
+struct WindowPlan {
+    std::vector<size_t> rows;
+    std::vector<uint32_t> owners;
+    std::vector<uint32_t> ownerSlots;
+    std::vector<uint64_t> receiveBytes;
+    std::vector<uint64_t> receiveDisplacements;
+    size_t collectiveBlocks{};
+};
+
+struct PendingBackend {
+    size_t window{};
+    size_t slot{};
+    Detail::TaskHandle handle{};
+    bool submitted{false};
+    Status status{Status::OK()};
+    size_t ownedRows{};
+    Clock::time_point slotReadyAt;
+    Clock::time_point backendSubmitStartedAt;
+    Clock::time_point backendSubmittedAt;
+};
+
+struct LoadMetrics {
+    double queueWaitMs{};
+    double slotWaitMs{};
+    double backendSubmitMs{};
+    double backendWaitMs{};
+    double collectiveSubmitMs{};
+    double scatterSubmitMs{};
+    double collectiveDeviceMs{};
+    double scatterDeviceMs{};
+    double syncMs{};
+    double totalMs{};
+    size_t windows{};
+};
+
+struct DumpMetrics {
+    double queueWaitMs{};
+    double backendSubmitMs{};
+    double backendWaitMs{};
+    double syncMs{};
+    double totalMs{};
+    size_t windows{};
+};
+
+struct StageTraceRecord {
+    size_t window{};
+    size_t slot{};
+    size_t rows{};
+    size_t ownedRows{};
+    uint64_t collectiveBytes{};
+    Clock::time_point slotReadyAt;
+    Clock::time_point backendSubmitStartedAt;
+    Clock::time_point backendSubmittedAt;
+    Clock::time_point backendWaitStartedAt;
+    Clock::time_point backendReadyAt;
+    Clock::time_point collectiveStartedAt;
+    Clock::time_point collectiveSubmittedAt;
+};
+
+struct TimingWindow {
+    PlatformRuntime* platform{nullptr};
+    EventHandle start{nullptr};
+    EventHandle collectiveDone{nullptr};
+    EventHandle scatterDone{nullptr};
+    bool complete{false};
+
+    TimingWindow() = default;
+    TimingWindow(const TimingWindow&) = delete;
+    TimingWindow& operator=(const TimingWindow&) = delete;
+    TimingWindow(TimingWindow&& other) noexcept
+        : platform(other.platform), start(other.start), collectiveDone(other.collectiveDone),
+          scatterDone(other.scatterDone), complete(other.complete)
+    {
+        other.platform = nullptr;
+        other.start = nullptr;
+        other.collectiveDone = nullptr;
+        other.scatterDone = nullptr;
+        other.complete = false;
+    }
+    ~TimingWindow()
+    {
+        if (platform == nullptr) { return; }
+        platform->DestroyEvent(start);
+        platform->DestroyEvent(collectiveDone);
+        platform->DestroyEvent(scatterDone);
+    }
+
+    bool Setup(PlatformRuntime& value)
+    {
+        platform = &value;
+        if (platform->CreateEvent(&start, true).Failure() ||
+            platform->CreateEvent(&collectiveDone, true).Failure() ||
+            platform->CreateEvent(&scatterDone, true).Failure()) {
+            return false;
+        }
+        return true;
+    }
+
+    bool Valid() const
+    {
+        return complete && start != nullptr && collectiveDone != nullptr &&
+               scatterDone != nullptr;
+    }
+};
+
+struct TaskState {
+    enum class Operation { Load, Dump };
+    explicit TaskState(Operation operation, Detail::TaskDesc input, uint64_t sequence,
+                       bool profile, bool stageTrace,
+                       std::shared_ptr<PlatformRuntime> platform)
+        : operation(operation), input(std::move(input)), queuedAt(Clock::now()), profile(profile),
+          stageTrace(stageTrace), sequence(sequence), platform(std::move(platform))
+    {
+    }
+    ~TaskState()
+    {
+        if (completion != nullptr && platform != nullptr) {
+            platform->DestroyEvent(completion);
+        }
+    }
+
+    Operation operation;
+    Detail::TaskDesc input;
+    std::vector<WindowPlan> windows;
+    std::mutex mutex;
+    std::condition_variable condition;
+    Status status{Status::OK()};
+    bool done{false};
+    EventHandle completion{nullptr};
+    bool completionRecorded{false};
+    Clock::time_point queuedAt;
+    Clock::time_point enqueuedAt;
+    bool profile{false};
+    bool stageTrace{false};
+    uint64_t sequence{};
+    std::shared_ptr<PlatformRuntime> platform;
+};
+
+uint32_t Owner(const Detail::BlockId& id, uint32_t worldSize)
+{
+    uint64_t value = 0;
+    std::memcpy(&value, id.data(), std::min(sizeof(value), id.size()));
+    return static_cast<uint32_t>(value % worldSize);
+}
+
+}  // namespace
+
+class AllGatherStore final : public StoreV1 {
+public:
+    ~AllGatherStore() override
+    {
+        if (platform_ != nullptr) { (void)platform_->SetDevice(deviceId_); }
+        std::vector<std::shared_ptr<TaskState>> tasks;
+        {
+            std::lock_guard<std::mutex> lock(tasksMutex_);
+            stopping_ = true;
+            for (const auto& item : tasks_) { tasks.push_back(item.second); }
+        }
+        for (const auto& task : tasks) {
+            std::unique_lock<std::mutex> lock(task->mutex);
+            task->condition.wait(lock, [&task] { return task->done; });
+            const auto completion = task->completion;
+            const auto completionRecorded = task->completionRecorded;
+            lock.unlock();
+            if (completionRecorded) { (void)platform_->SynchronizeEvent(completion); }
+        }
+        runtime_.reset();
+    }
+
+    Status Setup(const Detail::Dictionary& config) override
+    {
+        config.Get("store_backend", backend_);
+        config.GetNumber("device_id", deviceId_);
+        config.GetNumber("shard_size", shardSize_);
+        config.GetNumber("block_size", blockSize_);
+        config.GetNumbers("tensor_size_list", tensorSizes_);
+        config.GetNumber("allgather_rank", rank_);
+        config.GetNumber("allgather_world_size", worldSize_);
+        config.Get("allgather_replicated_data", replicated_);
+        config.Get("allgather_scatter_only", scatterOnly_);
+        config.GetNumber("allgather_load_slots", loadSlotCount_);
+        config.GetNumber("allgather_load_groups", loadGroupCount_);
+        config.GetNumber("allgather_dump_slots", dumpSlotCount_);
+        config.GetNumber("allgather_hccl_buffer_mb", collectiveBufferMb_);
+        config.GetNumber("allgather_collective_buffer_mb", collectiveBufferMb_);
+        config.Get("allgather_collective_mode", collectiveModeName_);
+        config.GetNumber("allgather_profile_sample_every", profileSampleEvery_);
+        config.GetNumber("allgather_stage_trace_sample_every", stageTraceSampleEvery_);
+        config.Get("allgather_async_completion", asyncCompletion_);
+        config.Get("allgather_separate_dump_queue", separateDumpQueue_);
+        config.Get("allgather_collective_count_crop", collectiveCountCrop_);
+        config.Get("allgather_collective_variable_counts", variableCollective_);
+        config.Get("allgather_load_skip_collective", skipLoadCollective_);
+        config.Get("allgather_load_skip_scatter", skipLoadScatter_);
+        config.Get("allgather_runtime_key", runtimeKey_);
+        config.GetNumbers("allgather_hccl_root_info", rootInfo_);
+        config.GetNumbers("allgather_collective_root_info", rootInfo_);
+
+        if (backend_ == nullptr) { return Status::InvalidParam("invalid store backend"); }
+        if (deviceId_ < 0) { return Status::OK(); }
+        if (worldSize_ == 0 || rank_ >= worldSize_) {
+            return Status::InvalidParam("invalid allgather rank({}/{})", rank_, worldSize_);
+        }
+        if (runtimeKey_.empty()) { return Status::InvalidParam("empty allgather runtime key"); }
+        if (config.Contains("allgather_fused_buffer_capacity_mb")) {
+            return Status::InvalidParam(
+                "allgather_fused_buffer_capacity_mb is not supported");
+        }
+        config.GetNumber("allgather_window_blocks_per_rank", windowBlocks_);
+        if (windowBlocks_ == 0) {
+            return Status::InvalidParam("allgather window must be positive");
+        }
+        collectiveEnabled_ = replicated_ && !scatterOnly_ && worldSize_ > 1;
+        auto status = ParseCollectiveMode(collectiveModeName_, &collectiveMode_,
+                                          &collectiveModeName_);
+        if (status.Failure()) { return status; }
+        if (loadGroupCount_ == 0 || loadGroupCount_ > loadSlotCount_) {
+            return Status::InvalidParam("invalid allgather load group count({}/{})",
+                                        loadGroupCount_, loadSlotCount_);
+        }
+        loadStorageWorldSize_ = collectiveEnabled_ ? worldSize_ : 1;
+        loadStorageRank_ = collectiveEnabled_ ? rank_ : 0;
+        dumpStorageWorldSize_ = replicated_ ? worldSize_ : 1;
+        dumpStorageRank_ = replicated_ ? rank_ : 0;
+        try {
+            plan_ = CalculateStageMemoryPlan(tensorSizes_, shardSize_, worldSize_,
+                                             collectiveEnabled_,
+                                             loadSlotCount_, dumpSlotCount_, windowBlocks_);
+        } catch (const std::exception& error) {
+            return Status::InvalidParam("invalid allgather memory plan: {}", error.what());
+        }
+
+        platform_ = CreatePlatformRuntime();
+        if (platform_ == nullptr) {
+            return Status::Error("allgather platform runtime unavailable");
+        }
+        if (variableCollective_ && collectiveEnabled_ &&
+            !platform_->SupportsAllGatherV()) {
+            return Status::InvalidParam("AllGatherV is unavailable on {}",
+                                        platform_->Name());
+        }
+        status = platform_->SetDevice(deviceId_);
+        if (status.Failure()) { return status; }
+        status = AllocateBuffers();
+        if (status.Failure()) { return status; }
+        auto runtime = AllGatherRuntime::Acquire(runtimeKey_, deviceId_, rank_, worldSize_,
+                                                 collectiveBufferMb_, collectiveMode_,
+                                                 rootInfo_,
+                                                 collectiveEnabled_, loadGroupCount_);
+        if (!runtime) { return runtime.Error(); }
+        runtime_ = runtime.Value();
+        UC_INFO(
+            "AllGatherStore: shard={}, world={}, window_blocks={}, load_slots={}, "
+            "load_groups={}, "
+            "dump_slots={}, payload_bytes={}, metadata_bytes={}, "
+            "collective_buffer_bytes={}, scatter_only={}, skip_load_collective={}, "
+            "skip_load_scatter={}, variable_collective={}, collective_mode={}, platform={}.",
+            shardSize_, worldSize_, windowBlocks_, loadSlotCount_, loadGroupCount_,
+            dumpSlotCount_,
+            plan_.PayloadBytes(),
+            plan_.MetadataBytes(),
+            CalculateCollectiveBytes(collectiveBufferMb_, collectiveEnabled_,
+                                     loadGroupCount_),
+            scatterOnly_, skipLoadCollective_, skipLoadScatter_, variableCollective_,
+            collectiveModeName_,
+            platform_->Name());
+        return Status::OK();
+    }
+
+    std::string Readme() const override { return "AllGatherStore"; }
+
+    Expected<std::vector<uint8_t>> Lookup(const Detail::BlockId* blocks, size_t num) override
+    {
+        return backend_->Lookup(blocks, num);
+    }
+
+    Expected<ssize_t> LookupOnPrefix(const Detail::BlockId* blocks, size_t num) override
+    {
+        return backend_->LookupOnPrefix(blocks, num);
+    }
+
+    void Prefetch(const Detail::BlockId* blocks, size_t num) override
+    {
+        if (deviceId_ < 0 || !collectiveEnabled_) {
+            backend_->Prefetch(blocks, num);
+            return;
+        }
+        std::vector<Detail::BlockId> owned;
+        for (size_t i = 0; i < num; ++i) {
+            if (Owner(blocks[i], loadStorageWorldSize_) == loadStorageRank_) {
+                owned.push_back(blocks[i]);
+            }
+        }
+        if (!owned.empty()) { backend_->Prefetch(owned.data(), owned.size()); }
+    }
+
+    Status CheckHealth() override { return backend_->CheckHealth(); }
+
+    Expected<Detail::TaskHandle> Load(Detail::TaskDesc input) override
+    {
+        if (deviceId_ < 0) {
+            return Status::Error("allgather load is unavailable on scheduler");
+        }
+        return Submit(TaskState::Operation::Load, std::move(input));
+    }
+
+    Expected<Detail::TaskHandle> Dump(Detail::TaskDesc input) override
+    {
+        if (deviceId_ < 0) {
+            return Status::Error("allgather dump is unavailable on scheduler");
+        }
+        return Submit(TaskState::Operation::Dump, std::move(input));
+    }
+
+    Expected<bool> Check(Detail::TaskHandle handle) override
+    {
+        if (deviceId_ < 0) {
+            return Status::Error("allgather check is unavailable on scheduler");
+        }
+        auto task = FindTask(handle);
+        if (!task) { return Status::InvalidParam("invalid allgather task({})", handle); }
+        std::lock_guard<std::mutex> lock(task->mutex);
+        if (!task->done) { return false; }
+        if (!task->completionRecorded) { return true; }
+        return platform_->QueryEvent(task->completion);
+    }
+
+    Status Wait(Detail::TaskHandle handle) override
+    {
+        if (deviceId_ < 0) {
+            return Status::Error("allgather wait is unavailable on scheduler");
+        }
+        auto task = FindTask(handle);
+        if (!task) { return Status::InvalidParam("invalid allgather task({})", handle); }
+        std::unique_lock<std::mutex> lock(task->mutex);
+        task->condition.wait(lock, [&task] { return task->done; });
+        auto status = task->status;
+        const auto completion = task->completion;
+        const auto completionRecorded = task->completionRecorded;
+        lock.unlock();
+        if (completionRecorded) {
+            auto completionStatus = platform_->SynchronizeEvent(completion);
+            if (status.Success() && completionStatus.Failure()) { status = completionStatus; }
+        }
+        EraseTask(handle, task);
+        return status;
+    }
+
+private:
+    Status AllocateBuffers()
+    {
+        const size_t windowBytes = windowBlocks_ * shardSize_;
+        const size_t maxRows = windowBlocks_ * (collectiveEnabled_ ? worldSize_ : 1);
+        loadSlots_.reserve(loadSlotCount_);
+        for (size_t i = 0; i < loadSlotCount_; ++i) {
+            auto slot = std::make_unique<LoadSlot>();
+            slot->platform = platform_;
+            auto status = slot->send.Allocate(platform_, windowBytes);
+            if (status.Failure()) { return status; }
+            if (collectiveEnabled_) {
+                status = slot->receive.Allocate(platform_, worldSize_ * windowBytes);
+                if (status.Failure()) { return status; }
+            }
+            status = slot->destinations.Allocate(
+                platform_, maxRows * tensorSizes_.size() * sizeof(uint64_t));
+            if (status.Failure()) { return status; }
+            status = slot->routes.Allocate(platform_, maxRows * 2 * sizeof(uint32_t));
+            if (status.Failure()) { return status; }
+            status = slot->hostDestinations.Allocate(platform_, maxRows * tensorSizes_.size());
+            if (status.Failure()) { return status; }
+            status = slot->hostRoutes.Allocate(platform_, maxRows * 2);
+            if (status.Failure()) { return status; }
+            status = platform_->CreateEvent(&slot->completion);
+            if (status.Failure()) { return status; }
+            loadSlots_.push_back(std::move(slot));
+        }
+        dumpSlots_.reserve(dumpSlotCount_);
+        for (size_t i = 0; i < dumpSlotCount_; ++i) {
+            auto slot = std::make_unique<DumpSlot>();
+            slot->platform = platform_;
+            auto status = slot->send.Allocate(platform_, windowBytes, true);
+            if (status.Failure()) { return status; }
+            status = slot->descriptors.Allocate(
+                platform_, windowBlocks_ * plan_.chunkCount * 3 * sizeof(uint64_t));
+            if (status.Failure()) { return status; }
+            status = slot->offsets.Allocate(platform_,
+                                            (kMaxCopyWorkers + 1) * sizeof(uint32_t));
+            if (status.Failure()) { return status; }
+            status = slot->hostDescriptors.Allocate(
+                platform_, windowBlocks_ * plan_.chunkCount * 3);
+            if (status.Failure()) { return status; }
+            status = slot->hostOffsets.Allocate(platform_, kMaxCopyWorkers + 1);
+            if (status.Failure()) { return status; }
+            status = platform_->CreateEvent(&slot->ready);
+            if (status.Failure()) { return status; }
+            dumpSlots_.push_back(std::move(slot));
+        }
+        auto status = chunkLayout_.Allocate(platform_, plan_.chunkLayoutBytes);
+        if (status.Failure()) { return status; }
+        std::vector<uint64_t> chunks;
+        size_t sourceOffset = 0;
+        for (size_t tensor = 0; tensor < tensorSizes_.size(); ++tensor) {
+            for (size_t offset = 0; offset < tensorSizes_[tensor]; offset += kCopyChunkBytes) {
+                chunks.push_back(tensor);
+                chunks.push_back(sourceOffset + offset);
+                chunks.push_back(offset);
+                chunks.push_back(std::min(kCopyChunkBytes, tensorSizes_[tensor] - offset));
+            }
+            sourceOffset += tensorSizes_[tensor];
+        }
+        return platform_->CopyHostToDevice(chunkLayout_.data, chunkLayout_.size,
+                                           chunks.data(), chunks.size() * sizeof(uint64_t),
+                                           nullptr);
+    }
+
+    Expected<Detail::TaskHandle> Submit(TaskState::Operation operation, Detail::TaskDesc input)
+    {
+        if (input.empty()) { return Status::InvalidParam("empty allgather task"); }
+        for (const auto& shard : input) {
+            if (shard.addrs.size() != tensorSizes_.size()) {
+                return Status::InvalidParam("invalid allgather address count({}/{})",
+                                            shard.addrs.size(), tensorSizes_.size());
+            }
+        }
+        const auto sampleSequence = taskSequence_.fetch_add(1, std::memory_order_relaxed);
+        const auto sequence = operation == TaskState::Operation::Load
+                                  ? loadTaskSequence_.fetch_add(1, std::memory_order_relaxed)
+                                  : 0;
+        const bool profile = profileSampleEvery_ > 0 &&
+                             sampleSequence % profileSampleEvery_ == 0;
+        const bool stageTrace = operation == TaskState::Operation::Load &&
+                                stageTraceSampleEvery_ > 0 &&
+                                sequence % stageTraceSampleEvery_ == 0;
+        auto task = std::make_shared<TaskState>(operation, std::move(input), sequence,
+                                                profile, stageTrace, platform_);
+        if (operation == TaskState::Operation::Load && asyncCompletion_) {
+            auto status = platform_->CreateEvent(&task->completion);
+            if (status.Failure()) { return status; }
+        }
+        task->windows = BuildWindows(task->input, operation);
+        const auto handle = nextHandle_.fetch_add(1);
+        size_t queueDepth = 0;
+        {
+            std::lock_guard<std::mutex> lock(tasksMutex_);
+            if (stopping_) { return Status::Error("allgather store is stopping"); }
+            tasks_.emplace(handle, task);
+            queueDepth = tasks_.size();
+        }
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_task_queue_depth"),
+                                 static_cast<double>(queueDepth));
+        auto work = [this, task](PlatformRuntime& platform, StreamHandle stream,
+                                 CollectiveHandle collective) {
+                try {
+                    if (task->operation == TaskState::Operation::Load) {
+                        ProcessLoad(task, platform, stream, collective);
+                    } else {
+                        ProcessDump(task, platform, stream);
+                    }
+                } catch (const std::exception& error) {
+                    Finish(task, Status::Error(
+                                     fmt::format("allgather progress failed: {}", error.what())));
+                } catch (...) {
+                    Finish(task, Status::Error("allgather progress failed"));
+                }
+            };
+        task->enqueuedAt = Clock::now();
+        auto status = operation == TaskState::Operation::Dump && separateDumpQueue_
+                          ? runtime_->SubmitDump(std::move(work))
+                          : runtime_->Submit(std::move(work));
+        if (status.Failure()) {
+            std::lock_guard<std::mutex> lock(tasksMutex_);
+            tasks_.erase(handle);
+            return status;
+        }
+        return Detail::TaskHandle(handle);
+    }
+
+    std::vector<WindowPlan> BuildWindows(const Detail::TaskDesc& input,
+                                         TaskState::Operation operation) const
+    {
+        const auto storageWorldSize = operation == TaskState::Operation::Load
+                                          ? loadStorageWorldSize_
+                                          : dumpStorageWorldSize_;
+        std::vector<size_t> counts(storageWorldSize, 0);
+        std::vector<uint32_t> owners(input.size());
+        std::vector<size_t> ownerSlots(input.size());
+        size_t windowCount = 0;
+        for (size_t row = 0; row < input.size(); ++row) {
+            owners[row] = Owner(input[row].owner, storageWorldSize);
+            ownerSlots[row] = counts[owners[row]]++;
+            windowCount = std::max(windowCount, ownerSlots[row] / windowBlocks_ + 1);
+        }
+        std::vector<WindowPlan> windows(windowCount);
+        for (size_t row = 0; row < input.size(); ++row) {
+            const size_t window = ownerSlots[row] / windowBlocks_;
+            windows[window].rows.push_back(row);
+            windows[window].owners.push_back(owners[row]);
+            windows[window].ownerSlots.push_back(ownerSlots[row] % windowBlocks_);
+        }
+        const bool allowCrop = collectiveCountCrop_ && windows.size() == 1;
+        for (auto& window : windows) {
+            window.receiveBytes.assign(storageWorldSize, 0);
+            window.receiveDisplacements.assign(storageWorldSize, 0);
+            for (const auto slot : window.ownerSlots) {
+                window.collectiveBlocks =
+                    std::max(window.collectiveBlocks, static_cast<size_t>(slot) + 1);
+            }
+            for (size_t i = 0; i < window.owners.size(); ++i) {
+                window.receiveBytes[window.owners[i]] =
+                    std::max(window.receiveBytes[window.owners[i]],
+                             (static_cast<uint64_t>(window.ownerSlots[i]) + 1) *
+                                 shardSize_);
+            }
+            for (size_t owner = 1; owner < storageWorldSize; ++owner) {
+                window.receiveDisplacements[owner] =
+                    window.receiveDisplacements[owner - 1] +
+                    window.receiveBytes[owner - 1];
+            }
+            // Cropping a tail collective can reduce its link bandwidth enough to regress.
+            if (!allowCrop || window.collectiveBlocks * 2 > windowBlocks_) {
+                window.collectiveBlocks = windowBlocks_;
+            }
+        }
+        return windows;
+    }
+
+    PendingBackend SubmitLoadWindow(const std::shared_ptr<TaskState>& task, size_t windowIndex,
+                                    size_t slotIndex, LoadMetrics& metrics)
+    {
+        auto& slot = *loadSlots_[slotIndex];
+        PendingBackend pending{windowIndex, slotIndex, 0, false, Status::OK()};
+        try {
+            if (slot.recorded) {
+                const auto started = Clock::now();
+                auto status = platform_->SynchronizeEvent(slot.completion);
+                metrics.slotWaitMs += Milliseconds(Clock::now() - started);
+                if (status.Failure()) {
+                    pending.status = status;
+                    return pending;
+                }
+                slot.recorded = false;
+            }
+            pending.slotReadyAt = Clock::now();
+            Detail::TaskDesc backendTask;
+            const auto& window = task->windows[windowIndex];
+            for (size_t i = 0; i < window.rows.size(); ++i) {
+                if (window.owners[i] != loadStorageRank_) { continue; }
+                auto shard = task->input[window.rows[i]];
+                shard.addrs = {static_cast<uint8_t*>(slot.send.data) +
+                               window.ownerSlots[i] * shardSize_};
+                backendTask.push_back(std::move(shard));
+            }
+            pending.ownedRows = backendTask.size();
+            if (backendTask.empty()) { return pending; }
+            backendTask.brief = "AllGatherLoadWindow";
+            const auto started = Clock::now();
+            pending.backendSubmitStartedAt = started;
+            auto result = backend_->Load(std::move(backendTask));
+            pending.backendSubmittedAt = Clock::now();
+            metrics.backendSubmitMs += Milliseconds(pending.backendSubmittedAt - started);
+            if (!result) {
+                pending.status = result.Error();
+            } else {
+                pending.handle = result.Value();
+                pending.submitted = true;
+            }
+        } catch (const std::exception& error) {
+            pending.status = Status::Error(
+                fmt::format("allgather load window submission failed: {}", error.what()));
+        } catch (...) {
+            pending.status = Status::Error("allgather load window submission failed");
+        }
+        return pending;
+    }
+
+    Status ScatterWindow(const std::shared_ptr<TaskState>& task, const WindowPlan& window,
+                         LoadSlot& slot, PlatformRuntime& platform, StreamHandle stream)
+    {
+        auto& destinations = slot.hostDestinations;
+        auto& routes = slot.hostRoutes;
+        size_t destinationOffset = 0;
+        size_t routeOffset = 0;
+        for (size_t i = 0; i < window.rows.size(); ++i) {
+            const auto& shard = task->input[window.rows[i]];
+            for (const auto address : shard.addrs) {
+                destinations.data[destinationOffset++] = reinterpret_cast<uint64_t>(address);
+            }
+            if (variableCollective_ && collectiveEnabled_) {
+                routes.data[routeOffset++] = static_cast<uint32_t>(
+                    window.receiveDisplacements[window.owners[i]] / shardSize_ +
+                    window.ownerSlots[i]);
+                routes.data[routeOffset++] = 0;
+            } else {
+                routes.data[routeOffset++] = window.owners[i];
+                routes.data[routeOffset++] = window.ownerSlots[i];
+            }
+        }
+        auto status = platform.CopyHostToDevice(
+            slot.destinations.data, slot.destinations.size, destinations.data,
+            destinationOffset * sizeof(uint64_t), stream);
+        if (status.Failure()) { return status; }
+        status = platform.CopyHostToDevice(slot.routes.data, slot.routes.size, routes.data,
+                                           routeOffset * sizeof(uint32_t), stream);
+        if (status.Failure()) { return status; }
+        const auto taskCount = window.rows.size() * plan_.chunkCount;
+        const auto usedWorkers =
+            static_cast<uint32_t>(std::min(kMaxCopyWorkers, taskCount));
+        if (usedWorkers == 0) { return Status::OK(); }
+        void* receive = collectiveEnabled_ ? slot.receive.data : slot.send.data;
+        const auto rankStride = variableCollective_ && collectiveEnabled_
+                                    ? shardSize_
+                                    : window.collectiveBlocks * shardSize_;
+        return platform.LaunchCompactScatter(
+            stream, receive, slot.destinations.data, slot.routes.data, chunkLayout_.data,
+            window.rows.size(), plan_.chunkCount, tensorSizes_.size(),
+            rankStride, shardSize_, usedWorkers);
+    }
+
+    void ProcessLoad(const std::shared_ptr<TaskState>& task, PlatformRuntime& platform,
+                     StreamHandle stream, CollectiveHandle collective)
+    {
+        (void)stream;
+        (void)collective;
+        const auto taskStarted = Clock::now();
+        LoadMetrics metrics;
+        metrics.queueWaitMs = Milliseconds(taskStarted - task->queuedAt);
+        metrics.windows = task->windows.size();
+        Status firstError = Status::OK();
+        std::deque<PendingBackend> active;
+        std::vector<TimingWindow> timingWindows;
+        std::vector<StageTraceRecord> stageTraceRecords;
+        if (task->stageTrace) { stageTraceRecords.reserve(task->windows.size()); }
+        bool profiling = task->profile;
+        if (profiling) {
+            try {
+                timingWindows.reserve(task->windows.size());
+            } catch (...) {
+                profiling = false;
+            }
+        }
+        size_t nextWindow = 0;
+        while (nextWindow < task->windows.size() && active.size() < loadSlotCount_) {
+            active.push_back(SubmitLoadWindow(task, nextWindow, active.size(), metrics));
+            ++nextWindow;
+        }
+        while (!active.empty()) {
+            auto pending = active.front();
+            active.pop_front();
+            auto& slot = *loadSlots_[pending.slot];
+            const auto loadStream = runtime_->LoadStream(pending.slot);
+            const auto loadCollective = runtime_->LoadCollective(pending.slot);
+            if (pending.status.Failure() && firstError.Success()) {
+                firstError = pending.status;
+            }
+            Clock::time_point backendWaitStartedAt;
+            auto backendReadyAt = Clock::now();
+            if (pending.submitted) {
+                backendWaitStartedAt = Clock::now();
+                auto status = backend_->Wait(pending.handle);
+                backendReadyAt = Clock::now();
+                metrics.backendWaitMs +=
+                    Milliseconds(backendReadyAt - backendWaitStartedAt);
+                if (status.Failure() && firstError.Success()) { firstError = status; }
+            }
+            TimingWindow* timing = nullptr;
+            if (profiling) {
+                try {
+                    timingWindows.emplace_back();
+                    if (timingWindows.back().Setup(platform)) {
+                        timing = &timingWindows.back();
+                        if (platform.RecordEvent(timing->start, loadStream).Failure()) {
+                            timing = nullptr;
+                        }
+                    }
+                } catch (...) {
+                    profiling = false;
+                    timing = nullptr;
+                }
+            }
+            const auto& window = task->windows[pending.window];
+            Clock::time_point collectiveStartedAt;
+            auto collectiveSubmittedAt = backendReadyAt;
+            if (collectiveEnabled_ && !skipLoadCollective_) {
+                collectiveStartedAt = Clock::now();
+                const auto unequalCounts =
+                    variableCollective_ &&
+                    !std::all_of(window.receiveBytes.begin() + 1,
+                                 window.receiveBytes.end(),
+                                 [&window](uint64_t bytes) {
+                                     return bytes == window.receiveBytes.front();
+                                 });
+                auto status = unequalCounts
+                                  ? platform.AllGatherV(
+                                        slot.send.data,
+                                        window.receiveBytes[loadStorageRank_],
+                                        slot.receive.data,
+                                        window.receiveBytes.data(),
+                                        window.receiveDisplacements.data(),
+                                        loadCollective, loadStream)
+                                  : platform.AllGather(
+                                        slot.send.data, slot.receive.data,
+                                        variableCollective_
+                                            ? window.receiveBytes.front()
+                                            : window.collectiveBlocks * shardSize_,
+                                        loadCollective, loadStream);
+                collectiveSubmittedAt = Clock::now();
+                metrics.collectiveSubmitMs +=
+                    Milliseconds(collectiveSubmittedAt - collectiveStartedAt);
+                if (status.Failure() && firstError.Success()) { firstError = status; }
+            }
+            if (task->stageTrace) {
+                stageTraceRecords.push_back(StageTraceRecord{
+                    pending.window,
+                    pending.slot,
+                    window.rows.size(),
+                    pending.ownedRows,
+                    std::accumulate(window.receiveBytes.begin(),
+                                    window.receiveBytes.end(), uint64_t{0}),
+                    pending.slotReadyAt,
+                    pending.backendSubmitStartedAt,
+                    pending.backendSubmittedAt,
+                    backendWaitStartedAt,
+                    backendReadyAt,
+                    collectiveStartedAt,
+                    collectiveSubmittedAt});
+            }
+            if (timing != nullptr &&
+                platform.RecordEvent(timing->collectiveDone, loadStream).Failure()) {
+                timing = nullptr;
+            }
+            if (firstError.Success() && !skipLoadScatter_) {
+                const auto started = Clock::now();
+                auto status = ScatterWindow(task, window, slot, platform, loadStream);
+                metrics.scatterSubmitMs += Milliseconds(Clock::now() - started);
+                if (status.Failure()) { firstError = status; }
+            }
+            if (timing != nullptr) {
+                if (platform.RecordEvent(timing->scatterDone, loadStream).Failure()) {
+                    timing = nullptr;
+                } else {
+                    timing->complete = true;
+                }
+            }
+            auto status = platform.RecordEvent(slot.completion, loadStream);
+            if (status.Failure() && firstError.Success()) { firstError = status; }
+            slot.recorded = status.Success();
+            if (nextWindow < task->windows.size()) {
+                active.push_back(SubmitLoadWindow(task, nextWindow, pending.slot, metrics));
+                ++nextWindow;
+            }
+        }
+        const auto completionStream = runtime_->LoadStream(0);
+        for (const auto& slot : loadSlots_) {
+            if (!slot->recorded) { continue; }
+            auto waitStatus = platform.WaitEvent(completionStream, slot->completion);
+            if (waitStatus.Failure() && firstError.Success()) { firstError = waitStatus; }
+        }
+        auto status = Status::OK();
+        if (asyncCompletion_) {
+            status = platform.RecordEvent(task->completion, completionStream);
+            if (status.Failure()) {
+                if (firstError.Success()) { firstError = status; }
+            } else {
+                task->completionRecorded = true;
+            }
+        }
+        if (!asyncCompletion_ || (profiling && status.Success())) {
+            const auto syncStarted = Clock::now();
+            status = asyncCompletion_ ? platform.SynchronizeEvent(task->completion)
+                                      : platform.SynchronizeStream(completionStream);
+            metrics.syncMs = Milliseconds(Clock::now() - syncStarted);
+            if (status.Failure() && firstError.Success()) { firstError = status; }
+        }
+        if (profiling && status.Success()) {
+            for (auto& timing : timingWindows) {
+                if (!timing.Valid()) { continue; }
+                float elapsed = 0.0F;
+                if (platform.EventElapsedTime(&elapsed, timing.start,
+                                              timing.collectiveDone).Success()) {
+                    metrics.collectiveDeviceMs += elapsed;
+                }
+                if (platform.EventElapsedTime(&elapsed, timing.collectiveDone,
+                                              timing.scatterDone).Success()) {
+                    metrics.scatterDeviceMs += elapsed;
+                }
+            }
+        }
+        metrics.totalMs = Milliseconds(Clock::now() - taskStarted);
+        RecordLoadMetrics(metrics, task->profile && profiling);
+        RecordStageTrace(*task, taskStarted, stageTraceRecords);
+        Finish(task, firstError);
+    }
+
+    void RecordStageTrace(const TaskState& task, Clock::time_point dequeuedAt,
+                          const std::vector<StageTraceRecord>& records) const
+    {
+        for (const auto& record : records) {
+            UC_INFO(
+                "AG_STAGE device={} rank={} shard={} task={} window={} slot={} rows={} owned={} "
+                "bytes={} received_us={} enqueued_us={} dequeued_us={} slot_ready_us={} "
+                "backend_submit_begin_us={} backend_submit_end_us={} "
+                "backend_wait_begin_us={} backend_ready_us={} "
+                "collective_begin_us={} collective_end_us={}.",
+                deviceId_, rank_, shardSize_, task.sequence, record.window, record.slot,
+                record.rows, record.ownedRows, record.collectiveBytes,
+                Microseconds(task.queuedAt), Microseconds(task.enqueuedAt),
+                Microseconds(dequeuedAt), Microseconds(record.slotReadyAt),
+                Microseconds(record.backendSubmitStartedAt),
+                Microseconds(record.backendSubmittedAt),
+                Microseconds(record.backendWaitStartedAt),
+                Microseconds(record.backendReadyAt),
+                Microseconds(record.collectiveStartedAt),
+                Microseconds(record.collectiveSubmittedAt));
+        }
+    }
+
+    static void RecordLoadMetrics(const LoadMetrics& metrics, bool profiled)
+    {
+        if (!profiled) { return; }
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_load_windows"),
+                                 static_cast<double>(metrics.windows));
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_task_queue_wait_ms"),
+                                 metrics.queueWaitMs);
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_load_slot_reclaim_wait_ms"),
+                                 metrics.slotWaitMs);
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_load_backend_submit_ms"),
+                                 metrics.backendSubmitMs);
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_load_inner_wait_ms"),
+                                 metrics.backendWaitMs);
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_load_collective_submit_ms"),
+                                 metrics.collectiveSubmitMs);
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_load_scatter_submit_ms"),
+                                 metrics.scatterSubmitMs);
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_load_sync_ms"), metrics.syncMs);
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_load_total_ms"),
+                                 metrics.totalMs);
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_load_collective_device_ms"),
+                                 metrics.collectiveDeviceMs);
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_load_scatter_device_ms"),
+                                 metrics.scatterDeviceMs);
+        UC_INFO(
+            "AllGather load profile: queue_ms={:.3f}, slot_ms={:.3f}, "
+            "backend_submit_ms={:.3f}, backend_wait_ms={:.3f}, "
+            "collective_submit_ms={:.3f}, collective_device_ms={:.3f}, "
+            "scatter_submit_ms={:.3f}, scatter_device_ms={:.3f}, "
+            "sync_ms={:.3f}, total_ms={:.3f}, windows={}.",
+            metrics.queueWaitMs, metrics.slotWaitMs, metrics.backendSubmitMs,
+            metrics.backendWaitMs, metrics.collectiveSubmitMs,
+            metrics.collectiveDeviceMs, metrics.scatterSubmitMs,
+            metrics.scatterDeviceMs, metrics.syncMs, metrics.totalMs,
+            metrics.windows);
+    }
+
+    static std::pair<std::vector<uint64_t>, std::vector<uint32_t>> BalanceDescriptors(
+        std::vector<std::array<uint64_t, 3>> descriptors)
+    {
+        if (descriptors.empty()) { return {}; }
+        const size_t workers = std::min(kMaxCopyWorkers, descriptors.size());
+        std::vector<std::vector<std::array<uint64_t, 3>>> bins(workers);
+        std::vector<size_t> loads(workers, 0);
+        std::sort(descriptors.begin(), descriptors.end(),
+                  [](const auto& lhs, const auto& rhs) { return lhs[2] > rhs[2]; });
+        for (const auto& descriptor : descriptors) {
+            const auto target =
+                std::min_element(loads.begin(), loads.end()) - loads.begin();
+            bins[target].push_back(descriptor);
+            loads[target] += descriptor[2];
+        }
+        std::vector<uint64_t> ordered;
+        std::vector<uint32_t> offsets{0};
+        for (const auto& bin : bins) {
+            for (const auto& descriptor : bin) {
+                ordered.insert(ordered.end(), descriptor.begin(), descriptor.end());
+            }
+            offsets.push_back(ordered.size() / 3);
+        }
+        return {std::move(ordered), std::move(offsets)};
+    }
+
+    PendingBackend SubmitDumpWindow(const std::shared_ptr<TaskState>& task, size_t windowIndex,
+                                    size_t slotIndex, PlatformRuntime& platform,
+                                    StreamHandle stream, DumpMetrics& metrics)
+    {
+        auto& slot = *dumpSlots_[slotIndex];
+        const auto& window = task->windows[windowIndex];
+        std::vector<std::array<uint64_t, 3>> descriptors;
+        Detail::TaskDesc backendTask;
+        for (size_t i = 0; i < window.rows.size(); ++i) {
+            if (window.owners[i] != dumpStorageRank_) { continue; }
+            const auto& source = task->input[window.rows[i]];
+            size_t shardOffset = 0;
+            for (size_t tensor = 0; tensor < tensorSizes_.size(); ++tensor) {
+                const auto address = reinterpret_cast<uint64_t>(source.addrs[tensor]);
+                for (size_t offset = 0; address != 0 && offset < tensorSizes_[tensor];
+                     offset += kCopyChunkBytes) {
+                    descriptors.push_back(
+                        {address + offset,
+                         reinterpret_cast<uint64_t>(slot.send.data) +
+                             window.ownerSlots[i] * shardSize_ + shardOffset + offset,
+                         std::min(kCopyChunkBytes, tensorSizes_[tensor] - offset)});
+                }
+                shardOffset += tensorSizes_[tensor];
+            }
+            auto shard = source;
+            shard.addrs = {static_cast<uint8_t*>(slot.send.data) +
+                           window.ownerSlots[i] * shardSize_};
+            backendTask.push_back(std::move(shard));
+        }
+        PendingBackend pending{windowIndex, slotIndex, 0, false, Status::OK()};
+        if (backendTask.empty()) { return pending; }
+        auto balanced = BalanceDescriptors(std::move(descriptors));
+        auto status = Status::OK();
+        if (!balanced.first.empty()) {
+            std::copy(balanced.first.begin(), balanced.first.end(), slot.hostDescriptors.data);
+            std::copy(balanced.second.begin(), balanced.second.end(), slot.hostOffsets.data);
+            status = platform.CopyHostToDevice(
+                slot.descriptors.data, slot.descriptors.size, slot.hostDescriptors.data,
+                balanced.first.size() * sizeof(uint64_t), stream);
+            if (status.Failure()) { throw std::runtime_error(status.ToString()); }
+            status = platform.CopyHostToDevice(
+                slot.offsets.data, slot.offsets.size, slot.hostOffsets.data,
+                balanced.second.size() * sizeof(uint32_t), stream);
+            if (status.Failure()) { throw std::runtime_error(status.ToString()); }
+            const auto usedWorkers = static_cast<uint32_t>(balanced.second.size() - 1);
+            status = platform.LaunchSegmentedCopy(stream, slot.descriptors.data,
+                                                  slot.offsets.data, usedWorkers);
+            if (status.Failure()) { throw std::runtime_error(status.ToString()); }
+        }
+        status = platform.RecordEvent(slot.ready, stream);
+        if (status.Failure()) { throw std::runtime_error(status.ToString()); }
+        backendTask.brief = "AllGatherDumpWindow";
+        backendTask.prerequisiteHandle = reinterpret_cast<uintptr_t>(slot.ready);
+        const auto started = Clock::now();
+        auto result = backend_->Dump(std::move(backendTask));
+        metrics.backendSubmitMs += Milliseconds(Clock::now() - started);
+        if (!result) { throw std::runtime_error(result.Error().ToString()); }
+        pending.handle = result.Value();
+        pending.submitted = true;
+        return pending;
+    }
+
+    void ProcessDump(const std::shared_ptr<TaskState>& task, PlatformRuntime& platform,
+                     StreamHandle stream)
+    {
+        const auto taskStarted = Clock::now();
+        DumpMetrics metrics;
+        metrics.queueWaitMs = Milliseconds(taskStarted - task->queuedAt);
+        metrics.windows = task->windows.size();
+        Status firstError = Status::OK();
+        if (task->input.prerequisiteHandle != 0) {
+            auto status = platform.WaitEvent(
+                stream, reinterpret_cast<EventHandle>(task->input.prerequisiteHandle));
+            if (status.Failure()) { firstError = status; }
+        }
+        std::deque<PendingBackend> active;
+        size_t nextWindow = 0;
+        while (nextWindow < task->windows.size() && active.size() < dumpSlotCount_) {
+            active.push_back(
+                SubmitDumpWindow(task, nextWindow, active.size(), platform, stream, metrics));
+            ++nextWindow;
+        }
+        while (!active.empty()) {
+            auto pending = active.front();
+            active.pop_front();
+            if (pending.submitted) {
+                const auto started = Clock::now();
+                auto status = backend_->Wait(pending.handle);
+                metrics.backendWaitMs += Milliseconds(Clock::now() - started);
+                if (status.Failure() && firstError.Success()) { firstError = status; }
+            }
+            if (nextWindow < task->windows.size()) {
+                active.push_back(
+                    SubmitDumpWindow(task, nextWindow, pending.slot, platform, stream,
+                                     metrics));
+                ++nextWindow;
+            }
+        }
+        const auto syncStarted = Clock::now();
+        auto status = platform.SynchronizeStream(stream);
+        metrics.syncMs = Milliseconds(Clock::now() - syncStarted);
+        if (status.Failure() && firstError.Success()) { firstError = status; }
+        metrics.totalMs = Milliseconds(Clock::now() - taskStarted);
+        RecordDumpMetrics(metrics, task->profile);
+        Finish(task, firstError);
+    }
+
+    static void RecordDumpMetrics(const DumpMetrics& metrics, bool profiled)
+    {
+        if (!profiled) { return; }
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_dump_windows"),
+                                 static_cast<double>(metrics.windows));
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_task_queue_wait_ms"),
+                                 metrics.queueWaitMs);
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_dump_backend_submit_ms"),
+                                 metrics.backendSubmitMs);
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_dump_backend_wait_ms"),
+                                 metrics.backendWaitMs);
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_dump_sync_ms"), metrics.syncMs);
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_dump_total_ms"),
+                                 metrics.totalMs);
+        UC_INFO(
+            "AllGather dump profile: queue_ms={:.3f}, backend_submit_ms={:.3f}, "
+            "backend_wait_ms={:.3f}, sync_ms={:.3f}, total_ms={:.3f}, windows={}.",
+            metrics.queueWaitMs, metrics.backendSubmitMs, metrics.backendWaitMs,
+            metrics.syncMs, metrics.totalMs, metrics.windows);
+    }
+
+    static void Finish(const std::shared_ptr<TaskState>& task, Status status)
+    {
+        {
+            std::lock_guard<std::mutex> lock(task->mutex);
+            if (task->done) { return; }
+            task->status = std::move(status);
+            task->done = true;
+        }
+        task->condition.notify_all();
+    }
+
+    std::shared_ptr<TaskState> FindTask(Detail::TaskHandle handle)
+    {
+        std::lock_guard<std::mutex> lock(tasksMutex_);
+        const auto found = tasks_.find(handle);
+        return found == tasks_.end() ? nullptr : found->second;
+    }
+
+    void EraseTask(Detail::TaskHandle handle, const std::shared_ptr<TaskState>& task)
+    {
+        std::lock_guard<std::mutex> lock(tasksMutex_);
+        const auto found = tasks_.find(handle);
+        if (found != tasks_.end() && found->second == task) { tasks_.erase(found); }
+    }
+
+    StoreV1* backend_{nullptr};
+    int32_t deviceId_{-1};
+    size_t shardSize_{0};
+    size_t blockSize_{0};
+    std::vector<size_t> tensorSizes_;
+    uint32_t rank_{0};
+    uint32_t worldSize_{1};
+    uint32_t loadStorageRank_{0};
+    uint32_t loadStorageWorldSize_{1};
+    uint32_t dumpStorageRank_{0};
+    uint32_t dumpStorageWorldSize_{1};
+    bool replicated_{false};
+    bool scatterOnly_{false};
+    bool collectiveEnabled_{false};
+    size_t windowBlocks_{kDefaultWindowBlocks};
+    size_t loadSlotCount_{kDefaultLoadSlots};
+    size_t loadGroupCount_{1};
+    size_t dumpSlotCount_{kDefaultDumpSlots};
+    uint32_t collectiveBufferMb_{kDefaultCollectiveBufferMb};
+    std::string collectiveModeName_{"host"};
+    uint32_t collectiveMode_{1};
+    std::string runtimeKey_;
+    std::vector<uint8_t> rootInfo_;
+    std::shared_ptr<PlatformRuntime> platform_;
+    StageMemoryPlan plan_;
+    DeviceBuffer chunkLayout_;
+    std::vector<std::unique_ptr<LoadSlot>> loadSlots_;
+    std::vector<std::unique_ptr<DumpSlot>> dumpSlots_;
+    std::shared_ptr<AllGatherRuntime> runtime_;
+    std::atomic<Detail::TaskHandle> nextHandle_{1};
+    std::atomic<uint64_t> taskSequence_{0};
+    std::atomic<uint64_t> loadTaskSequence_{0};
+    size_t profileSampleEvery_{0};
+    size_t stageTraceSampleEvery_{0};
+    bool asyncCompletion_{false};
+    bool separateDumpQueue_{true};
+    bool collectiveCountCrop_{true};
+    bool variableCollective_{false};
+    bool skipLoadCollective_{false};
+    bool skipLoadScatter_{false};
+    std::mutex tasksMutex_;
+    std::unordered_map<Detail::TaskHandle, std::shared_ptr<TaskState>> tasks_;
+    bool stopping_{false};
+};
+
+}  // namespace UC::AllGatherStore
+
+extern "C" UC::StoreV1* MakeAllGatherStore()
+{
+    return new UC::AllGatherStore::AllGatherStore();
+}

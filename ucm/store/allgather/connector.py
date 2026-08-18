@@ -22,7 +22,30 @@ _MAX_AIV_CORES = 40
 _COPY_CHUNK_BYTES = 32 * 1024
 _DESCRIPTOR_BYTES = 3 * np.dtype(np.int64).itemsize
 _CHUNK_LAYOUT_FIELDS = 4
-_DEFAULT_HCCL_BUFFER_MB = 32
+_DEFAULT_HCCL_BUFFER_MB = 8
+_COLLECTIVE_MODES = {
+    "auto": 0,
+    "default": 0,
+    "host": 1,
+    "host_ts": 1,
+    "aicpu": 2,
+    "ai_cpu": 2,
+    "aicpu_ts": 2,
+    "ai_cpu_ts": 2,
+    "aiv": 3,
+}
+
+
+def _collective_mode(value: object) -> tuple[str, int]:
+    normalized = str(value).strip().lower()
+    try:
+        mode = _COLLECTIVE_MODES[normalized]
+    except KeyError as error:
+        raise ValueError(
+            "allgather_collective_mode must be auto, host, aicpu_ts, or aiv"
+        ) from error
+    canonical = {0: "auto", 1: "host", 2: "aicpu_ts", 3: "aiv"}[mode]
+    return canonical, mode
 
 
 @dataclass
@@ -59,6 +82,7 @@ class _DumpSlot(_CopySlot):
 class _LoadWindowPlan:
     row_count: int
     metadata_offset: int
+    collective_blocks: int
     owned_block_ids: List[bytes]
     owned_source_rows: List[int]
     owned_addrs_by_slot: List[np.ndarray]
@@ -231,7 +255,7 @@ _SHARED_PROGRESS_MANAGERS_LOCK = threading.Lock()
 
 
 def _acquire_shared_progress_manager(
-    device_id: int, hccl_buffer_mb: int
+    device_id: int, hccl_buffer_mb: int, collective_mode: int
 ) -> _LoadProgressManager:
     from vllm.distributed.parallel_state import get_tp_group
 
@@ -240,7 +264,7 @@ def _acquire_shared_progress_manager(
     if backend is None:
         backend = dist.get_backend(tp_group.device_group)
     group_ranks = tuple(tuple(ranks) for ranks in tp_group.group_ranks)
-    key = (device_id, str(backend), group_ranks, hccl_buffer_mb)
+    key = (device_id, str(backend), group_ranks, hccl_buffer_mb, collective_mode)
     with _SHARED_PROGRESS_MANAGERS_LOCK:
         manager = _SHARED_PROGRESS_MANAGERS.get(key)
         if manager is not None:
@@ -251,7 +275,10 @@ def _acquire_shared_progress_manager(
             import torch_npu
 
             pg_options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
-            pg_options.hccl_config = {"hccl_buffer_size": hccl_buffer_mb}
+            pg_options.hccl_config = {
+                "hccl_buffer_size": hccl_buffer_mb,
+                "hccl_op_expansion_mode": collective_mode,
+            }
         for ranks in group_ranks:
             group = dist.new_group(list(ranks), backend=backend, pg_options=pg_options)
             if tp_group.rank in ranks:
@@ -456,14 +483,31 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
         self._rank = int(config.get("allgather_rank", 0))
         self._world_size = int(config.get("allgather_world_size", 1))
         self._replicated_data = bool(config.get("allgather_replicated_data", False))
-        self._collective_enabled = self._replicated_data and self._world_size > 1
-        self._storage_rank = self._rank if self._replicated_data else 0
-        self._storage_world_size = self._world_size if self._replicated_data else 1
+        self._scatter_only = bool(config.get("allgather_scatter_only", False))
+        self._collective_enabled = (
+            self._replicated_data and not self._scatter_only and self._world_size > 1
+        )
+        self._collective_count_crop = bool(
+            config.get("allgather_collective_count_crop", True)
+        )
+        self._skip_load_collective = bool(
+            config.get("allgather_load_skip_collective", False)
+        )
+        self._skip_load_scatter = bool(config.get("allgather_load_skip_scatter", False))
+        self._load_storage_rank = self._rank if self._collective_enabled else 0
+        self._load_storage_world_size = (
+            self._world_size if self._collective_enabled else 1
+        )
+        self._dump_storage_rank = self._rank if self._replicated_data else 0
+        self._dump_storage_world_size = self._world_size if self._replicated_data else 1
         self._tensor_sizes = [int(size) for size in config.get("tensor_size_list", [])]
         self._shard_size = int(config.get("shard_size", 0))
         self._logical_size = sum(self._tensor_sizes)
         self._device_id = int(config.get("device_id", -1))
         self._hccl_buffer_mb = 0
+        self._collective_mode_name, self._collective_mode = _collective_mode(
+            config.get("allgather_collective_mode", "host")
+        )
         self._device = create_device() if self._worker else None
         self._copy_op = None
         self._tp_group = None
@@ -508,7 +552,7 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
                 self._hccl_buffer_mb = hccl_buffer_mb
                 if injected_group is None:
                     self._load_progress_manager = _acquire_shared_progress_manager(
-                        self._device_id, hccl_buffer_mb
+                        self._device_id, hccl_buffer_mb, self._collective_mode
                     )
                 else:
                     self._load_progress_manager = _LoadProgressManager(
@@ -538,7 +582,7 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
             default_capacity_mb = 256 if layerwise else 2048
             self._pool = _FusedBufferPool(
                 device_id=self._device_id,
-                world_size=self._storage_world_size,
+                world_size=self._load_storage_world_size,
                 shard_size=self._shard_size,
                 chunk_layout=chunk_layout,
                 requested_window_blocks=int(
@@ -553,14 +597,19 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
                 ),
             )
             inner_config["tensor_size_list"] = [self._shard_size]
-            inner_config["share_buffer_enable"] = False
-            inner_config["local_rank_size"] = 1
+            if not self._scatter_only:
+                inner_config["share_buffer_enable"] = False
+                inner_config["local_rank_size"] = 1
             logger.info(
-                "UcmAllGatherStore uses rank-private CacheStore host memory: "
+                "UcmAllGatherStore initialized: "
                 f"rank={self._rank}, world_size={self._world_size}, "
                 f"shard_size={self._shard_size}, layerwise={layerwise}, "
-                f"mode={'allgather' if self._collective_enabled else 'local-coalesced'}, "
-                f"hccl_buffer_mb={self._hccl_buffer_mb}"
+                f"mode={'scatter-only' if self._scatter_only else ('allgather' if self._collective_enabled else 'local-coalesced')}, "
+                f"shared_cache={bool(inner_config.get('share_buffer_enable', False))}, "
+                f"hccl_buffer_mb={self._hccl_buffer_mb}, "
+                f"collective_mode={self._collective_mode_name}, "
+                f"skip_load_collective={self._skip_load_collective}, "
+                f"skip_load_scatter={self._skip_load_scatter}"
             )
 
         self._inner = UcmPipelineStore(inner_config)
@@ -632,11 +681,11 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
             dtype=np.uint64,
         )
 
-    def _partition(self, block_ids: List[bytes]) -> tuple[List[int], List[int]]:
-        owners = [
-            self._owner(block_id, self._storage_world_size) for block_id in block_ids
-        ]
-        counts = [0] * self._storage_world_size
+    def _partition(
+        self, block_ids: List[bytes], storage_world_size: int
+    ) -> tuple[List[int], List[int]]:
+        owners = [self._owner(block_id, storage_world_size) for block_id in block_ids]
+        counts = [0] * storage_world_size
         owner_slots = []
         for owner in owners:
             owner_slots.append(counts[owner])
@@ -646,7 +695,10 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
     def owns(self, block_id: bytes) -> bool:
         if not self._worker:
             return True
-        return self._owner(block_id, self._storage_world_size) == self._storage_rank
+        return (
+            self._owner(block_id, self._dump_storage_world_size)
+            == self._dump_storage_rank
+        )
 
     @staticmethod
     def _balanced_descriptors(
@@ -709,7 +761,7 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
     ) -> List[tuple[int, int, int]]:
         descriptors = []
         for row, (owner, slot) in enumerate(zip(owners, owner_slots)):
-            if owner != self._storage_rank:
+            if owner != self._dump_storage_rank:
                 continue
             offset = 0
             for address, size in zip(addrs[row], self._tensor_sizes):
@@ -751,7 +803,7 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
             ),
             self._pool.chunk_layout,
             plan.row_count,
-            self._pool.window_blocks * self._shard_size,
+            plan.collective_blocks * self._shard_size,
             self._shard_size,
         )
 
@@ -782,10 +834,14 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
         if not self._worker:
             self._inner.prefetch(block_ids)
             return
+        if not self._collective_enabled:
+            self._inner.prefetch(block_ids)
+            return
         owned = [
             block_id
             for block_id in block_ids
-            if self._owner(block_id, self._storage_world_size) == self._storage_rank
+            if self._owner(block_id, self._load_storage_world_size)
+            == self._load_storage_rank
         ]
         if owned:
             self._inner.prefetch(owned)
@@ -807,18 +863,24 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
         return self.dump_data(block_ids, shard_index, self._tensor_addrs(src_tensor))
 
     def _build_load_plan(self, block_ids: List[bytes]) -> _LoadPlan:
-        owners, owner_slots = self._partition(block_ids)
+        owners, owner_slots = self._partition(block_ids, self._load_storage_world_size)
         windows = []
         row_order = []
         route_rows = []
         metadata_offset = 0
-        for start_slot, rows in self._window_rows(owner_slots):
+        window_rows = list(self._window_rows(owner_slots))
+        allow_crop = self._collective_count_crop and len(window_rows) == 1
+        for start_slot, rows in window_rows:
             window_owners = [owners[row] for row in rows]
             window_slots = [owner_slots[row] - start_slot for row in rows]
+            collective_blocks = max(window_slots) + 1
+            # Dense collectives retain higher link bandwidth than a slightly shorter tail.
+            if not allow_crop or collective_blocks * 2 > self._pool.window_blocks:
+                collective_blocks = self._pool.window_blocks
             owned_positions = [
                 index
                 for index, owner in enumerate(window_owners)
-                if owner == self._storage_rank
+                if owner == self._load_storage_rank
             ]
             owned_source_rows = [rows[index] for index in owned_positions]
             owned_addrs_by_slot = []
@@ -837,6 +899,7 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
                 _LoadWindowPlan(
                     row_count=len(rows),
                     metadata_offset=metadata_offset,
+                    collective_blocks=collective_blocks,
                     owned_block_ids=[block_ids[row] for row in owned_source_rows],
                     owned_source_rows=owned_source_rows,
                     owned_addrs_by_slot=owned_addrs_by_slot,
@@ -1185,7 +1248,7 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
                 f"dump address shape {addrs.shape} does not match "
                 f"({len(block_ids)}, {len(self._tensor_sizes)})"
             )
-        owners, owner_slots = self._partition(block_ids)
+        owners, owner_slots = self._partition(block_ids, self._dump_storage_world_size)
         task = AllGatherTask(operation="dump")
         waited_prerequisite = False
         try:
@@ -1194,7 +1257,7 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
                 owned_rows = [
                     index
                     for index, owner in enumerate(window_owners)
-                    if owner == self._storage_rank
+                    if owner == self._dump_storage_rank
                 ]
                 if not owned_rows:
                     continue
@@ -1266,6 +1329,9 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
         inner_wait_ms = 0.0
         collective_submit_ms = 0.0
         scatter_submit_ms = 0.0
+        collective_device_ms = 0.0
+        scatter_device_ms = 0.0
+        device_timings = []
         window_count = 0
         if task.metadata_event is not None:
             torch.npu.current_stream().wait_event(task.metadata_event)
@@ -1286,18 +1352,43 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
 
             slot = window.slot
             try:
-                if self._collective_enabled:
+                collective_start_event = None
+                collective_done_event = None
+                scatter_done_event = None
+                stream = torch.npu.current_stream()
+                if self._collective_enabled and not self._skip_load_collective:
+                    collective_start_event = torch.npu.Event(enable_timing=True)
+                    collective_done_event = torch.npu.Event(enable_timing=True)
+                    collective_start_event.record(stream)
+                    collective_bytes = window.plan.collective_blocks * self._shard_size
                     collective_start = time.perf_counter()
                     dist.all_gather_into_tensor(
-                        slot.receive_buffer, slot.send_buffer, group=self._tp_group
+                        slot.receive_buffer.narrow(
+                            0, 0, collective_bytes * self._world_size
+                        ),
+                        slot.send_buffer.narrow(0, 0, collective_bytes),
+                        group=self._tp_group,
                     )
                     collective_submit_ms += (
                         time.perf_counter() - collective_start
                     ) * 1000
-                if task.load_error is None:
+                    collective_done_event.record(stream)
+                if task.load_error is None and not self._skip_load_scatter:
+                    scatter_done_event = torch.npu.Event(enable_timing=True)
+                    if collective_done_event is None:
+                        collective_done_event = torch.npu.Event(enable_timing=True)
+                        collective_done_event.record(stream)
                     scatter_start = time.perf_counter()
                     self._compact_scatter(task, window, slot)
                     scatter_submit_ms += (time.perf_counter() - scatter_start) * 1000
+                    scatter_done_event.record(stream)
+                device_timings.append(
+                    (
+                        collective_start_event,
+                        collective_done_event,
+                        scatter_done_event,
+                    )
+                )
             except BaseException:
                 self._pool.release_load(slot)
                 self._drain_load_windows(task.active_load_windows)
@@ -1310,11 +1401,25 @@ class UcmAllGatherStore(UcmKVStoreBaseV1):
         sync_start = time.perf_counter()
         torch.npu.current_stream().synchronize()
         sync_ms = (time.perf_counter() - sync_start) * 1000
+        try:
+            for collective_start, collective_done, scatter_done in device_timings:
+                if collective_start is not None:
+                    collective_device_ms += collective_start.elapsed_time(
+                        collective_done
+                    )
+                if scatter_done is not None:
+                    scatter_device_ms += collective_done.elapsed_time(scatter_done)
+        except BaseException as error:
+            logger.warning("Failed to collect AllGather device timings: %s", error)
+            collective_device_ms = 0.0
+            scatter_device_ms = 0.0
         ucmmetrics.update_stats(
             {
                 "allgather_load_inner_wait_ms": inner_wait_ms,
                 "allgather_load_collective_submit_ms": collective_submit_ms,
                 "allgather_load_scatter_submit_ms": scatter_submit_ms,
+                "allgather_load_collective_device_ms": collective_device_ms,
+                "allgather_load_scatter_device_ms": scatter_device_ms,
                 "allgather_load_sync_ms": sync_ms,
                 "allgather_load_windows": float(window_count),
             }
