@@ -11,6 +11,15 @@ constexpr size_t kDefaultWindowBlocks = 4;
 constexpr size_t kCopyChunkBytes = 32 * 1024;
 constexpr size_t kMaxCopyWorkers = 40;
 constexpr size_t kCollectiveBufferCopies = 2;
+constexpr size_t kFrameHeaderBytes = 32;
+constexpr size_t kFrameRecordBytes = 16;
+
+constexpr size_t AlignFrameBytes(size_t bytes) { return (bytes + 31) / 32 * 32; }
+
+constexpr size_t CalculateFrameMetadataBytes(size_t windowBlocks)
+{
+    return AlignFrameBytes(kFrameHeaderBytes + windowBlocks * kFrameRecordBytes);
+}
 
 struct StageMemoryPlan {
     size_t shardSize{};
@@ -35,9 +44,9 @@ struct StageMemoryPlan {
     size_t TotalBytes() const;
 };
 
-StageMemoryPlan CalculateStageMemoryPlan(const std::vector<size_t>& tensorSizes,
-                                         size_t shardSize, size_t worldSize, bool replicated,
-                                         size_t loadSlots, size_t dumpSlots,
+StageMemoryPlan CalculateStageMemoryPlan(const std::vector<size_t>& tensorSizes, size_t shardSize,
+                                         size_t worldSize, bool replicated, size_t loadSlots,
+                                         size_t dumpSlots,
                                          size_t windowBlocks = kDefaultWindowBlocks);
 size_t CalculateCollectiveBytes(uint32_t bufferMb, bool collectiveEnabled,
                                 size_t collectiveGroupCount = 1);

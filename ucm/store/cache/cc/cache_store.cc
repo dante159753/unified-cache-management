@@ -88,6 +88,14 @@ public:
     {
         bufferMgr_.Prefetch(blocks, num);
     }
+    void Prefetch(const Detail::Shard* shards, size_t num) override
+    {
+        if (!transEnable_ || bufferMgr_.GetTransBuffer() == nullptr) {
+            StoreV1::Prefetch(shards, num);
+            return;
+        }
+        transMgr_.Prefetch(shards, num);
+    }
     Expected<Detail::TaskHandle> Load(Detail::TaskDesc task) override
     {
         if (!transEnable_) { return Status::Error("transfer is not enable"); }

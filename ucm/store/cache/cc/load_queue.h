@@ -32,6 +32,7 @@
 #include "template/hashset.h"
 #include "template/spsc_ring_queue.h"
 #include "thread/latch.h"
+#include "thread/thread_pool.h"
 #include "trans_buffer.h"
 #include "trans_task.h"
 #include "ucmstore_v1.h"
@@ -52,6 +53,10 @@ class LoadQueue {
         bool launchBoundary{false};
         double transferEnqueueTp{0};
     };
+    struct PrefetchShardTask {
+        TransBuffer::Handle bufferHandle;
+        Detail::TaskHandle backendTaskHandle{};
+    };
 
 private:
     alignas(64) std::atomic_bool stop_{false};
@@ -70,11 +75,13 @@ private:
     std::thread dispatcher_;
     std::thread transfer_;
     std::vector<ShardTask> holder_;
+    ThreadPool<std::vector<PrefetchShardTask>> prefetchPool_;
 
 public:
     ~LoadQueue();
     Status Setup(const Config& config, TaskIdSet* failureSet, TransBuffer* buffer);
     void Submit(TaskPtr task, WaiterPtr waiter);
+    void Prefetch(const Detail::Shard* shards, size_t num);
 
 private:
     void DispatchStage();
@@ -88,6 +95,7 @@ private:
     void RecordH2dSyncMetrics(double h2dSyncMs) const;
     void ClearSdmaDirectHolders() noexcept;
     bool UseSdmaDirectTaskLaunch() const noexcept;
+    void CompletePrefetch(std::vector<PrefetchShardTask>& tasks);
 };
 
 }  // namespace UC::CacheStore

@@ -179,6 +179,10 @@ public:
     {
         if (config_.storeBackend) { config_.storeBackend->Prefetch(blocks, num); }
     }
+    void Prefetch(const Detail::Shard* shards, size_t num) override
+    {
+        if (config_.storeBackend) { config_.storeBackend->Prefetch(shards, num); }
+    }
 
     Status CheckHealth() override
     {

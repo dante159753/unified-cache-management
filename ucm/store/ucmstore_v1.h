@@ -107,6 +107,14 @@ public:
      */
     virtual void Prefetch(const Detail::BlockId* blocks, size_t num) = 0;
 
+    virtual void Prefetch(const Detail::Shard* shards, size_t num)
+    {
+        std::vector<Detail::BlockId> blocks;
+        blocks.reserve(num);
+        for (size_t i = 0; i < num; ++i) { blocks.push_back(shards[i].owner); }
+        Prefetch(blocks.data(), blocks.size());
+    }
+
     /**
      * @brief Check whether this store's own read/write path is healthy.
      *

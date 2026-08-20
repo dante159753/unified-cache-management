@@ -17,6 +17,8 @@ DEFAULT_WA_LOAD_GROUPS = 1
 DEFAULT_DUMP_SLOTS = 2
 DEFAULT_COLLECTIVE_BUFFER_MB = 8
 COLLECTIVE_BUFFER_COPIES = 2
+FRAME_HEADER_BYTES = 32
+FRAME_RECORD_BYTES = 16
 DEFAULT_HCCL_BUFFER_MB = DEFAULT_COLLECTIVE_BUFFER_MB
 HCCL_BUFFER_COPIES = COLLECTIVE_BUFFER_COPIES
 
@@ -97,6 +99,10 @@ def _positive(name: str, value: int) -> int:
     return value
 
 
+def calculate_frame_metadata_bytes(window_blocks: int) -> int:
+    return (FRAME_HEADER_BYTES + window_blocks * FRAME_RECORD_BYTES + 31) // 32 * 32
+
+
 def calculate_stage_memory_plan(
     tensor_sizes: Sequence[int],
     shard_size: int,
@@ -127,6 +133,9 @@ def calculate_stage_memory_plan(
 
     window_payload_bytes = window_blocks * shard_size
     collective_enabled = bool(replicated) and world_size > 1
+    frame_bytes = window_payload_bytes + (
+        calculate_frame_metadata_bytes(window_blocks) if collective_enabled else 0
+    )
     max_window_rows = window_blocks * (world_size if collective_enabled else 1)
 
     return AllGatherStageMemoryPlan(
@@ -138,16 +147,16 @@ def calculate_stage_memory_plan(
         replicated=bool(replicated),
         load_slots=load_slots,
         dump_slots=dump_slots,
-        load_send_bytes=load_slots * window_payload_bytes,
+        load_send_bytes=load_slots * frame_bytes,
         load_receive_bytes=(
-            load_slots * world_size * window_payload_bytes if collective_enabled else 0
+            load_slots * world_size * frame_bytes if collective_enabled else 0
         ),
         dump_send_bytes=dump_slots * window_payload_bytes,
         chunk_layout_bytes=chunk_count * 4 * 8,
         dump_descriptor_bytes=(dump_slots * window_blocks * chunk_count * 3 * 8),
         dump_offset_bytes=dump_slots * (MAX_COPY_WORKERS + 1) * 4,
         load_destination_bytes=(load_slots * max_window_rows * len(sizes) * 8),
-        load_route_bytes=load_slots * max_window_rows * 2 * 4,
+        load_route_bytes=(0 if collective_enabled else load_slots * max_window_rows * 2 * 4),
     )
 
 

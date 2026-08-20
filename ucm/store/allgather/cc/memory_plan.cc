@@ -1,5 +1,4 @@
 #include "memory_plan.h"
-
 #include <numeric>
 #include <stdexcept>
 
@@ -18,10 +17,9 @@ size_t StageMemoryPlan::MetadataBytes() const
 
 size_t StageMemoryPlan::TotalBytes() const { return PayloadBytes() + MetadataBytes(); }
 
-StageMemoryPlan CalculateStageMemoryPlan(const std::vector<size_t>& tensorSizes,
-                                         size_t shardSize, size_t worldSize, bool replicated,
-                                         size_t loadSlots, size_t dumpSlots,
-                                         size_t windowBlocks)
+StageMemoryPlan CalculateStageMemoryPlan(const std::vector<size_t>& tensorSizes, size_t shardSize,
+                                         size_t worldSize, bool replicated, size_t loadSlots,
+                                         size_t dumpSlots, size_t windowBlocks)
 {
     if (tensorSizes.empty() || shardSize == 0 || worldSize == 0 || loadSlots == 0 ||
         dumpSlots == 0 || windowBlocks == 0) {
@@ -38,6 +36,8 @@ StageMemoryPlan CalculateStageMemoryPlan(const std::vector<size_t>& tensorSizes,
     }
     const bool collectiveEnabled = replicated && worldSize > 1;
     const size_t windowPayloadBytes = windowBlocks * shardSize;
+    const size_t frameBytes =
+        windowPayloadBytes + (collectiveEnabled ? CalculateFrameMetadataBytes(windowBlocks) : 0);
     const size_t maxWindowRows = windowBlocks * (collectiveEnabled ? worldSize : 1);
 
     StageMemoryPlan plan;
@@ -49,17 +49,14 @@ StageMemoryPlan CalculateStageMemoryPlan(const std::vector<size_t>& tensorSizes,
     plan.replicated = replicated;
     plan.loadSlots = loadSlots;
     plan.dumpSlots = dumpSlots;
-    plan.loadSendBytes = loadSlots * windowPayloadBytes;
-    plan.loadReceiveBytes =
-        collectiveEnabled ? loadSlots * worldSize * windowPayloadBytes : 0;
+    plan.loadSendBytes = loadSlots * frameBytes;
+    plan.loadReceiveBytes = collectiveEnabled ? loadSlots * worldSize * frameBytes : 0;
     plan.dumpSendBytes = dumpSlots * windowPayloadBytes;
     plan.chunkLayoutBytes = chunkCount * 4 * sizeof(uint64_t);
-    plan.dumpDescriptorBytes =
-        dumpSlots * windowBlocks * chunkCount * 3 * sizeof(uint64_t);
+    plan.dumpDescriptorBytes = dumpSlots * windowBlocks * chunkCount * 3 * sizeof(uint64_t);
     plan.dumpOffsetBytes = dumpSlots * (kMaxCopyWorkers + 1) * sizeof(uint32_t);
-    plan.loadDestinationBytes =
-        loadSlots * maxWindowRows * tensorSizes.size() * sizeof(uint64_t);
-    plan.loadRouteBytes = loadSlots * maxWindowRows * 2 * sizeof(uint32_t);
+    plan.loadDestinationBytes = loadSlots * maxWindowRows * tensorSizes.size() * sizeof(uint64_t);
+    plan.loadRouteBytes = collectiveEnabled ? 0 : loadSlots * maxWindowRows * 2 * sizeof(uint32_t);
     return plan;
 }
 

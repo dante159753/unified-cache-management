@@ -119,6 +119,11 @@ void HealthBreakerStore::Prefetch(const Detail::BlockId* blocks, size_t num)
     if (Enabled()) { store_->Prefetch(blocks, num); }
 }
 
+void HealthBreakerStore::Prefetch(const Detail::Shard* shards, size_t num)
+{
+    if (Enabled()) { store_->Prefetch(shards, num); }
+}
+
 Status HealthBreakerStore::CheckHealth()
 {
     auto status = healthCheck_.Run([this] { return store_->CheckHealth(); });

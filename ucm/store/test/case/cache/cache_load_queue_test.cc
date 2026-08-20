@@ -80,6 +80,57 @@ TEST_F(UCCacheLoadQueueTest, LoadSameBlockTwice)
     ASSERT_FALSE(failureSet.Contains(task2->id));
 }
 
+TEST_F(UCCacheLoadQueueTest, PrefetchPreservesShardIndex)
+{
+    using namespace UC::CacheStore;
+    using namespace testing;
+    UC::Test::Detail::MockStore backend;
+    std::atomic<size_t> submitted{0};
+    EXPECT_CALL(backend, Load)
+        .Times(2)
+        .WillRepeatedly(Invoke([&](UC::Detail::TaskDesc task) {
+            EXPECT_EQ(task.size(), 1);
+            EXPECT_TRUE(task[0].index == 3 || task[0].index == 7);
+            EXPECT_NE(task[0].addrs[0], nullptr);
+            submitted.fetch_add(1);
+            return NextId();
+        }));
+    EXPECT_CALL(backend, Check)
+        .WillRepeatedly(Return(UC::Expected<bool>{true}));
+    EXPECT_CALL(backend, Wait).Times(2).WillRepeatedly(Return(UC::Status::OK()));
+    UC::HashSet<UC::Detail::TaskHandle> failureSet;
+    Config config;
+    config.storeBackend = &backend;
+    config.tensorSizes = {32768};
+    config.shardSize = 32768;
+    config.blockSize = config.shardSize * 8;
+    config.deviceId = 0;
+    config.bufferCapacity = config.shardSize * 1024;
+    config.uniqueId = rd.RandomString(10);
+    config.shareBufferEnable = true;
+    TransBuffer buffer;
+    LoadQueue loadQ;
+    ASSERT_EQ(buffer.Setup(config), UC::Status::OK());
+    ASSERT_EQ(loadQ.Setup(config, &failureSet, &buffer), UC::Status::OK());
+    auto blockId = UC::Test::Detail::TypesHelper::MakeBlockId(
+        "a1b2c3d4e5f6789012345678901234ab");
+    UC::Detail::TaskDesc desc{
+        {blockId, 3, {}},
+        {blockId, 7, {}},
+    };
+    loadQ.Prefetch(desc.data(), desc.size());
+    ASSERT_EQ(submitted.load(), 2);
+    for (const auto shardIndex : {3U, 7U}) {
+        bool ready = false;
+        for (size_t retry = 0; retry < 1000 && !ready; ++retry) {
+            auto handle = buffer.Get(blockId, shardIndex, true, false);
+            ready = handle.Ready();
+            if (!ready) { std::this_thread::yield(); }
+        }
+        EXPECT_TRUE(ready);
+    }
+}
+
 TEST_F(UCCacheLoadQueueTest, SharedFailureStopsNonOwnerWait)
 {
     using namespace UC::CacheStore;

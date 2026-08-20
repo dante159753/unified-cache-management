@@ -1,9 +1,7 @@
-#include "platform_runtime.h"
-
 #include <acl/acl.h>
-#include <hccl/hccl.h>
-
 #include <cstring>
+#include <hccl/hccl.h>
+#include "platform_runtime.h"
 
 namespace ucm_segmented_copy {
 void Launch(void* stream, void* descriptors, void* coreOffsets, uint32_t usedCores);
@@ -11,10 +9,14 @@ void Launch(void* stream, void* descriptors, void* coreOffsets, uint32_t usedCor
 
 namespace ucm_compact_scatter {
 void Launch(void* stream, void* receiveBuffer, void* destinationAddresses, void* routes,
-            void* chunks, uint32_t rowCount,
-            uint32_t chunksPerBlock, uint32_t tensorCount,
+            void* chunks, uint32_t rowCount, uint32_t chunksPerBlock, uint32_t tensorCount,
             uint64_t rankStride, uint64_t shardSize, uint32_t usedCores);
-}
+void LaunchFramed(void* stream, void* receiveBuffer, void* destinationAddresses, void* chunks,
+                  void* taskError, uint32_t rowCount, uint32_t worldSize, uint32_t windowBlocks,
+                  uint32_t chunksPerBlock, uint32_t tensorCount, uint64_t frameStride,
+                  uint64_t metadataBytes, uint64_t shardSize, uint64_t sequence, uint32_t round,
+                  uint32_t usedCores);
+}  // namespace ucm_compact_scatter
 
 namespace UC::AllGatherStore {
 namespace {
@@ -42,8 +44,8 @@ public:
 
     Status AllocateDevice(void** data, size_t bytes, bool zero) override
     {
-        auto status = AclStatus(aclrtMalloc(data, bytes, ACL_MEM_TYPE_HIGH_BAND_WIDTH),
-                                "aclrtMalloc");
+        auto status =
+            AclStatus(aclrtMalloc(data, bytes, ACL_MEM_TYPE_HIGH_BAND_WIDTH), "aclrtMalloc");
         if (status.Success() && zero) {
             status = AclStatus(aclrtMemset(*data, bytes, 0, bytes), "aclrtMemset");
             if (status.Failure()) {
@@ -100,9 +102,9 @@ public:
 
     Status RecordEvent(EventHandle event, StreamHandle stream) override
     {
-        return AclStatus(aclrtRecordEvent(static_cast<aclrtEvent>(event),
-                                          static_cast<aclrtStream>(stream)),
-                         "aclrtRecordEvent");
+        return AclStatus(
+            aclrtRecordEvent(static_cast<aclrtEvent>(event), static_cast<aclrtStream>(stream)),
+            "aclrtRecordEvent");
     }
 
     Expected<bool> QueryEvent(EventHandle event) override
@@ -121,37 +123,52 @@ public:
 
     Status WaitEvent(StreamHandle stream, EventHandle event) override
     {
-        return AclStatus(aclrtStreamWaitEvent(static_cast<aclrtStream>(stream),
-                                              static_cast<aclrtEvent>(event)),
-                         "aclrtStreamWaitEvent");
+        return AclStatus(
+            aclrtStreamWaitEvent(static_cast<aclrtStream>(stream), static_cast<aclrtEvent>(event)),
+            "aclrtStreamWaitEvent");
     }
 
-    Status EventElapsedTime(float* milliseconds, EventHandle start,
-                            EventHandle end) override
+    Status EventElapsedTime(float* milliseconds, EventHandle start, EventHandle end) override
     {
-        return AclStatus(aclrtEventElapsedTime(milliseconds,
-                                               static_cast<aclrtEvent>(start),
+        return AclStatus(aclrtEventElapsedTime(milliseconds, static_cast<aclrtEvent>(start),
                                                static_cast<aclrtEvent>(end)),
                          "aclrtEventElapsedTime");
     }
 
-    Status CopyHostToDevice(void* destination, size_t destinationBytes,
-                            const void* source, size_t bytes,
-                            StreamHandle stream) override
+    Status CopyHostToDevice(void* destination, size_t destinationBytes, const void* source,
+                            size_t bytes, StreamHandle stream) override
     {
         if (bytes > destinationBytes) {
-            return Status::InvalidParam("host-to-device copy exceeds destination({}/{})",
-                                        bytes, destinationBytes);
+            return Status::InvalidParam("host-to-device copy exceeds destination({}/{})", bytes,
+                                        destinationBytes);
         }
         if (stream == nullptr) {
             return AclStatus(aclrtMemcpy(destination, destinationBytes, source, bytes,
                                          ACL_MEMCPY_HOST_TO_DEVICE),
                              "aclrtMemcpy");
         }
-        return AclStatus(aclrtMemcpyAsync(destination, destinationBytes, source, bytes,
-                                          ACL_MEMCPY_HOST_TO_DEVICE,
-                                          static_cast<aclrtStream>(stream)),
-                         "aclrtMemcpyAsync");
+        return AclStatus(
+            aclrtMemcpyAsync(destination, destinationBytes, source, bytes,
+                             ACL_MEMCPY_HOST_TO_DEVICE, static_cast<aclrtStream>(stream)),
+            "aclrtMemcpyAsync");
+    }
+
+    Status CopyDeviceToHost(void* destination, size_t destinationBytes, const void* source,
+                            size_t bytes, StreamHandle stream) override
+    {
+        if (bytes > destinationBytes) {
+            return Status::InvalidParam("device-to-host copy exceeds destination({}/{})", bytes,
+                                        destinationBytes);
+        }
+        if (stream == nullptr) {
+            return AclStatus(aclrtMemcpy(destination, destinationBytes, source, bytes,
+                                         ACL_MEMCPY_DEVICE_TO_HOST),
+                             "aclrtMemcpy");
+        }
+        return AclStatus(
+            aclrtMemcpyAsync(destination, destinationBytes, source, bytes,
+                             ACL_MEMCPY_DEVICE_TO_HOST, static_cast<aclrtStream>(stream)),
+            "aclrtMemcpyAsync");
     }
 
     Expected<std::vector<uint8_t>> CreateRootInfo() override
@@ -159,16 +176,15 @@ public:
         HcclRootInfo info{};
         auto status = HcclStatus(HcclGetRootInfo(&info), "HcclGetRootInfo");
         if (status.Failure()) { return status; }
-        return std::vector<uint8_t>(reinterpret_cast<uint8_t*>(info.internal),
-                                    reinterpret_cast<uint8_t*>(info.internal) +
-                                        HCCL_ROOT_INFO_BYTES);
+        return std::vector<uint8_t>(
+            reinterpret_cast<uint8_t*>(info.internal),
+            reinterpret_cast<uint8_t*>(info.internal) + HCCL_ROOT_INFO_BYTES);
     }
 
     size_t RootInfoSize() const override { return HCCL_ROOT_INFO_BYTES; }
 
     Status CreateCollective(uint32_t rank, uint32_t worldSize, uint32_t bufferMb,
-                            uint32_t expansionMode,
-                            const std::vector<uint8_t>& rootInfo,
+                            uint32_t expansionMode, const std::vector<uint8_t>& rootInfo,
                             CollectiveHandle* collective) override
     {
         if (rootInfo.size() != HCCL_ROOT_INFO_BYTES) {
@@ -180,9 +196,8 @@ public:
         HcclCommConfigInit(&config);
         config.hcclBufferSize = bufferMb;
         config.hcclOpExpansionMode = expansionMode;
-        return HcclStatus(HcclCommInitRootInfoConfig(
-                              worldSize, &info, rank, &config,
-                              reinterpret_cast<HcclComm*>(collective)),
+        return HcclStatus(HcclCommInitRootInfoConfig(worldSize, &info, rank, &config,
+                                                     reinterpret_cast<HcclComm*>(collective)),
                           "HcclCommInitRootInfoConfig");
     }
 
@@ -191,32 +206,30 @@ public:
         if (collective != nullptr) { (void)HcclCommDestroy(static_cast<HcclComm>(collective)); }
     }
 
-    Status AllGather(void* send, void* receive, size_t bytes,
-                     CollectiveHandle collective, StreamHandle stream) override
+    Status AllGather(void* send, void* receive, size_t bytes, CollectiveHandle collective,
+                     StreamHandle stream) override
     {
-        return HcclStatus(HcclAllGather(send, receive, bytes, HCCL_DATA_TYPE_INT8,
-                                        static_cast<HcclComm>(collective),
-                                        static_cast<aclrtStream>(stream)),
-                          "HcclAllGather");
+        return HcclStatus(
+            HcclAllGather(send, receive, bytes, HCCL_DATA_TYPE_INT8,
+                          static_cast<HcclComm>(collective), static_cast<aclrtStream>(stream)),
+            "HcclAllGather");
     }
 
     bool SupportsAllGatherV() const override { return true; }
 
-    Status AllGatherV(void* send, size_t sendBytes, void* receive,
-                      const uint64_t* receiveBytes,
-                      const uint64_t* receiveDisplacements,
-                      CollectiveHandle collective, StreamHandle stream) override
+    Status AllGatherV(void* send, size_t sendBytes, void* receive, const uint64_t* receiveBytes,
+                      const uint64_t* receiveDisplacements, CollectiveHandle collective,
+                      StreamHandle stream) override
     {
         return HcclStatus(
-            HcclAllGatherV(send, sendBytes, receive, receiveBytes,
-                           receiveDisplacements, HCCL_DATA_TYPE_INT8,
-                           static_cast<HcclComm>(collective),
+            HcclAllGatherV(send, sendBytes, receive, receiveBytes, receiveDisplacements,
+                           HCCL_DATA_TYPE_INT8, static_cast<HcclComm>(collective),
                            static_cast<aclrtStream>(stream)),
             "HcclAllGatherV");
     }
 
-    Status LaunchSegmentedCopy(StreamHandle stream, void* descriptors,
-                               void* coreOffsets, uint32_t usedWorkers) override
+    Status LaunchSegmentedCopy(StreamHandle stream, void* descriptors, void* coreOffsets,
+                               uint32_t usedWorkers) override
     {
         ucm_segmented_copy::Launch(stream, descriptors, coreOffsets, usedWorkers);
         return Status::OK();
@@ -224,14 +237,26 @@ public:
 
     Status LaunchCompactScatter(StreamHandle stream, void* receiveBuffer,
                                 void* destinationAddresses, void* routes, void* chunks,
-                                uint32_t rowCount,
-                                uint32_t chunksPerBlock,
-                                uint32_t tensorCount, uint64_t rankStride,
-                                uint64_t shardSize, uint32_t usedWorkers) override
+                                uint32_t rowCount, uint32_t chunksPerBlock, uint32_t tensorCount,
+                                uint64_t rankStride, uint64_t shardSize,
+                                uint32_t usedWorkers) override
     {
-        ucm_compact_scatter::Launch(stream, receiveBuffer, destinationAddresses, routes,
-                                    chunks, rowCount, chunksPerBlock, tensorCount,
-                                    rankStride, shardSize, usedWorkers);
+        ucm_compact_scatter::Launch(stream, receiveBuffer, destinationAddresses, routes, chunks,
+                                    rowCount, chunksPerBlock, tensorCount, rankStride, shardSize,
+                                    usedWorkers);
+        return Status::OK();
+    }
+
+    Status LaunchFramedScatter(StreamHandle stream, void* receiveBuffer, void* destinationAddresses,
+                               void* chunks, void* taskError, uint32_t rowCount, uint32_t worldSize,
+                               uint32_t windowBlocks, uint32_t chunksPerBlock, uint32_t tensorCount,
+                               uint64_t frameStride, uint64_t metadataBytes, uint64_t shardSize,
+                               uint64_t sequence, uint32_t round, uint32_t usedWorkers) override
+    {
+        ucm_compact_scatter::LaunchFramed(stream, receiveBuffer, destinationAddresses, chunks,
+                                          taskError, rowCount, worldSize, windowBlocks,
+                                          chunksPerBlock, tensorCount, frameStride, metadataBytes,
+                                          shardSize, sequence, round, usedWorkers);
         return Status::OK();
     }
 };

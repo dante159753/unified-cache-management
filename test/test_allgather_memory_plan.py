@@ -1,6 +1,7 @@
 import pytest
 
 from ucm.store.allgather.memory_plan import (
+    calculate_frame_metadata_bytes,
     calculate_stage_memory_plan,
     calculate_worker_memory_plan,
 )
@@ -16,11 +17,12 @@ def test_tp8_w4_memory_plan() -> None:
         dump_slots=2,
     )
 
-    assert plan.load_send_bytes == 2 * 4 * 3_002_368
-    assert plan.load_receive_bytes == 2 * 8 * 4 * 3_002_368
+    frame_bytes = 4 * 3_002_368 + calculate_frame_metadata_bytes(4)
+    assert plan.load_send_bytes == 2 * frame_bytes
+    assert plan.load_receive_bytes == 2 * 8 * frame_bytes
     assert plan.dump_send_bytes == 2 * 4 * 3_002_368
     assert plan.load_destination_bytes == 2 * 32 * 2 * 8
-    assert plan.load_route_bytes == 2 * 32 * 2 * 4
+    assert plan.load_route_bytes == 0
     assert plan.window_blocks == 4
 
     worker = calculate_worker_memory_plan([plan], hccl_buffer_mb=32)
@@ -60,8 +62,9 @@ def test_window_blocks_scale_payload_and_metadata() -> None:
     )
 
     assert plan.window_blocks == 64
-    assert plan.load_send_bytes == 2 * 64 * 4096
-    assert plan.load_receive_bytes == 2 * 8 * 64 * 4096
+    frame_bytes = 64 * 4096 + calculate_frame_metadata_bytes(64)
+    assert plan.load_send_bytes == 2 * frame_bytes
+    assert plan.load_receive_bytes == 2 * 8 * frame_bytes
     assert plan.dump_send_bytes == 2 * 64 * 4096
     assert plan.load_destination_bytes == 2 * 512 * 1 * 8
-    assert plan.load_route_bytes == 2 * 512 * 2 * 4
+    assert plan.load_route_bytes == 0

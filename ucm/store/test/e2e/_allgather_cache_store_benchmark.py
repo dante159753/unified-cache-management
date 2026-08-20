@@ -238,6 +238,7 @@ def _make_store_config(
                 "allgather_separate_dump_queue": not args.shared_dump_queue,
                 "allgather_collective_count_crop": not args.disable_count_crop,
                 "allgather_collective_variable_counts": args.variable_counts,
+                "allgather_dynamic_windows": not args.disable_dynamic_windows,
             }
         )
         if replicated_data and not scatter_only and world_size > 1:
@@ -245,6 +246,8 @@ def _make_store_config(
     if direction == "h2d" and not args.verify_roundtrip:
         config["fake_always_hit"] = True
         config["fake_fail_load"] = args.fail_rank == rank
+        if args.fake_load_delay_us:
+            config["fake_load_delay_us"] = args.fake_load_delay_us
         config["buffer_number"] = max(1024, args.blocks * 4)
     return config
 
@@ -292,9 +295,10 @@ def _run_iterations(
         failure_count = torch.tensor([int(failed)], dtype=torch.int32, device=device)
         dist.all_reduce(failure_count)
         dist.barrier()
-        if int(failure_count.item()) != 1:
+        if int(failure_count.item()) != world_size:
             raise RuntimeError(
-                f"expected exactly one injected load failure, got {failure_count.item()}"
+                "expected the injected owner failure on every rank, got "
+                f"{failure_count.item()}/{world_size}"
             )
         if rank == 0:
             print("ALLGATHER_FAILURE_DRAIN_PASS", flush=True)
@@ -425,6 +429,7 @@ def _print_summary(
         f"blocks={args.blocks}, inflight_tasks={args.inflight_tasks}, dtype={args.dtype}, "
         f"mixed_dump={args.mixed_dump}, local_coalesced={args.local_coalesced}, "
         f"scatter_only={args.scatter_only}, "
+        f"dynamic_windows={not args.disable_dynamic_windows}, "
         f"tensor_count={len(workload.tensor_shapes)}"
     )
     print(f"tensor_shapes={list(workload.tensor_shapes)}")
@@ -584,6 +589,13 @@ def _build_parser(direction: str, store_mode: str) -> argparse.ArgumentParser:
     parser.add_argument("--scatter-only", action="store_true")
     parser.add_argument("--disable-count-crop", action="store_true")
     parser.add_argument("--variable-counts", action="store_true")
+    parser.add_argument("--disable-dynamic-windows", action="store_true")
+    parser.add_argument(
+        "--fake-load-delay-us",
+        type=lambda value: [int(delay) for delay in value.split(",")],
+        default=[],
+        help="comma-separated FakeStore load delays, cycled by backend submission order",
+    )
     return parser
 
 
@@ -623,6 +635,8 @@ def run(direction: str, store_mode: str = "allgather") -> None:
         parser.error("--fail-rank must be -1 or a rank in --devices")
     if args.profile_sample_every < 0:
         parser.error("--profile-sample-every must be non-negative")
+    if any(delay < 0 for delay in args.fake_load_delay_us):
+        parser.error("--fake-load-delay-us must contain non-negative integers")
     if args.local_coalesced and store_mode != "allgather":
         parser.error("--local-coalesced requires the AllGatherStore benchmark")
     if args.scatter_only and store_mode != "allgather":

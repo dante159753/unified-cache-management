@@ -50,11 +50,70 @@ Status LoadQueue::Setup(const Config& config, TaskIdSet* failureSet, TransBuffer
     waiting_.Setup(config.waitingQueueDepth);
     running_.Setup(config.runningQueueDepth);
     holder_.reserve(1024);
+    auto startedPrefetch = prefetchPool_
+                               .SetWorkerFn([this](std::vector<PrefetchShardTask>& tasks,
+                                                   void* const&) { CompletePrefetch(tasks); })
+                               .SetNWorker(1)
+                               .SetCpuAffinity(cpuAffinityCores_)
+                               .Run();
+    if (!startedPrefetch) { return Status::Error("failed to start cache prefetch worker"); }
     dispatcher_ = std::thread{&LoadQueue::DispatchStage, this};
     std::promise<Status> started;
     auto fut = started.get_future();
     transfer_ = std::thread{&LoadQueue::TransferStage, this, std::ref(started)};
     return fut.get();
+}
+
+void LoadQueue::Prefetch(const Detail::Shard* shards, size_t num)
+{
+    std::vector<PrefetchShardTask> pending;
+    pending.reserve(num);
+    for (size_t i = 0; i < num; ++i) {
+        auto bufferHandle = buffer_->Get(shards[i].owner, shards[i].index, true, false);
+        if (!bufferHandle || !bufferHandle.Owner() || bufferHandle.Ready()) { continue; }
+        Detail::TaskDesc backendTask{
+            Detail::Shard{shards[i].owner, shards[i].index, {bufferHandle.Data()}}
+        };
+        backendTask.brief = "Backend2CachePrefetch";
+        auto result = backend_->Load(std::move(backendTask));
+        if (!result) {
+            bufferHandle.MarkFailed(result.Error());
+            UC_ERROR("Failed({}) to submit cache prefetch.", result.Error());
+            continue;
+        }
+        pending.push_back({std::move(bufferHandle), result.Value()});
+    }
+    if (!pending.empty()) { prefetchPool_.Push(std::move(pending)); }
+}
+
+void LoadQueue::CompletePrefetch(std::vector<PrefetchShardTask>& tasks)
+{
+    while (!tasks.empty()) {
+        bool completed = false;
+        for (auto iter = tasks.begin(); iter != tasks.end();) {
+            auto checked = backend_->Check(iter->backendTaskHandle);
+            if (!checked) {
+                iter->bufferHandle.MarkFailed(checked.Error());
+                UC_ERROR("Failed({}) to check cache prefetch task({}).", checked.Error(),
+                         iter->backendTaskHandle);
+            } else if (!checked.Value()) {
+                ++iter;
+                continue;
+            } else {
+                auto status = backend_->Wait(iter->backendTaskHandle);
+                if (status.Success()) {
+                    iter->bufferHandle.MarkReady();
+                } else {
+                    iter->bufferHandle.MarkFailed(status);
+                    UC_ERROR("Failed({}) to wait cache prefetch task({}).", status,
+                             iter->backendTaskHandle);
+                }
+            }
+            iter = tasks.erase(iter);
+            completed = true;
+        }
+        if (!completed) { std::this_thread::yield(); }
+    }
 }
 
 void LoadQueue::Submit(TaskPtr task, WaiterPtr waiter)

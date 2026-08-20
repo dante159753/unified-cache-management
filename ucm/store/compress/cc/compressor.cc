@@ -100,6 +100,11 @@ void Compressor::Prefetch(const Detail::BlockId* blocks, size_t num)
     impl_->backend->Prefetch(blocks, num);
 }
 
+void Compressor::Prefetch(const Detail::Shard* shards, size_t num)
+{
+    impl_->backend->Prefetch(shards, num);
+}
+
 Expected<Detail::TaskHandle> Compressor::Load(Detail::TaskDesc task)
 {
     if (!impl_->transEnable) { return Status::Error("transfer is not enable"); }
