@@ -215,8 +215,10 @@ struct WindowPlan {
     std::vector<size_t> rows;
     std::vector<uint32_t> owners;
     std::vector<uint32_t> ownerSlots;
-    /* Only the local-coalesced path uses this, as the scatter rank stride. The
-     * collective path always moves a fixed-size frame. */
+    std::vector<size_t> ownerCounts;
+    std::vector<uint64_t> frameCounts;
+    std::vector<uint64_t> frameDisplacements;
+    /* Only the local-coalesced path uses this, as the scatter rank stride. */
     size_t collectiveBlocks{};
 };
 
@@ -415,6 +417,8 @@ public:
         config.GetNumber("allgather_hccl_buffer_mb", collectiveBufferMb_);
         config.GetNumber("allgather_collective_buffer_mb", collectiveBufferMb_);
         config.Get("allgather_collective_mode", collectiveModeName_);
+        config.Get("allgather_collective_variable_counts", variableCollectiveRequested_);
+        config.GetNumber("allgather_scatter_aiv_cores", scatterAivCores_);
         config.GetNumber("allgather_profile_sample_every", profileSampleEvery_);
         config.GetNumber("allgather_stage_trace_sample_every", stageTraceSampleEvery_);
         config.Get("allgather_async_completion", asyncCompletion_);
@@ -449,6 +453,10 @@ public:
         if (receiveSlotCount_ == 0) {
             return Status::InvalidParam("allgather receive slot count must be positive");
         }
+        if (scatterAivCores_ == 0 || scatterAivCores_ > kMaxCopyWorkers) {
+            return Status::InvalidParam("allgather scatter AIV cores must be in [1, {}]",
+                                        kMaxCopyWorkers);
+        }
         // More landing areas than stageable windows cannot be reached.
         receiveSlotCount_ = std::min(receiveSlotCount_, loadSlotCount_);
         if (backendWaitTimeoutMs_ <= 0.0) {
@@ -480,6 +488,13 @@ public:
         if (platform_ == nullptr) {
             return Status::Error("allgather platform runtime unavailable");
         }
+        variableCollectiveEnabled_ =
+            variableCollectiveRequested_ && platform_->SupportsAllGatherV();
+        if (variableCollectiveRequested_ && !variableCollectiveEnabled_) {
+            UC_WARN("allgather_collective_variable_counts is unavailable on {}; using fixed "
+                    "AllGather",
+                    platform_->Name());
+        }
         status = platform_->SetDevice(deviceId_);
         if (status.Failure()) { return status; }
         status = AllocateBuffers();
@@ -495,14 +510,14 @@ public:
             "payload_bytes={}, "
             "metadata_bytes={}, collective_buffer_bytes={}, scatter_only={}, "
             "skip_load_collective={}, skip_load_scatter={}, load_backend_only={}, "
-            "collective_mode={}, platform={}.",
+            "collective_mode={}, variable_counts={}, scatter_aiv_cores={}, platform={}.",
             shardSize_, worldSize_, windowBlocks_, loadSlotCount_, receiveSlotCount_,
             dumpSlotCount_, frameBytes_,
             collectiveEnabled_ ? worldSize_ * frameBytes_ : 0, plan_.PayloadBytes(),
             plan_.MetadataBytes(),
             CalculateCollectiveBytes(collectiveBufferMb_, collectiveEnabled_, 1),
             scatterOnly_, skipLoadCollective_, skipLoadScatter_, loadBackendOnly_,
-            collectiveModeName_, platform_->Name());
+            collectiveModeName_, variableCollectiveEnabled_, scatterAivCores_, platform_->Name());
         return Status::OK();
     }
 
@@ -785,13 +800,26 @@ private:
             windowCount = std::max(windowCount, ownerSlots[row] / windowBlocks_ + 1);
         }
         std::vector<WindowPlan> windows(windowCount);
+        for (auto& window : windows) { window.ownerCounts.assign(storageWorldSize, 0); }
         for (size_t row = 0; row < input.size(); ++row) {
             const size_t window = ownerSlots[row] / windowBlocks_;
             windows[window].rows.push_back(row);
             windows[window].owners.push_back(owners[row]);
             windows[window].ownerSlots.push_back(ownerSlots[row] % windowBlocks_);
+            ++windows[window].ownerCounts[owners[row]];
         }
         for (auto& window : windows) { window.collectiveBlocks = windowBlocks_; }
+        if (operation == TaskState::Operation::Load && collectiveEnabled_ &&
+            variableCollectiveEnabled_ && windows.size() == 1) {
+            auto& window = windows.front();
+            window.frameCounts.resize(worldSize_);
+            window.frameDisplacements.resize(worldSize_);
+            for (size_t owner = 0; owner < worldSize_; ++owner) {
+                window.frameCounts[owner] =
+                    frameMetadataBytes_ + window.ownerCounts[owner] * shardSize_;
+                window.frameDisplacements[owner] = owner * frameBytes_;
+            }
+        }
         return windows;
     }
 
@@ -892,7 +920,7 @@ private:
         const auto taskCount =
             (collectiveEnabled_ ? worldSize_ * windowBlocks_ : window.rows.size()) *
             plan_.chunkCount;
-        const auto usedWorkers = static_cast<uint32_t>(std::min(kMaxCopyWorkers, taskCount));
+        const auto usedWorkers = static_cast<uint32_t>(std::min(scatterAivCores_, taskCount));
         if (usedWorkers == 0) { return Status::OK(); }
         void* receive = collectiveEnabled_ ? receiveSlot.receive.data : slot.send.data;
         if (collectiveEnabled_) {
@@ -1100,6 +1128,7 @@ private:
             receiveSlots_[slot]->inFlight = false;
             freeReceiveSlots.push_back(slot);
         };
+        reclaimSlots(true);
         submitReadyWindows();
         while (!active.empty()) {
             // Pick whichever window the backend finished first. On networked
@@ -1197,8 +1226,15 @@ private:
                     status = platform.WaitEvent(collectiveStream, receiveSlot.prepared);
                 }
                 if (status.Success()) {
-                    status = platform.AllGather(slot.send.data, receiveSlot.receive.data,
-                                                frameBytes_, loadCollective, collectiveStream);
+                    if (!window.frameCounts.empty()) {
+                        status = platform.AllGatherV(
+                            slot.send.data, window.frameCounts[rank_], receiveSlot.receive.data,
+                            window.frameCounts.data(), window.frameDisplacements.data(),
+                            loadCollective, collectiveStream);
+                    } else {
+                        status = platform.AllGather(slot.send.data, receiveSlot.receive.data,
+                                                    frameBytes_, loadCollective, collectiveStream);
+                    }
                 }
                 collectiveSubmittedAt = Clock::now();
                 metrics.collectiveSubmitMs +=
@@ -1220,8 +1256,12 @@ private:
             if (task->stageTrace) {
                 stageTraceRecords.push_back(StageTraceRecord{
                     pending.window, pending.slot, window.rows.size(), pending.ownedRows,
-                    collectiveEnabled_ ? worldSize_ * frameBytes_
-                                       : window.collectiveBlocks * shardSize_,
+                    collectiveEnabled_
+                        ? (window.frameCounts.empty()
+                               ? worldSize_ * frameBytes_
+                               : std::accumulate(window.frameCounts.begin(),
+                                                 window.frameCounts.end(), uint64_t{0}))
+                        : window.collectiveBlocks * shardSize_,
                     pending.slotReadyAt, pending.backendSubmitStartedAt, pending.backendSubmittedAt,
                     backendWaitStartedAt, backendReadyAt, collectiveStartedAt,
                     collectiveSubmittedAt});
@@ -1600,6 +1640,9 @@ private:
     uint32_t collectiveBufferMb_{kDefaultCollectiveBufferMb};
     std::string collectiveModeName_{"host"};
     uint32_t collectiveMode_{1};
+    bool variableCollectiveRequested_{true};
+    bool variableCollectiveEnabled_{false};
+    size_t scatterAivCores_{1};
     std::string runtimeKey_;
     std::vector<uint8_t> rootInfo_;
     std::shared_ptr<PlatformRuntime> platform_;

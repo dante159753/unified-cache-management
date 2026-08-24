@@ -48,6 +48,11 @@ public:
     virtual void DestroyCollective(CollectiveHandle collective) = 0;
     virtual Status AllGather(void* send, void* receive, size_t bytes, CollectiveHandle collective,
                              StreamHandle stream) = 0;
+    virtual bool SupportsAllGatherV() const = 0;
+    virtual Status AllGatherV(void* send, size_t sendBytes, void* receive,
+                              const uint64_t* receiveCounts,
+                              const uint64_t* receiveDisplacements,
+                              CollectiveHandle collective, StreamHandle stream) = 0;
     virtual Status LaunchSegmentedCopy(StreamHandle stream, void* descriptors, void* coreOffsets,
                                        uint32_t usedWorkers) = 0;
     virtual Status LaunchCompactScatter(StreamHandle stream, void* receiveBuffer,

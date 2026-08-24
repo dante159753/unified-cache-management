@@ -232,11 +232,13 @@ def _make_store_config(
                 "allgather_async_completion": not args.sync_completion,
                 "allgather_separate_dump_queue": not args.shared_dump_queue,
                 "allgather_collective_count_crop": not args.disable_count_crop,
-                "allgather_collective_variable_counts": args.variable_counts,
+                "allgather_scatter_aiv_cores": args.scatter_aiv_cores,
                 "allgather_dynamic_windows": not args.disable_dynamic_windows,
                 "allgather_load_backend_only": args.load_backend_only,
             }
         )
+        if args.variable_counts is not None:
+            config["allgather_collective_variable_counts"] = args.variable_counts
         if replicated_data and not scatter_only and world_size > 1:
             config["allgather_collective_root_info"] = root_info
     if direction == "h2d" and not args.verify_roundtrip:
@@ -584,7 +586,15 @@ def _build_parser(direction: str, store_mode: str) -> argparse.ArgumentParser:
     parser.add_argument("--scatter-only", action="store_true")
     parser.add_argument("--load-backend-only", action="store_true")
     parser.add_argument("--disable-count-crop", action="store_true")
-    parser.add_argument("--variable-counts", action="store_true")
+    variable_counts = parser.add_mutually_exclusive_group()
+    variable_counts.add_argument(
+        "--variable-counts", dest="variable_counts", action="store_true"
+    )
+    variable_counts.add_argument(
+        "--disable-variable-counts", dest="variable_counts", action="store_false"
+    )
+    parser.set_defaults(variable_counts=None)
+    parser.add_argument("--scatter-aiv-cores", type=int, default=1)
     parser.add_argument("--disable-dynamic-windows", action="store_true")
     parser.add_argument(
         "--fake-load-delay-us",
@@ -615,6 +625,7 @@ def run(direction: str, store_mode: str = "allgather") -> None:
         "dump_slots",
         "window_blocks",
         "collective_buffer_mb",
+        "scatter_aiv_cores",
         "timeout_ms",
     ):
         _positive(parser, f"--{name.replace('_', '-')}", getattr(args, name))
@@ -628,6 +639,8 @@ def run(direction: str, store_mode: str = "allgather") -> None:
         parser.error("--fail-rank must be -1 or a rank in --devices")
     if args.profile_sample_every < 0:
         parser.error("--profile-sample-every must be non-negative")
+    if args.scatter_aiv_cores > 40:
+        parser.error("--scatter-aiv-cores must not exceed 40")
     if any(delay < 0 for delay in args.fake_load_delay_us):
         parser.error("--fake-load-delay-us must contain non-negative integers")
     if args.local_coalesced and store_mode != "allgather":

@@ -221,6 +221,18 @@ public:
             "HcclAllGather");
     }
 
+    bool SupportsAllGatherV() const override { return true; }
+
+    Status AllGatherV(void* send, size_t sendBytes, void* receive,
+                      const uint64_t* receiveCounts, const uint64_t* receiveDisplacements,
+                      CollectiveHandle collective, StreamHandle stream) override
+    {
+        return HcclStatus(
+            HcclAllGatherV(send, sendBytes, receive, receiveCounts, receiveDisplacements,
+                           HCCL_DATA_TYPE_INT8, static_cast<HcclComm>(collective),
+                           static_cast<aclrtStream>(stream)),
+            "HcclAllGatherV");
+    }
 
     Status LaunchSegmentedCopy(StreamHandle stream, void* descriptors, void* coreOffsets,
                                uint32_t usedWorkers) override

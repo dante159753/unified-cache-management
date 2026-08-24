@@ -303,6 +303,14 @@ public:
             "ncclAllGather");
     }
 
+    bool SupportsAllGatherV() const override { return false; }
+
+    Status AllGatherV(void*, size_t, void*, const uint64_t*, const uint64_t*, CollectiveHandle,
+                      StreamHandle) override
+    {
+        return Status::Error("AllGatherV is unavailable on CUDA");
+    }
+
     Status LaunchSegmentedCopy(StreamHandle stream, void* descriptors, void* coreOffsets,
                                uint32_t usedWorkers) override
     {

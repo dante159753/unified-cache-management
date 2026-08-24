@@ -35,6 +35,8 @@ PipelineStore configuration plus:
 | `allgather_replicated_data` | false | Enables hash ownership and TP AllGather for replicated layouts; false selects rank-local transfer aggregation |
 | `allgather_scatter_only` | false | For replicated layouts, keeps hash-partitioned dump but loads every block from shared CacheStore and skips TP AllGather |
 | `allgather_collective_mode` | `host` | Collective engine: `host`, `aicpu_ts`, `aiv`, or `auto` |
+| `allgather_collective_variable_counts` | `true` | Use `HcclAllGatherV` for deterministic single-window loads and omit unused payload slots |
+| `allgather_scatter_aiv_cores` | 1 | Maximum AIV cores used by one load scatter kernel, in `[1, 40]` |
 | `allgather_dynamic_windows` | false | Dispatches whichever in-flight owner load completes first instead of waiting in source-window order |
 
 The actual window is reduced if the requested window does not fit the budget.
@@ -81,10 +83,12 @@ local tensor addresses from the task-wide destination table and immutable model
 layout. Different ranks may contribute different source windows to one
 collective because every record is self-describing.
 
-The fixed frame size lets HCCL receive the data before inspecting its embedded
-valid counts. AllGatherV is reserved for deterministic windows whose complete
-per-rank byte counts are known before submission; dynamic completion counts
-cannot use it without a preceding count exchange.
+For a single-window load, every rank derives the same per-owner valid counts
+from the request. When variable counts are enabled, HcclAllGatherV transfers
+only each frame's metadata and populated payload while retaining the fixed
+`rank * frame_bytes` receive displacement expected by scatter. Multi-window
+completion order is rank-local, so those loads keep fixed AllGather unless a
+preceding count exchange is added.
 
 ## Rank-local fused-buffer pool
 
