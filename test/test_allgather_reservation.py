@@ -69,7 +69,7 @@ def _install_native_plan(monkeypatch):
     return calls
 
 
-def test_layerwise_reservation_keeps_duplicate_stages_and_chunk_blocks(monkeypatch):
+def test_layerwise_reservation_reuses_largest_stage_and_keeps_chunk_blocks(monkeypatch):
     config = {
         "use_layerwise": True,
         "allgather_collective_buffer_mb": 1,
@@ -78,15 +78,38 @@ def test_layerwise_reservation_keeps_duplicate_stages_and_chunk_blocks(monkeypat
     calls = _install_native_plan(monkeypatch)
 
     result = reservation.calculate_vllm_reservation(
-        _worker([4096, 4096], blocks_per_chunk=3)
+        _worker([4096, 8192], blocks_per_chunk=3)
     )
 
     assert [call[0] for call in calls] == [
         [4096, 4096, 4096],
-        [4096, 4096, 4096],
+        [8192, 8192, 8192],
     ]
-    assert [call[1] for call in calls] == [12288, 12288]
-    assert result == 2 * 12288 + 2 * 1024 * 1024
+    assert [call[1] for call in calls] == [12288, 24576]
+    assert result == 24576 + 2 * 1024 * 1024
+
+
+def test_pipeline_config_reads_layerwise_from_launch_config():
+    connector_config = {"store_pipeline": "AllGather|Cache|Fake"}
+    launch_config = {
+        "use_layerwise": True,
+        "ucm_connectors": [
+            {
+                "ucm_connector_name": "UcmPipelineStore",
+                "ucm_connector_config": connector_config,
+            }
+        ],
+    }
+    vllm_config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector_extra_config=launch_config,
+        )
+    )
+
+    result = reservation.get_allgather_pipeline_config(vllm_config)
+
+    assert result["use_layerwise"] is True
+    assert "use_layerwise" not in connector_config
 
 
 def test_non_layerwise_reservation_repeats_tensor_layout_per_chunk(monkeypatch):

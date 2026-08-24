@@ -74,11 +74,12 @@ def get_allgather_pipeline_config(vllm_config: Any) -> dict[str, Any] | None:
     if len(connectors) != 1:
         return None
     connector = connectors[0]
-    config = connector.get("ucm_connector_config", {})
+    config = dict(connector.get("ucm_connector_config", {}))
     if connector.get("ucm_connector_name") != "UcmPipelineStore":
         return None
     if "AllGather" not in str(config.get("store_pipeline", "")).split("|"):
         return None
+    config["use_layerwise"] = bool(launch_config.get("use_layerwise", False))
     return config
 
 
@@ -163,7 +164,7 @@ def calculate_vllm_reservation(worker: Any) -> int:
     if receive_slots <= 0:
         raise ValueError("allgather_receive_slots must be positive")
 
-    total = sum(
+    stage_totals = [
         int(
             ucm_allgather_runtime.calculate_memory_plan(
                 tensor_sizes,
@@ -183,7 +184,10 @@ def calculate_vllm_reservation(worker: Any) -> int:
             stage_load_slots,
             stage_dump_slots,
         ) in stage_inputs
-    )
+    ]
+    # One layerwise runtime reuses its buffers across layers. FA and WA are the
+    # exception because they are backed by separate runtimes.
+    total = sum(stage_totals) if not use_layerwise or is_fawa else max(stage_totals)
     if replicated and tp_size > 1:
         total += (
             collective_buffer_mb
