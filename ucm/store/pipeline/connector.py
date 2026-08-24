@@ -241,9 +241,6 @@ def _cache_posix_pipeline_builder(
 
 def _allgather_root_info(config: Dict[str, object]) -> List[int]:
     runtime_key = str(config["allgather_runtime_key"])
-    group_count = int(config.get("allgather_load_groups", 1))
-    if group_count <= 0:
-        raise ValueError("allgather_load_groups must be positive")
     with _allgather_root_infos_lock:
         cached = _allgather_root_infos.get(runtime_key)
         if cached is not None:
@@ -262,18 +259,16 @@ def _allgather_root_info(config: Dict[str, object]) -> List[int]:
         size = int(ucm_allgather_runtime.root_info_size())
         platform = str(ucm_allgather_runtime.platform_name())
         device_type = "npu" if platform == "ascend" else platform
+        # One root info per runtime: the stage owns a single collective domain.
         if group_rank == 0:
-            root_info = []
-            for _ in range(group_count):
-                root_info.extend(ucm_allgather_runtime.create_root_info())
             tensor = torch.tensor(
-                root_info,
+                ucm_allgather_runtime.create_root_info(),
                 dtype=torch.uint8,
                 device=f"{device_type}:{int(config['device_id'])}",
             )
         else:
             tensor = torch.empty(
-                size * group_count,
+                size,
                 dtype=torch.uint8,
                 device=f"{device_type}:{int(config['device_id'])}",
             )
@@ -321,6 +316,22 @@ def _stack_allgather_stage(
     _preload_library(store_dir / "allgather/libucm_segmented_copy_kernels.so")
     _preload_library(store_dir / "allgather/libucm_compact_scatter_kernels.so")
     pipeline.Stack("Cache", str(store_dir / "cache/libcachestore.so"), cache_config)
+    if (
+        int(allgather_config.get("device_id", -1)) >= 0
+        and bool(allgather_config.get("allgather_replicated_data", False))
+        and int(allgather_config.get("allgather_world_size", 1)) > 1
+    ):
+        import torch.distributed as dist
+
+        if dist.is_initialized():
+            group = None
+            try:
+                from vllm.distributed.parallel_state import get_tp_group
+
+                group = get_tp_group().device_group
+            except (AssertionError, RuntimeError):
+                pass
+            dist.barrier(group=group)
     pipeline.Stack(
         "AllGather",
         str(store_dir / "allgather/liballgatherstore.so"),

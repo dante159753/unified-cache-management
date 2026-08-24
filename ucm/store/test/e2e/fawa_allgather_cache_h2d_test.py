@@ -44,11 +44,11 @@ def _store_config(
     runtime_key: str,
     root_info: list[int],
     load_slots: int,
-    load_groups: int,
     window_blocks: int,
     buffer_mb: int,
     variable_counts: bool,
     scatter_only: bool,
+    load_backend_only: bool,
 ) -> dict[str, object]:
     shard_size = _aligned_size(sizes)
     return {
@@ -75,12 +75,12 @@ def _store_config(
         "allgather_collective_root_info": root_info,
         "allgather_window_blocks_per_rank": window_blocks,
         "allgather_load_slots": load_slots,
-        "allgather_load_groups": load_groups,
         "allgather_dump_slots": 2,
         "allgather_collective_buffer_mb": buffer_mb,
         "allgather_async_completion": True,
         "allgather_separate_dump_queue": True,
         "allgather_collective_variable_counts": variable_counts,
+        "allgather_load_backend_only": load_backend_only,
     }
 
 
@@ -105,9 +105,7 @@ def _worker(
     wa_store = None
     try:
         fa_roots = (
-            []
-            if args.scatter_only
-            else _broadcast_root_info(torch, dist, rank, device, 4)
+            [] if args.scatter_only else _broadcast_root_info(torch, dist, rank, device)
         )
         wa_roots = (
             fa_roots
@@ -115,7 +113,7 @@ def _worker(
             else (
                 []
                 if args.scatter_only
-                else _broadcast_root_info(torch, dist, rank, device, 1)
+                else _broadcast_root_info(torch, dist, rank, device)
             )
         )
         runtime_base = f"fawa-cache-benchmark-{unique_id}"
@@ -135,11 +133,11 @@ def _worker(
                 fa_runtime,
                 fa_roots,
                 4,
-                4,
                 args.fa_window_blocks,
                 args.buffer_mb,
                 args.variable_counts,
                 args.scatter_only,
+                args.load_backend_only,
             )
         )
         wa_store = UcmPipelineStore(
@@ -153,11 +151,11 @@ def _worker(
                 wa_runtime,
                 wa_roots,
                 1,
-                1,
                 args.wa_window_blocks,
                 args.buffer_mb,
                 args.variable_counts,
                 args.scatter_only,
+                args.load_backend_only,
             )
         )
 
@@ -203,6 +201,7 @@ def _worker(
                 "wa_window_blocks": args.wa_window_blocks,
                 "variable_counts": args.variable_counts,
                 "scatter_only": args.scatter_only,
+                "load_backend_only": args.load_backend_only,
                 "mean_ms": mean_seconds * 1000,
                 "p50_ms": _percentile(latencies, 50) * 1000,
                 "p95_ms": _percentile(latencies, 95) * 1000,
@@ -231,6 +230,7 @@ def main() -> None:
     parser.add_argument("--share-runtime", action="store_true")
     parser.add_argument("--variable-counts", action="store_true")
     parser.add_argument("--scatter-only", action="store_true")
+    parser.add_argument("--load-backend-only", action="store_true")
     args = parser.parse_args()
     args.devices = _parse_devices(parser, args.devices)
     if (

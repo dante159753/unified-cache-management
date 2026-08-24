@@ -42,6 +42,7 @@ def _install_native_plan(monkeypatch):
         load_slots,
         dump_slots,
         window_blocks,
+        receive_slots,
     ):
         calls.append(
             (
@@ -52,6 +53,7 @@ def _install_native_plan(monkeypatch):
                 load_slots,
                 dump_slots,
                 window_blocks,
+                receive_slots,
             )
         )
         return {"total_bytes": shard_size}
@@ -99,7 +101,7 @@ def test_non_layerwise_reservation_repeats_tensor_layout_per_chunk(monkeypatch):
         _worker([4096, 8192], blocks_per_chunk=2, replicated=False)
     )
 
-    assert calls == [([4096, 8192, 4096, 8192], 24576, 8, False, 2, 2, 4)]
+    assert calls == [([4096, 8192, 4096, 8192], 24576, 8, False, 2, 2, 4, 2)]
 
 
 def test_scatter_only_reservation_omits_collective_memory(monkeypatch):
@@ -113,7 +115,7 @@ def test_scatter_only_reservation_omits_collective_memory(monkeypatch):
 
     result = reservation.calculate_vllm_reservation(_worker([4096]))
 
-    assert calls == [([4096], 4096, 8, False, 2, 2, 4)]
+    assert calls == [([4096], 4096, 8, False, 2, 2, 4, 2)]
     assert result == 4096
 
 
@@ -127,7 +129,7 @@ def test_window_blocks_are_reserved(monkeypatch):
 
     reservation.calculate_vllm_reservation(_worker([4096]))
 
-    assert calls[0][-1] == 64
+    assert calls[0][-2] == 64
 
 
 def test_fawa_stage_windows_are_reserved(monkeypatch):
@@ -143,7 +145,7 @@ def test_fawa_stage_windows_are_reserved(monkeypatch):
         _worker([151552, 4096], sliding_windows=[None, 8192])
     )
 
-    assert [call[-1] for call in calls] == [4, 64]
+    assert [call[-2] for call in calls] == [4, 64]
 
 
 def test_fawa_stage_slots_are_reserved(monkeypatch):
@@ -175,7 +177,7 @@ def test_fawa_default_load_slots_and_groups_are_reserved(monkeypatch):
     )
 
     assert [call[4] for call in calls] == [4, 1]
-    assert result == 151552 + 4096 + 5 * 2 * 1024 * 1024
+    assert result == 151552 + 4096 + 2 * 2 * 1024 * 1024
 
 
 def test_explicit_blocks_per_chunk_overrides_connector(monkeypatch):

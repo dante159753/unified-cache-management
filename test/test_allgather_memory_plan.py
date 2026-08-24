@@ -21,7 +21,8 @@ def test_tp8_w4_memory_plan() -> None:
     assert plan.load_send_bytes == 2 * frame_bytes
     assert plan.load_receive_bytes == 2 * 8 * frame_bytes
     assert plan.dump_send_bytes == 2 * 4 * 3_002_368
-    assert plan.load_destination_bytes == 2 * 32 * 2 * 8
+    assert plan.receive_slots == 2
+    assert plan.load_destination_bytes == 0
     assert plan.load_route_bytes == 0
     assert plan.window_blocks == 4
 
@@ -66,5 +67,31 @@ def test_window_blocks_scale_payload_and_metadata() -> None:
     assert plan.load_send_bytes == 2 * frame_bytes
     assert plan.load_receive_bytes == 2 * 8 * frame_bytes
     assert plan.dump_send_bytes == 2 * 64 * 4096
-    assert plan.load_destination_bytes == 2 * 512 * 1 * 8
+    assert plan.load_destination_bytes == 0
     assert plan.load_route_bytes == 0
+
+
+def test_receive_slots_are_independent_and_capped_by_load_slots() -> None:
+    plan = calculate_stage_memory_plan(
+        [4096],
+        4096,
+        world_size=8,
+        replicated=True,
+        load_slots=4,
+        receive_slots=3,
+    )
+
+    frame_bytes = 4 * 4096 + calculate_frame_metadata_bytes(4)
+    assert plan.receive_slots == 3
+    assert plan.load_send_bytes == 4 * frame_bytes
+    assert plan.load_receive_bytes == 3 * 8 * frame_bytes
+
+    capped = calculate_stage_memory_plan(
+        [4096],
+        4096,
+        world_size=8,
+        replicated=True,
+        load_slots=2,
+        receive_slots=4,
+    )
+    assert capped.receive_slots == 2

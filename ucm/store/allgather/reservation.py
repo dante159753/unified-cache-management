@@ -4,13 +4,12 @@ from typing import Any
 
 from ucm.store.allgather.memory_plan import (
     COLLECTIVE_BUFFER_COPIES,
+    COLLECTIVE_GROUPS_PER_STAGE,
     DEFAULT_COLLECTIVE_BUFFER_MB,
     DEFAULT_DUMP_SLOTS,
-    DEFAULT_FA_LOAD_GROUPS,
     DEFAULT_FA_LOAD_SLOTS,
-    DEFAULT_LOAD_GROUPS,
     DEFAULT_LOAD_SLOTS,
-    DEFAULT_WA_LOAD_GROUPS,
+    DEFAULT_RECEIVE_SLOTS,
     DEFAULT_WA_LOAD_SLOTS,
 )
 
@@ -127,21 +126,11 @@ def calculate_vllm_reservation(worker: Any) -> int:
             suffix: next(spec for spec in spec_values if _stage_suffix(spec) == suffix)
             for suffix in stage_suffixes
         }
-        collective_group_count = sum(
-            _stage_number(
-                spec,
-                config,
-                "allgather_load_groups",
-                DEFAULT_WA_LOAD_GROUPS if suffix == "wa" else DEFAULT_FA_LOAD_GROUPS,
-            )
-            for suffix, spec in stage_specs.items()
-        )
+        # FA and WA run on separate runtimes, so they hold one communicator
+        # each. Any allgather_load_groups value in the config is ignored.
+        collective_group_count = len(stage_specs) * COLLECTIVE_GROUPS_PER_STAGE
     else:
-        collective_group_count = int(
-            config.get("allgather_load_groups", DEFAULT_LOAD_GROUPS)
-        )
-        if collective_group_count <= 0:
-            raise ValueError("allgather_load_groups must be positive")
+        collective_group_count = COLLECTIVE_GROUPS_PER_STAGE
 
     if use_layerwise:
         stage_inputs = [
@@ -170,6 +159,10 @@ def calculate_vllm_reservation(worker: Any) -> int:
 
     from ucm.store.allgather import ucm_allgather_runtime
 
+    receive_slots = int(config.get("allgather_receive_slots", DEFAULT_RECEIVE_SLOTS))
+    if receive_slots <= 0:
+        raise ValueError("allgather_receive_slots must be positive")
+
     total = sum(
         int(
             ucm_allgather_runtime.calculate_memory_plan(
@@ -180,6 +173,7 @@ def calculate_vllm_reservation(worker: Any) -> int:
                 stage_load_slots,
                 stage_dump_slots,
                 window_blocks,
+                min(receive_slots, stage_load_slots),
             )["total_bytes"]
         )
         for (

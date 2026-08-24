@@ -155,22 +155,17 @@ def _synchronize(torch, device_type: str) -> None:
         torch.cuda.synchronize()
 
 
-def _broadcast_root_info(
-    torch, dist, rank: int, device: str, group_count: int
-) -> list[int]:
+def _broadcast_root_info(torch, dist, rank: int, device: str) -> list[int]:
     from ucm.store.allgather import ucm_allgather_runtime
 
     size = int(ucm_allgather_runtime.root_info_size())
-    result = []
-    for _ in range(group_count):
-        if rank == 0:
-            root_info = ucm_allgather_runtime.create_root_info()
-            tensor = torch.tensor(root_info, dtype=torch.uint8, device=device)
-        else:
-            tensor = torch.empty(size, dtype=torch.uint8, device=device)
-        dist.broadcast(tensor, src=0)
-        result.extend(tensor.cpu().tolist())
-    return result
+    if rank == 0:
+        root_info = ucm_allgather_runtime.create_root_info()
+        tensor = torch.tensor(root_info, dtype=torch.uint8, device=device)
+    else:
+        tensor = torch.empty(size, dtype=torch.uint8, device=device)
+    dist.broadcast(tensor, src=0)
+    return tensor.cpu().tolist()
 
 
 def _make_tensors(torch, workload: Workload, block_count: int, device: str, dtype: str):
@@ -210,6 +205,7 @@ def _make_store_config(
         "cache_load_backend_only": False,
         "cache_buffer_capacity_gb": args.cache_capacity_gb,
         "cache_stream_number": args.cache_streams,
+        "cache_load_exclusive_buffer_number": 32,
         "cache_sdma_direct": False,
         "io_direct": True,
         "timeout_ms": args.timeout_ms,
@@ -229,7 +225,6 @@ def _make_store_config(
                 "allgather_runtime_key": f"allgather-cache-benchmark-{unique_id}",
                 "allgather_window_blocks_per_rank": args.window_blocks,
                 "allgather_load_slots": args.load_slots,
-                "allgather_load_groups": args.load_groups,
                 "allgather_dump_slots": args.dump_slots,
                 "allgather_collective_buffer_mb": args.collective_buffer_mb,
                 "allgather_collective_mode": args.collective_mode,
@@ -239,6 +234,7 @@ def _make_store_config(
                 "allgather_collective_count_crop": not args.disable_count_crop,
                 "allgather_collective_variable_counts": args.variable_counts,
                 "allgather_dynamic_windows": not args.disable_dynamic_windows,
+                "allgather_load_backend_only": args.load_backend_only,
             }
         )
         if replicated_data and not scatter_only and world_size > 1:
@@ -483,7 +479,7 @@ def _worker(
     store = None
     try:
         root_info = (
-            _broadcast_root_info(torch, dist, rank, device, args.load_groups)
+            _broadcast_root_info(torch, dist, rank, device)
             if store_mode == "allgather"
             and not args.local_coalesced
             and not args.scatter_only
@@ -566,7 +562,6 @@ def _build_parser(direction: str, store_mode: str) -> argparse.ArgumentParser:
     parser.add_argument("--cache-capacity-gb", type=int, default=4)
     parser.add_argument("--cache-streams", type=int, default=4)
     parser.add_argument("--load-slots", type=int, default=2)
-    parser.add_argument("--load-groups", type=int, default=1)
     parser.add_argument("--dump-slots", type=int, default=2)
     parser.add_argument("--window-blocks", type=int, default=4)
     parser.add_argument("--collective-buffer-mb", type=int, default=8)
@@ -587,6 +582,7 @@ def _build_parser(direction: str, store_mode: str) -> argparse.ArgumentParser:
     parser.add_argument("--shared-dump-queue", action="store_true")
     parser.add_argument("--local-coalesced", action="store_true")
     parser.add_argument("--scatter-only", action="store_true")
+    parser.add_argument("--load-backend-only", action="store_true")
     parser.add_argument("--disable-count-crop", action="store_true")
     parser.add_argument("--variable-counts", action="store_true")
     parser.add_argument("--disable-dynamic-windows", action="store_true")
@@ -616,7 +612,6 @@ def run(direction: str, store_mode: str = "allgather") -> None:
         "cache_capacity_gb",
         "cache_streams",
         "load_slots",
-        "load_groups",
         "dump_slots",
         "window_blocks",
         "collective_buffer_mb",
@@ -625,8 +620,6 @@ def run(direction: str, store_mode: str = "allgather") -> None:
         _positive(parser, f"--{name.replace('_', '-')}", getattr(args, name))
     if args.warmup < 0:
         parser.error("--warmup must be non-negative")
-    if args.load_groups > args.load_slots:
-        parser.error("--load-groups must not exceed --load-slots")
     if args.master_port < 0 or args.master_port > 65535:
         parser.error("--master-port must be 0 or a valid TCP port")
     if args.block_id_seed < 0 or args.block_id_seed >= 1 << 64:

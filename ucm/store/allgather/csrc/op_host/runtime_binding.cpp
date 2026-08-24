@@ -23,16 +23,17 @@ std::vector<uint8_t> CreateRootInfo()
 
 py::dict CalculateMemoryPlan(const std::vector<size_t>& tensorSizes, size_t shardSize,
                              size_t worldSize, bool replicated, size_t loadSlots,
-                             size_t dumpSlots, size_t windowBlocks)
+                             size_t dumpSlots, size_t windowBlocks, size_t receiveSlots)
 {
     const auto plan = UC::AllGatherStore::CalculateStageMemoryPlan(
-        tensorSizes, shardSize, worldSize, replicated, loadSlots, dumpSlots,
-        windowBlocks);
+        tensorSizes, shardSize, worldSize, replicated, loadSlots, dumpSlots, windowBlocks,
+        receiveSlots);
     py::dict result;
     result["window_blocks"] = plan.windowBlocks;
     result["shard_size"] = plan.shardSize;
     result["tensor_count"] = plan.tensorCount;
     result["chunk_count"] = plan.chunkCount;
+    result["receive_slots"] = plan.receiveSlots;
     result["load_send_bytes"] = plan.loadSendBytes;
     result["load_receive_bytes"] = plan.loadReceiveBytes;
     result["dump_send_bytes"] = plan.dumpSendBytes;
@@ -55,5 +56,6 @@ PYBIND11_MODULE(ucm_allgather_runtime, module)
     module.def("calculate_memory_plan", &CalculateMemoryPlan, py::arg("tensor_sizes"),
                py::arg("shard_size"), py::arg("world_size"), py::arg("replicated"),
                py::arg("load_slots") = 2, py::arg("dump_slots") = 2,
-               py::arg("window_blocks") = UC::AllGatherStore::kDefaultWindowBlocks);
+               py::arg("window_blocks") = UC::AllGatherStore::kDefaultWindowBlocks,
+               py::arg("receive_slots") = UC::AllGatherStore::kDefaultReceiveSlotCount);
 }

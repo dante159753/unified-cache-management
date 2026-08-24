@@ -24,13 +24,19 @@ namespace {
 Status AclStatus(aclError code, const char* operation)
 {
     if (code == ACL_SUCCESS) { return Status::OK(); }
-    return Status::Error(fmt::format("{} failed({})", operation, code));
+    const auto* recent = aclGetRecentErrMsg();
+    return Status::Error(fmt::format("{} failed({}): {}", operation, code,
+                                     recent != nullptr ? recent : "no recent ACL message"));
 }
 
 Status HcclStatus(HcclResult code, const char* operation)
 {
     if (code == HCCL_SUCCESS) { return Status::OK(); }
-    return Status::Error(fmt::format("{} failed({})", operation, static_cast<int>(code)));
+    // HcclGetErrorString turns opaque codes such as 4 (HCCL_E_INTERNAL) into a
+    // description. Without it a collective failure only reports the number.
+    const auto* message = HcclGetErrorString(code);
+    return Status::Error(fmt::format("{} failed({}): {}", operation, static_cast<int>(code),
+                                     message != nullptr ? message : "unknown HCCL error"));
 }
 
 class AscendPlatformRuntime final : public PlatformRuntime {
@@ -215,18 +221,6 @@ public:
             "HcclAllGather");
     }
 
-    bool SupportsAllGatherV() const override { return true; }
-
-    Status AllGatherV(void* send, size_t sendBytes, void* receive, const uint64_t* receiveBytes,
-                      const uint64_t* receiveDisplacements, CollectiveHandle collective,
-                      StreamHandle stream) override
-    {
-        return HcclStatus(
-            HcclAllGatherV(send, sendBytes, receive, receiveBytes, receiveDisplacements,
-                           HCCL_DATA_TYPE_INT8, static_cast<HcclComm>(collective),
-                           static_cast<aclrtStream>(stream)),
-            "HcclAllGatherV");
-    }
 
     Status LaunchSegmentedCopy(StreamHandle stream, void* descriptors, void* coreOffsets,
                                uint32_t usedWorkers) override

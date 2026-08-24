@@ -48,21 +48,6 @@ public:
     virtual void DestroyCollective(CollectiveHandle collective) = 0;
     virtual Status AllGather(void* send, void* receive, size_t bytes, CollectiveHandle collective,
                              StreamHandle stream) = 0;
-    virtual bool SupportsAllGatherV() const { return false; }
-    virtual Status AllGatherV(void* send, size_t sendBytes, void* receive,
-                              const uint64_t* receiveBytes, const uint64_t* receiveDisplacements,
-                              CollectiveHandle collective, StreamHandle stream)
-    {
-        (void)send;
-        (void)sendBytes;
-        (void)receive;
-        (void)receiveBytes;
-        (void)receiveDisplacements;
-        (void)collective;
-        (void)stream;
-        return Status::Error("AllGatherV is not supported");
-    }
-
     virtual Status LaunchSegmentedCopy(StreamHandle stream, void* descriptors, void* coreOffsets,
                                        uint32_t usedWorkers) = 0;
     virtual Status LaunchCompactScatter(StreamHandle stream, void* receiveBuffer,

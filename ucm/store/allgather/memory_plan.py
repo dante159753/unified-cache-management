@@ -9,11 +9,18 @@ COPY_CHUNK_BYTES = 32 * 1024
 MAX_COPY_WORKERS = 40
 MAX_AIV_CORES = MAX_COPY_WORKERS
 DEFAULT_LOAD_SLOTS = 2
-DEFAULT_LOAD_GROUPS = 1
+# Each AllGather stage owns exactly one collective domain. Concurrent
+# communicators on one device were a source of HCCL internal errors, and
+# pipelining now comes from the per-slot side streams instead.
+COLLECTIVE_GROUPS_PER_STAGE = 1
+# Receive areas only cover the collective-to-scatter handoff, which one
+# serialized collective stream saturates with a couple of buffers.
+DEFAULT_RECEIVE_SLOTS = 2
+DEFAULT_LOAD_GROUPS = COLLECTIVE_GROUPS_PER_STAGE
 DEFAULT_FA_LOAD_SLOTS = 4
-DEFAULT_FA_LOAD_GROUPS = 4
+DEFAULT_FA_LOAD_GROUPS = COLLECTIVE_GROUPS_PER_STAGE
 DEFAULT_WA_LOAD_SLOTS = 1
-DEFAULT_WA_LOAD_GROUPS = 1
+DEFAULT_WA_LOAD_GROUPS = COLLECTIVE_GROUPS_PER_STAGE
 DEFAULT_DUMP_SLOTS = 2
 DEFAULT_COLLECTIVE_BUFFER_MB = 8
 COLLECTIVE_BUFFER_COPIES = 2
@@ -32,6 +39,7 @@ class AllGatherStageMemoryPlan:
     window_blocks: int
     replicated: bool
     load_slots: int
+    receive_slots: int
     dump_slots: int
     load_send_bytes: int
     load_receive_bytes: int
@@ -111,6 +119,7 @@ def calculate_stage_memory_plan(
     load_slots: int = DEFAULT_LOAD_SLOTS,
     dump_slots: int = DEFAULT_DUMP_SLOTS,
     window_blocks: int = DEFAULT_WINDOW_BLOCKS,
+    receive_slots: int = DEFAULT_RECEIVE_SLOTS,
 ) -> AllGatherStageMemoryPlan:
     sizes = tuple(int(size) for size in tensor_sizes)
     if not sizes or any(size < 0 for size in sizes):
@@ -120,6 +129,7 @@ def calculate_stage_memory_plan(
     load_slots = _positive("load_slots", load_slots)
     dump_slots = _positive("dump_slots", dump_slots)
     window_blocks = _positive("window_blocks", window_blocks)
+    receive_slots = min(_positive("receive_slots", receive_slots), load_slots)
     if sum(sizes) > shard_size:
         raise ValueError(
             f"tensor sizes total {sum(sizes)} exceeds shard_size {shard_size}"
@@ -146,17 +156,22 @@ def calculate_stage_memory_plan(
         window_blocks=window_blocks,
         replicated=bool(replicated),
         load_slots=load_slots,
+        receive_slots=receive_slots,
         dump_slots=dump_slots,
         load_send_bytes=load_slots * frame_bytes,
         load_receive_bytes=(
-            load_slots * world_size * frame_bytes if collective_enabled else 0
+            receive_slots * world_size * frame_bytes if collective_enabled else 0
         ),
         dump_send_bytes=dump_slots * window_payload_bytes,
         chunk_layout_bytes=chunk_count * 4 * 8,
         dump_descriptor_bytes=(dump_slots * window_blocks * chunk_count * 3 * 8),
         dump_offset_bytes=dump_slots * (MAX_COPY_WORKERS + 1) * 4,
-        load_destination_bytes=(load_slots * max_window_rows * len(sizes) * 8),
-        load_route_bytes=(0 if collective_enabled else load_slots * max_window_rows * 2 * 4),
+        load_destination_bytes=(
+            0 if collective_enabled else load_slots * max_window_rows * len(sizes) * 8
+        ),
+        load_route_bytes=(
+            0 if collective_enabled else load_slots * max_window_rows * 2 * 4
+        ),
     )
 
 

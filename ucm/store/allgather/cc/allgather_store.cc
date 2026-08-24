@@ -30,7 +30,14 @@ namespace {
 constexpr uint32_t kDefaultCollectiveBufferMb = 8;
 constexpr size_t kDefaultLoadSlots = 2;
 constexpr size_t kDefaultDumpSlots = 2;
+constexpr size_t kDefaultReceiveSlots = 2;
+constexpr double kDefaultBackendWaitTimeoutMs = 300000.0;
 using Clock = std::chrono::steady_clock;
+/* Backend readiness has to be polled, so back off instead of spinning: on
+ * networked storage a window can take milliseconds and the progress thread is
+ * shared by every task in the process. */
+constexpr auto kBackendPollMinSleep = std::chrono::microseconds(5);
+constexpr auto kBackendPollMaxSleep = std::chrono::microseconds(100);
 
 Status ParseCollectiveMode(const std::string& value, uint32_t* mode, std::string* canonical)
 {
@@ -134,21 +141,58 @@ struct HostBuffer {
     }
 };
 
+/**
+ * @brief One staged window on its way from the backend into the collective.
+ *
+ * Send slots size the reordering freedom: the more of them there are, the more
+ * candidate windows the progress thread can choose from when networked storage
+ * completes reads out of order. They are cheap - one window of payload each.
+ */
 struct LoadSlot {
     std::shared_ptr<PlatformRuntime> platform;
     DeviceBuffer send;
-    DeviceBuffer receive;
+    /* Local-coalesced mode only: the scatter reads the send buffer directly. */
     DeviceBuffer destinations;
     DeviceBuffer routes;
     HostBuffer<uint64_t> hostDestinations;
     HostBuffer<uint32_t> hostRoutes;
     HostBuffer<uint8_t> hostFrame;
-    EventHandle completion{nullptr};
-    bool recorded{false};
+    /* The send buffer has been consumed, so the backend may refill it. Recorded
+     * after the AllGather, or after the scatter when there is no collective. */
+    EventHandle sendFree{nullptr};
+    bool inFlight{false};
 
     ~LoadSlot()
     {
-        if (completion != nullptr && platform != nullptr) { platform->DestroyEvent(completion); }
+        if (sendFree != nullptr && platform != nullptr) { platform->DestroyEvent(sendFree); }
+    }
+};
+
+/**
+ * @brief Landing area for one collective, plus the stream that drains it.
+ *
+ * Receive buffers are world_size times larger than send buffers but only need to
+ * cover the collective-to-scatter handoff. Collectives are serialized on one
+ * stream, so two or three of these saturate that handoff no matter how many send
+ * slots exist. Sizing them together with send slots is what used to make the
+ * receive area the dominant allocation.
+ */
+struct ReceiveSlot {
+    std::shared_ptr<PlatformRuntime> platform;
+    DeviceBuffer receive;
+    /* Metadata for this round is on the stream. The previous round that used
+     * this slot scattered on the same stream, so waiting for `prepared` also
+     * proves the receive buffer is free. */
+    EventHandle prepared{nullptr};
+    EventHandle scattered{nullptr};
+    bool inFlight{false};
+
+    ~ReceiveSlot()
+    {
+        if (platform == nullptr) { return; }
+        for (const auto event : {prepared, scattered}) {
+            if (event != nullptr) { platform->DestroyEvent(event); }
+        }
     }
 };
 
@@ -171,8 +215,8 @@ struct WindowPlan {
     std::vector<size_t> rows;
     std::vector<uint32_t> owners;
     std::vector<uint32_t> ownerSlots;
-    std::vector<uint64_t> receiveBytes;
-    std::vector<uint64_t> receiveDisplacements;
+    /* Only the local-coalesced path uses this, as the scatter rank stride. The
+     * collective path always moves a fixed-size frame. */
     size_t collectiveBlocks{};
 };
 
@@ -181,6 +225,7 @@ struct PendingBackend {
     size_t slot{};
     Detail::TaskHandle handle{};
     bool submitted{false};
+    bool abandoned{false};
     Status status{Status::OK()};
     size_t ownedRows{};
     Clock::time_point slotReadyAt;
@@ -317,6 +362,9 @@ struct TaskState {
     std::shared_ptr<PlatformRuntime> platform;
 };
 
+/** Communication failures are process-level, not request-level. */
+bool IsFatalCommunication(const Status& status) { return status == Status::StoreUnhealthy(); }
+
 uint32_t Owner(const Detail::BlockId& id, uint32_t worldSize)
 {
     uint64_t value = 0;
@@ -360,8 +408,10 @@ public:
         config.Get("allgather_replicated_data", replicated_);
         config.Get("allgather_scatter_only", scatterOnly_);
         config.GetNumber("allgather_load_slots", loadSlotCount_);
-        config.GetNumber("allgather_load_groups", loadGroupCount_);
+        config.GetNumber("allgather_load_groups", requestedLoadGroups_);
         config.GetNumber("allgather_dump_slots", dumpSlotCount_);
+        config.GetNumber("allgather_receive_slots", receiveSlotCount_);
+        config.GetNumber("allgather_backend_wait_timeout_ms", backendWaitTimeoutMs_);
         config.GetNumber("allgather_hccl_buffer_mb", collectiveBufferMb_);
         config.GetNumber("allgather_collective_buffer_mb", collectiveBufferMb_);
         config.Get("allgather_collective_mode", collectiveModeName_);
@@ -369,11 +419,9 @@ public:
         config.GetNumber("allgather_stage_trace_sample_every", stageTraceSampleEvery_);
         config.Get("allgather_async_completion", asyncCompletion_);
         config.Get("allgather_separate_dump_queue", separateDumpQueue_);
-        config.Get("allgather_collective_count_crop", collectiveCountCrop_);
-        config.Get("allgather_collective_variable_counts", variableCollective_);
-        config.Get("allgather_dynamic_windows", dynamicWindows_);
         config.Get("allgather_load_skip_collective", skipLoadCollective_);
         config.Get("allgather_load_skip_scatter", skipLoadScatter_);
+        config.Get("allgather_load_backend_only", loadBackendOnly_);
         config.Get("allgather_runtime_key", runtimeKey_);
         config.GetNumbers("allgather_hccl_root_info", rootInfo_);
         config.GetNumbers("allgather_collective_root_info", rootInfo_);
@@ -395,18 +443,35 @@ public:
         auto status =
             ParseCollectiveMode(collectiveModeName_, &collectiveMode_, &collectiveModeName_);
         if (status.Failure()) { return status; }
-        if (loadGroupCount_ == 0 || loadGroupCount_ > loadSlotCount_) {
-            return Status::InvalidParam("invalid allgather load group count({}/{})",
-                                        loadGroupCount_, loadSlotCount_);
+        if (loadSlotCount_ == 0) {
+            return Status::InvalidParam("allgather load slot count must be positive");
+        }
+        if (receiveSlotCount_ == 0) {
+            return Status::InvalidParam("allgather receive slot count must be positive");
+        }
+        // More landing areas than stageable windows cannot be reached.
+        receiveSlotCount_ = std::min(receiveSlotCount_, loadSlotCount_);
+        if (backendWaitTimeoutMs_ <= 0.0) {
+            return Status::InvalidParam("allgather backend wait timeout must be positive");
+        }
+        if (requestedLoadGroups_ > 1) {
+            // Several communicators driving concurrent collectives on one device
+            // is what the reference HCCL users on Ascend deliberately avoid, and
+            // it is how this stage used to desynchronize its ranks. Overlap now
+            // comes from the per-slot side streams instead.
+            UC_WARN(
+                "allgather_load_groups={} is no longer supported; the stage uses one "
+                "collective domain. Raise allgather_load_slots for pipelining instead.",
+                requestedLoadGroups_);
         }
         loadStorageWorldSize_ = collectiveEnabled_ ? worldSize_ : 1;
         loadStorageRank_ = collectiveEnabled_ ? rank_ : 0;
         dumpStorageWorldSize_ = replicated_ ? worldSize_ : 1;
         dumpStorageRank_ = replicated_ ? rank_ : 0;
         try {
-            plan_ =
-                CalculateStageMemoryPlan(tensorSizes_, shardSize_, worldSize_, collectiveEnabled_,
-                                         loadSlotCount_, dumpSlotCount_, windowBlocks_);
+            plan_ = CalculateStageMemoryPlan(tensorSizes_, shardSize_, worldSize_,
+                                             collectiveEnabled_, loadSlotCount_, dumpSlotCount_,
+                                             windowBlocks_, receiveSlotCount_);
         } catch (const std::exception& error) {
             return Status::InvalidParam("invalid allgather memory plan: {}", error.what());
         }
@@ -415,30 +480,29 @@ public:
         if (platform_ == nullptr) {
             return Status::Error("allgather platform runtime unavailable");
         }
-        if (variableCollective_ && collectiveEnabled_ && !platform_->SupportsAllGatherV()) {
-            return Status::InvalidParam("AllGatherV is unavailable on {}", platform_->Name());
-        }
         status = platform_->SetDevice(deviceId_);
         if (status.Failure()) { return status; }
         status = AllocateBuffers();
         if (status.Failure()) { return status; }
         auto runtime = AllGatherRuntime::Acquire(runtimeKey_, deviceId_, rank_, worldSize_,
                                                  collectiveBufferMb_, collectiveMode_, rootInfo_,
-                                                 collectiveEnabled_, loadGroupCount_);
+                                                 collectiveEnabled_, receiveSlotCount_);
         if (!runtime) { return runtime.Error(); }
         runtime_ = runtime.Value();
         UC_INFO(
             "AllGatherStore: shard={}, world={}, window_blocks={}, load_slots={}, "
-            "load_groups={}, "
-            "dump_slots={}, payload_bytes={}, metadata_bytes={}, "
-            "collective_buffer_bytes={}, scatter_only={}, skip_load_collective={}, "
-            "skip_load_scatter={}, variable_collective={}, dynamic_windows={}, "
+            "receive_slots={}, dump_slots={}, frame_bytes={}, collective_message_bytes={}, "
+            "payload_bytes={}, "
+            "metadata_bytes={}, collective_buffer_bytes={}, scatter_only={}, "
+            "skip_load_collective={}, skip_load_scatter={}, load_backend_only={}, "
             "collective_mode={}, platform={}.",
-            shardSize_, worldSize_, windowBlocks_, loadSlotCount_, loadGroupCount_, dumpSlotCount_,
-            plan_.PayloadBytes(), plan_.MetadataBytes(),
-            CalculateCollectiveBytes(collectiveBufferMb_, collectiveEnabled_, loadGroupCount_),
-            scatterOnly_, skipLoadCollective_, skipLoadScatter_, variableCollective_,
-            dynamicWindows_, collectiveModeName_, platform_->Name());
+            shardSize_, worldSize_, windowBlocks_, loadSlotCount_, receiveSlotCount_,
+            dumpSlotCount_, frameBytes_,
+            collectiveEnabled_ ? worldSize_ * frameBytes_ : 0, plan_.PayloadBytes(),
+            plan_.MetadataBytes(),
+            CalculateCollectiveBytes(collectiveBufferMb_, collectiveEnabled_, 1),
+            scatterOnly_, skipLoadCollective_, skipLoadScatter_, loadBackendOnly_,
+            collectiveModeName_, platform_->Name());
         return Status::OK();
     }
 
@@ -546,28 +610,37 @@ private:
             auto status = slot->send.Allocate(platform_, frameBytes_);
             if (status.Failure()) { return status; }
             if (collectiveEnabled_) {
-                status = slot->receive.Allocate(platform_, worldSize_ * frameBytes_);
-                if (status.Failure()) { return status; }
-            }
-            status = slot->destinations.Allocate(platform_,
-                                                 maxRows * tensorSizes_.size() * sizeof(uint64_t));
-            if (status.Failure()) { return status; }
-            if (!collectiveEnabled_) {
-                status = slot->routes.Allocate(platform_, maxRows * 2 * sizeof(uint32_t));
-                if (status.Failure()) { return status; }
-            }
-            status = slot->hostDestinations.Allocate(platform_, maxRows * tensorSizes_.size());
-            if (status.Failure()) { return status; }
-            if (!collectiveEnabled_) {
-                status = slot->hostRoutes.Allocate(platform_, maxRows * 2);
-                if (status.Failure()) { return status; }
-            } else {
+                // Row addresses live on the task in framed mode, not on the slot.
                 status = slot->hostFrame.Allocate(platform_, frameMetadataBytes_);
                 if (status.Failure()) { return status; }
+            } else {
+                status = slot->destinations.Allocate(
+                    platform_, maxRows * tensorSizes_.size() * sizeof(uint64_t));
+                if (status.Failure()) { return status; }
+                status = slot->routes.Allocate(platform_, maxRows * 2 * sizeof(uint32_t));
+                if (status.Failure()) { return status; }
+                status = slot->hostDestinations.Allocate(platform_, maxRows * tensorSizes_.size());
+                if (status.Failure()) { return status; }
+                status = slot->hostRoutes.Allocate(platform_, maxRows * 2);
+                if (status.Failure()) { return status; }
             }
-            status = platform_->CreateEvent(&slot->completion);
+            status = platform_->CreateEvent(&slot->sendFree);
             if (status.Failure()) { return status; }
             loadSlots_.push_back(std::move(slot));
+        }
+        receiveSlots_.reserve(receiveSlotCount_);
+        for (size_t i = 0; i < receiveSlotCount_; ++i) {
+            auto slot = std::make_unique<ReceiveSlot>();
+            slot->platform = platform_;
+            if (collectiveEnabled_) {
+                auto status = slot->receive.Allocate(platform_, worldSize_ * frameBytes_);
+                if (status.Failure()) { return status; }
+            }
+            for (auto* event : {&slot->prepared, &slot->scattered}) {
+                auto status = platform_->CreateEvent(event);
+                if (status.Failure()) { return status; }
+            }
+            receiveSlots_.push_back(std::move(slot));
         }
         dumpSlots_.reserve(dumpSlotCount_);
         for (size_t i = 0; i < dumpSlotCount_; ++i) {
@@ -625,13 +698,13 @@ private:
                                 sequence % stageTraceSampleEvery_ == 0;
         auto task = std::make_shared<TaskState>(operation, std::move(input), sequence, profile,
                                                 stageTrace, platform_);
-        if (operation == TaskState::Operation::Load && collectiveEnabled_) {
+        if (operation == TaskState::Operation::Load && collectiveEnabled_ && !loadBackendOnly_) {
             auto status = task->deviceError.Allocate(platform_, sizeof(uint32_t), true);
             if (status.Failure()) { return status; }
             status = task->hostError.Allocate(platform_, 1);
             if (status.Failure()) { return status; }
             task->hostError.data[0] = 0;
-            if (dynamicWindows_) {
+            {
                 const auto destinationCount = task->input.size() * tensorSizes_.size();
                 status = task->destinations.Allocate(platform_,
                                                      destinationCount * sizeof(uint64_t));
@@ -665,7 +738,13 @@ private:
         UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_task_queue_depth"),
                                  static_cast<double>(queueDepth));
         auto work = [this, task](PlatformRuntime& platform, StreamHandle stream,
-                                 CollectiveHandle collective) {
+                                 CollectiveHandle collective, Status fatal) {
+            if (fatal.Failure()) {
+                // The collective domain already diverged from its peers. Running
+                // this task would only add another mismatched round.
+                Finish(task, fatal);
+                return;
+            }
             try {
                 if (task->operation == TaskState::Operation::Load) {
                     ProcessLoad(task, platform, stream, collective);
@@ -712,28 +791,7 @@ private:
             windows[window].owners.push_back(owners[row]);
             windows[window].ownerSlots.push_back(ownerSlots[row] % windowBlocks_);
         }
-        const bool allowCrop = collectiveCountCrop_ && windows.size() == 1;
-        for (auto& window : windows) {
-            window.receiveBytes.assign(storageWorldSize, 0);
-            window.receiveDisplacements.assign(storageWorldSize, 0);
-            for (const auto slot : window.ownerSlots) {
-                window.collectiveBlocks =
-                    std::max(window.collectiveBlocks, static_cast<size_t>(slot) + 1);
-            }
-            for (size_t i = 0; i < window.owners.size(); ++i) {
-                window.receiveBytes[window.owners[i]] =
-                    std::max(window.receiveBytes[window.owners[i]],
-                             (static_cast<uint64_t>(window.ownerSlots[i]) + 1) * shardSize_);
-            }
-            for (size_t owner = 1; owner < storageWorldSize; ++owner) {
-                window.receiveDisplacements[owner] =
-                    window.receiveDisplacements[owner - 1] + window.receiveBytes[owner - 1];
-            }
-            // Cropping a tail collective can reduce its link bandwidth enough to regress.
-            if (!allowCrop || window.collectiveBlocks * 2 > windowBlocks_) {
-                window.collectiveBlocks = windowBlocks_;
-            }
-        }
+        for (auto& window : windows) { window.collectiveBlocks = windowBlocks_; }
         return windows;
     }
 
@@ -741,18 +799,11 @@ private:
                                     size_t slotIndex, LoadMetrics& metrics)
     {
         auto& slot = *loadSlots_[slotIndex];
-        PendingBackend pending{windowIndex, slotIndex, 0, false, Status::OK()};
+        PendingBackend pending{windowIndex, slotIndex, 0, false, false, Status::OK()};
         try {
-            if (slot.recorded) {
-                const auto started = Clock::now();
-                auto status = platform_->SynchronizeEvent(slot.completion);
-                metrics.slotWaitMs += Milliseconds(Clock::now() - started);
-                if (status.Failure()) {
-                    pending.status = status;
-                    return pending;
-                }
-                slot.recorded = false;
-            }
+            // The caller only hands over slots whose previous AllGather has
+            // already consumed the send buffer, so no synchronization is needed
+            // here. The backend fills the payload from its own stream.
             pending.slotReadyAt = Clock::now();
             Detail::TaskDesc backendTask;
             const auto& window = task->windows[windowIndex];
@@ -788,9 +839,9 @@ private:
 
     Status PrepareLoadMetadata(const std::shared_ptr<TaskState>& task, size_t windowIndex,
                                const WindowPlan& window, LoadSlot& slot, bool backendFailed,
-                               PlatformRuntime& platform, StreamHandle stream)
+                               PlatformRuntime& platform, StreamHandle stream) const
     {
-        if (!dynamicWindows_ || !collectiveEnabled_) {
+        if (!collectiveEnabled_) {
             auto& destinations = slot.hostDestinations;
             size_t destinationOffset = 0;
             for (size_t i = 0; i < window.rows.size(); ++i) {
@@ -803,9 +854,7 @@ private:
                                                     destinations.data,
                                                     destinationOffset * sizeof(uint64_t), stream);
             if (status.Failure()) { return status; }
-        }
-
-        if (collectiveEnabled_) {
+        } else {
             std::memset(slot.hostFrame.data, 0, frameMetadataBytes_);
             auto* header = reinterpret_cast<FrameHeader*>(slot.hostFrame.data);
             header->magic = kFrameMagic;
@@ -818,7 +867,7 @@ private:
             for (size_t i = 0; i < window.rows.size(); ++i) {
                 if (window.owners[i] != loadStorageRank_) { continue; }
                 auto& record = records[header->validCount++];
-                record.row = static_cast<uint32_t>(dynamicWindows_ ? window.rows[i] : i);
+                record.row = static_cast<uint32_t>(window.rows[i]);
                 record.status = backendFailed ? kFrameStatusBackendFailed : kFrameStatusReady;
                 record.payloadSlot = window.ownerSlots[i];
             }
@@ -836,8 +885,8 @@ private:
                                          routeOffset * sizeof(uint32_t), stream);
     }
 
-    Status ScatterWindow(const std::shared_ptr<TaskState>& task, size_t windowIndex,
-                         const WindowPlan& window, LoadSlot& slot, PlatformRuntime& platform,
+    Status ScatterWindow(const std::shared_ptr<TaskState>& task, const WindowPlan& window,
+                         LoadSlot& slot, ReceiveSlot& receiveSlot, PlatformRuntime& platform,
                          StreamHandle stream)
     {
         const auto taskCount =
@@ -845,29 +894,95 @@ private:
             plan_.chunkCount;
         const auto usedWorkers = static_cast<uint32_t>(std::min(kMaxCopyWorkers, taskCount));
         if (usedWorkers == 0) { return Status::OK(); }
+        void* receive = collectiveEnabled_ ? receiveSlot.receive.data : slot.send.data;
         if (collectiveEnabled_) {
-            void* destinations =
-                dynamicWindows_ ? task->destinations.data : slot.destinations.data;
+            // Rows are routed by the frame each rank sent, so the round the local
+            // window happens to carry is irrelevant to the kernel.
             return platform.LaunchFramedScatter(
-                stream, slot.receive.data, destinations, chunkLayout_.data, task->deviceError.data,
-                static_cast<uint32_t>(dynamicWindows_ ? task->input.size() : window.rows.size()),
-                worldSize_,
+                stream, receive, task->destinations.data, chunkLayout_.data,
+                task->deviceError.data, static_cast<uint32_t>(task->input.size()), worldSize_,
                 static_cast<uint32_t>(windowBlocks_), static_cast<uint32_t>(plan_.chunkCount),
                 static_cast<uint32_t>(tensorSizes_.size()), frameBytes_, frameMetadataBytes_,
-                shardSize_, task->sequence,
-                dynamicWindows_ ? kAnyFrameRound : static_cast<uint32_t>(windowIndex),
-                usedWorkers);
+                shardSize_, task->sequence, kAnyFrameRound, usedWorkers);
         }
-        void* receive = collectiveEnabled_ ? slot.receive.data : slot.send.data;
         return platform.LaunchCompactScatter(
             stream, receive, slot.destinations.data, slot.routes.data, chunkLayout_.data,
             window.rows.size(), plan_.chunkCount, tensorSizes_.size(),
             window.collectiveBlocks * shardSize_, shardSize_, usedWorkers);
     }
 
+    void ProcessLoadBackendOnly(const std::shared_ptr<TaskState>& task)
+    {
+        const auto taskStarted = Clock::now();
+        LoadMetrics metrics;
+        metrics.queueWaitMs = Milliseconds(taskStarted - task->queuedAt);
+        metrics.windows = task->windows.size();
+        Status firstError = Status::OK();
+        std::deque<size_t> freeSlots;
+        std::deque<PendingBackend> active;
+        for (size_t i = 0; i < loadSlots_.size(); ++i) { freeSlots.push_back(i); }
+        size_t nextWindow = 0;
+        Prefetch(task->input.data(), task->input.size());
+        auto submitReadyWindows = [&] {
+            while (nextWindow < task->windows.size() && !freeSlots.empty()) {
+                const auto slot = freeSlots.front();
+                freeSlots.pop_front();
+                active.push_back(SubmitLoadWindow(task, nextWindow, slot, metrics));
+                ++nextWindow;
+            }
+        };
+        submitReadyWindows();
+        while (!active.empty()) {
+            const auto waitStarted = Clock::now();
+            auto ready = active.end();
+            auto backoff = kBackendPollMinSleep;
+            while (ready == active.end()) {
+                for (auto candidate = active.begin(); candidate != active.end(); ++candidate) {
+                    if (candidate->status.Failure() || !candidate->submitted) {
+                        ready = candidate;
+                        break;
+                    }
+                    auto checked = backend_->Check(candidate->handle);
+                    if (!checked) {
+                        candidate->status = checked.Error();
+                        ready = candidate;
+                        break;
+                    }
+                    if (!checked.Value()) { continue; }
+                    candidate->status = backend_->Wait(candidate->handle);
+                    ready = candidate;
+                    break;
+                }
+                if (ready != active.end()) { break; }
+                if (Milliseconds(Clock::now() - waitStarted) > backendWaitTimeoutMs_) {
+                    ready = active.begin();
+                    ready->status = Status::Error(fmt::format(
+                        "allgather backend-only load exceeded {}ms", backendWaitTimeoutMs_));
+                    if (ready->submitted) { (void)backend_->Wait(ready->handle); }
+                    break;
+                }
+                std::this_thread::sleep_for(backoff);
+                backoff = std::min(backoff * 2, kBackendPollMaxSleep);
+            }
+            metrics.backendWaitMs += Milliseconds(Clock::now() - waitStarted);
+            auto pending = *ready;
+            active.erase(ready);
+            if (pending.status.Failure() && firstError.Success()) { firstError = pending.status; }
+            freeSlots.push_back(pending.slot);
+            submitReadyWindows();
+        }
+        metrics.totalMs = Milliseconds(Clock::now() - taskStarted);
+        RecordLoadMetrics(metrics, task->profile);
+        Finish(task, firstError);
+    }
+
     void ProcessLoad(const std::shared_ptr<TaskState>& task, PlatformRuntime& platform,
                      StreamHandle stream, CollectiveHandle collective)
     {
+        if (loadBackendOnly_) {
+            ProcessLoadBackendOnly(task);
+            return;
+        }
         (void)stream;
         (void)collective;
         const auto taskStarted = Clock::now();
@@ -876,7 +991,11 @@ private:
         metrics.windows = task->windows.size();
         Status firstError = Status::OK();
         Status localBackendError = Status::OK();
+        bool collectiveFailed = false;
         std::deque<PendingBackend> active;
+        // Windows whose backend timed out. Their send buffer may still be written
+        // by the backend, so the slot stays out of circulation until the drain.
+        std::vector<PendingBackend> abandoned;
         std::vector<TimingWindow> timingWindows;
         std::vector<StageTraceRecord> stageTraceRecords;
         if (task->stageTrace) { stageTraceRecords.reserve(task->windows.size()); }
@@ -889,10 +1008,24 @@ private:
             }
         }
         size_t nextWindow = 0;
-        size_t collectiveOrdinal = 0;
         Prefetch(task->input.data(), task->input.size());
-        if (dynamicWindows_ && collectiveEnabled_) {
-            const auto metadataStream = runtime_->LoadStream(0);
+        // A slot is busy from the moment the backend refills its send buffer
+        // until the AllGather reading that buffer completes. With asynchronous
+        // completion a task returns before its device work drains, so this state
+        // is kept on the slot and survives into the next task.
+        std::deque<size_t> freeSlots;
+        std::deque<size_t> recyclingSlots;
+        for (size_t i = 0; i < loadSlots_.size(); ++i) {
+            (loadSlots_[i]->inFlight ? recyclingSlots : freeSlots).push_back(i);
+        }
+        std::deque<size_t> freeReceiveSlots;
+        std::deque<size_t> recyclingReceiveSlots;
+        std::vector<bool> taskReceiveSlots(receiveSlots_.size(), false);
+        for (size_t i = 0; i < receiveSlots_.size(); ++i) {
+            (receiveSlots_[i]->inFlight ? recyclingReceiveSlots : freeReceiveSlots).push_back(i);
+        }
+        if (collectiveEnabled_) {
+            const auto metadataStream = runtime_->SlotStream(0);
             auto status = platform.CopyHostToDevice(
                 task->destinations.data, task->destinations.size, task->hostDestinations.data,
                 task->hostDestinations.count * sizeof(uint64_t), metadataStream);
@@ -902,70 +1035,137 @@ private:
             if (status.Failure()) {
                 firstError = status;
             } else {
-                for (size_t group = 0; group < loadGroupCount_; ++group) {
-                    status = platform.WaitEvent(runtime_->LoadStream(group), task->metadataReady);
+                // Every slot stream scatters through task->destinations, so all of
+                // them must observe the copy, not only the stream that issued it.
+                for (size_t i = 0; i < loadSlots_.size(); ++i) {
+                    status = platform.WaitEvent(runtime_->SlotStream(i), task->metadataReady);
                     if (status.Failure() && firstError.Success()) { firstError = status; }
                 }
             }
         }
-        while (nextWindow < task->windows.size() && active.size() < loadSlotCount_) {
-            active.push_back(SubmitLoadWindow(task, nextWindow, active.size(), metrics));
-            ++nextWindow;
-        }
+        auto reclaimSlots = [&](bool blocking) {
+            for (auto slot = recyclingSlots.begin(); slot != recyclingSlots.end();) {
+                auto queried = platform.QueryEvent(loadSlots_[*slot]->sendFree);
+                if (queried && !queried.Value()) {
+                    ++slot;
+                    continue;
+                }
+                if (!queried && firstError.Success()) { firstError = queried.Error(); }
+                loadSlots_[*slot]->inFlight = false;
+                freeSlots.push_back(*slot);
+                slot = recyclingSlots.erase(slot);
+            }
+            if (!blocking || !freeSlots.empty() || recyclingSlots.empty()) { return; }
+            // Collectives run in submission order on one stream, so the oldest
+            // recycling send slot is always the next one to be released.
+            const auto slot = recyclingSlots.front();
+            recyclingSlots.pop_front();
+            const auto started = Clock::now();
+            auto status = platform.SynchronizeEvent(loadSlots_[slot]->sendFree);
+            metrics.slotWaitMs += Milliseconds(Clock::now() - started);
+            if (status.Failure() && firstError.Success()) { firstError = status; }
+            loadSlots_[slot]->inFlight = false;
+            freeSlots.push_back(slot);
+        };
+        auto submitReadyWindows = [&] {
+            while (nextWindow < task->windows.size() && !freeSlots.empty()) {
+                const auto slot = freeSlots.front();
+                freeSlots.pop_front();
+                active.push_back(SubmitLoadWindow(task, nextWindow, slot, metrics));
+                ++nextWindow;
+            }
+        };
+        auto reclaimReceiveSlots = [&](bool blocking) {
+            for (auto slot = recyclingReceiveSlots.begin();
+                 slot != recyclingReceiveSlots.end();) {
+                auto queried = platform.QueryEvent(receiveSlots_[*slot]->scattered);
+                if (queried && !queried.Value()) {
+                    ++slot;
+                    continue;
+                }
+                if (!queried && firstError.Success()) { firstError = queried.Error(); }
+                receiveSlots_[*slot]->inFlight = false;
+                freeReceiveSlots.push_back(*slot);
+                slot = recyclingReceiveSlots.erase(slot);
+            }
+            if (!blocking || !freeReceiveSlots.empty() || recyclingReceiveSlots.empty()) {
+                return;
+            }
+            const auto slot = recyclingReceiveSlots.front();
+            recyclingReceiveSlots.pop_front();
+            const auto started = Clock::now();
+            auto status = platform.SynchronizeEvent(receiveSlots_[slot]->scattered);
+            metrics.slotWaitMs += Milliseconds(Clock::now() - started);
+            if (status.Failure() && firstError.Success()) { firstError = status; }
+            receiveSlots_[slot]->inFlight = false;
+            freeReceiveSlots.push_back(slot);
+        };
+        submitReadyWindows();
         while (!active.empty()) {
-            auto ready = active.begin();
-            Clock::time_point backendWaitStartedAt;
-            auto backendReadyAt = Clock::now();
-            if (dynamicWindows_) {
-                const auto waitStarted = Clock::now();
-                backendWaitStartedAt = waitStarted;
-                while (true) {
-                    ready = active.end();
-                    for (auto candidate = active.begin(); candidate != active.end(); ++candidate) {
-                        if (candidate->status.Failure() || !candidate->submitted) {
-                            ready = candidate;
-                            break;
-                        }
-                        auto checked = backend_->Check(candidate->handle);
-                        if (!checked) {
-                            candidate->status = checked.Error();
-                            ready = candidate;
-                            break;
-                        }
-                        if (!checked.Value()) { continue; }
-                        candidate->status = backend_->Wait(candidate->handle);
+            // Pick whichever window the backend finished first. On networked
+            // storage reads land out of order, so a fixed window order would
+            // stall every round on one straggler.
+            const auto waitStarted = Clock::now();
+            const auto backendWaitStartedAt = waitStarted;
+            auto ready = active.end();
+            auto backoff = kBackendPollMinSleep;
+            while (true) {
+                for (auto candidate = active.begin(); candidate != active.end(); ++candidate) {
+                    if (candidate->status.Failure() || !candidate->submitted) {
                         ready = candidate;
                         break;
                     }
-                    if (ready != active.end()) { break; }
-                    std::this_thread::yield();
+                    auto checked = backend_->Check(candidate->handle);
+                    if (!checked) {
+                        candidate->status = checked.Error();
+                        ready = candidate;
+                        break;
+                    }
+                    if (!checked.Value()) { continue; }
+                    candidate->status = backend_->Wait(candidate->handle);
+                    ready = candidate;
+                    break;
                 }
-                backendReadyAt = Clock::now();
-                metrics.backendWaitMs += Milliseconds(backendReadyAt - waitStarted);
+                if (ready != active.end()) { break; }
+                if (Milliseconds(Clock::now() - waitStarted) > backendWaitTimeoutMs_) {
+                    // Fail this round rather than hang: the frame marks its rows
+                    // failed and the collective sequence still runs to the end, so
+                    // peer ranks are not left waiting on a missing contribution.
+                    ready = active.begin();
+                    ready->status = Status::Error(fmt::format(
+                        "allgather backend load exceeded {}ms", backendWaitTimeoutMs_));
+                    ready->abandoned = true;
+                    abandoned.push_back(*ready);
+                    break;
+                }
+                std::this_thread::sleep_for(backoff);
+                backoff = std::min(backoff * 2, kBackendPollMaxSleep);
             }
-            auto pending = dynamicWindows_ ? *ready : active.front();
-            if (dynamicWindows_) {
-                active.erase(ready);
-            } else {
-                active.pop_front();
-            }
+            const auto backendReadyAt = Clock::now();
+            metrics.backendWaitMs += Milliseconds(backendReadyAt - waitStarted);
+            auto pending = *ready;
+            active.erase(ready);
             auto& slot = *loadSlots_[pending.slot];
-            const auto dispatchIndex = dynamicWindows_ ? collectiveOrdinal++ : pending.slot;
-            const auto loadStream = runtime_->LoadStream(dispatchIndex);
-            const auto loadCollective = runtime_->LoadCollective(dispatchIndex);
+            // Receive slots rotate with the collective order, which is the same on
+            // every rank. Metadata copies and the scatter run on that slot's
+            // stream; the collective always runs on the one collective stream.
+            reclaimReceiveSlots(false);
+            if (freeReceiveSlots.empty()) { reclaimReceiveSlots(true); }
+            if (freeReceiveSlots.empty()) {
+                if (firstError.Success()) {
+                    firstError = Status::Error("allgather receive slot reclamation failed");
+                }
+                break;
+            }
+            const auto receiveIndex = freeReceiveSlots.front();
+            freeReceiveSlots.pop_front();
+            auto& receiveSlot = *receiveSlots_[receiveIndex];
+            const auto slotStream = runtime_->SlotStream(receiveIndex);
+            const auto collectiveStream = runtime_->CollectiveStream();
+            const auto loadCollective = runtime_->Collective();
             bool backendFailed = pending.status.Failure();
             if (backendFailed && localBackendError.Success()) {
                 localBackendError = pending.status;
-            }
-            if (!dynamicWindows_ && pending.submitted) {
-                backendWaitStartedAt = Clock::now();
-                auto status = backend_->Wait(pending.handle);
-                backendReadyAt = Clock::now();
-                metrics.backendWaitMs += Milliseconds(backendReadyAt - backendWaitStartedAt);
-                if (status.Failure()) {
-                    backendFailed = true;
-                    if (localBackendError.Success()) { localBackendError = status; }
-                }
             }
             TimingWindow* timing = nullptr;
             if (profiling) {
@@ -973,7 +1173,7 @@ private:
                     timingWindows.emplace_back();
                     if (timingWindows.back().Setup(platform)) {
                         timing = &timingWindows.back();
-                        if (platform.RecordEvent(timing->start, loadStream).Failure()) {
+                        if (platform.RecordEvent(timing->start, collectiveStream).Failure()) {
                             timing = nullptr;
                         }
                     }
@@ -984,20 +1184,37 @@ private:
             }
             const auto& window = task->windows[pending.window];
             auto roundStatus = PrepareLoadMetadata(task, pending.window, window, slot,
-                                                   backendFailed, platform, loadStream);
+                                                   backendFailed, platform, slotStream);
             if (roundStatus.Failure() && firstError.Success()) { firstError = roundStatus; }
             Clock::time_point collectiveStartedAt;
             auto collectiveSubmittedAt = backendReadyAt;
             if (collectiveEnabled_ && !skipLoadCollective_) {
                 collectiveStartedAt = Clock::now();
-                auto status = platform.AllGather(slot.send.data, slot.receive.data, frameBytes_,
-                                                 loadCollective, loadStream);
+                // Waiting for `prepared` also covers the previous round's scatter:
+                // both are queued on this slot's stream, in that order.
+                auto status = platform.RecordEvent(receiveSlot.prepared, slotStream);
+                if (status.Success()) {
+                    status = platform.WaitEvent(collectiveStream, receiveSlot.prepared);
+                }
+                if (status.Success()) {
+                    status = platform.AllGather(slot.send.data, receiveSlot.receive.data,
+                                                frameBytes_, loadCollective, collectiveStream);
+                }
                 collectiveSubmittedAt = Clock::now();
                 metrics.collectiveSubmitMs +=
                     Milliseconds(collectiveSubmittedAt - collectiveStartedAt);
                 if (status.Failure()) {
+                    // A collective that failed to enqueue never reached the wire,
+                    // so this rank has already fallen out of step with its peers.
+                    // Issuing the remaining rounds would only widen the gap.
                     roundStatus = status;
-                    if (firstError.Success()) { firstError = status; }
+                    collectiveFailed = true;
+                    status = Status::StoreUnhealthy(fmt::format(
+                        "allgather collective failed, communicator is unusable: {}", status));
+                    if (firstError.Success() || !IsFatalCommunication(firstError)) {
+                        firstError = status;
+                    }
+                    runtime_->Poison(status);
                 }
             }
             if (task->stageTrace) {
@@ -1009,37 +1226,76 @@ private:
                     backendWaitStartedAt, backendReadyAt, collectiveStartedAt,
                     collectiveSubmittedAt});
             }
+            if (collectiveEnabled_ && !skipLoadCollective_) {
+                // The scatter reads the receive buffer, so it has to trail the
+                // collective that fills it. This is a device-side dependency:
+                // the host never waits here.
+                auto status = platform.RecordEvent(slot.sendFree, collectiveStream);
+                if (status.Success()) { status = platform.WaitEvent(slotStream, slot.sendFree); }
+                if (status.Failure() && firstError.Success()) { firstError = status; }
+            }
             if (timing != nullptr &&
-                platform.RecordEvent(timing->collectiveDone, loadStream).Failure()) {
+                platform.RecordEvent(timing->collectiveDone, collectiveStream).Failure()) {
                 timing = nullptr;
             }
             if (roundStatus.Success() && (!backendFailed || collectiveEnabled_) &&
                 !skipLoadScatter_) {
                 const auto started = Clock::now();
-                auto status =
-                    ScatterWindow(task, pending.window, window, slot, platform, loadStream);
+                auto scatterStatus =
+                    ScatterWindow(task, window, slot, receiveSlot, platform, slotStream);
                 metrics.scatterSubmitMs += Milliseconds(Clock::now() - started);
-                if (status.Failure()) { firstError = status; }
+                if (scatterStatus.Failure()) { firstError = scatterStatus; }
             }
             if (timing != nullptr) {
-                if (platform.RecordEvent(timing->scatterDone, loadStream).Failure()) {
+                if (platform.RecordEvent(timing->scatterDone, slotStream).Failure()) {
                     timing = nullptr;
                 } else {
                     timing->complete = true;
                 }
             }
-            auto status = platform.RecordEvent(slot.completion, loadStream);
-            if (status.Failure() && firstError.Success()) { firstError = status; }
-            slot.recorded = status.Success();
-            if (nextWindow < task->windows.size()) {
-                active.push_back(SubmitLoadWindow(task, nextWindow, pending.slot, metrics));
-                ++nextWindow;
+            auto scatteredStatus = platform.RecordEvent(receiveSlot.scattered, slotStream);
+            if (scatteredStatus.Failure() && firstError.Success()) { firstError = scatteredStatus; }
+            if (!collectiveEnabled_ || skipLoadCollective_) {
+                // No collective read the send buffer, so the scatter is what frees
+                // it. Record on the same stream, after the scatter.
+                auto status = platform.RecordEvent(slot.sendFree, slotStream);
+                if (status.Failure() && firstError.Success()) { firstError = status; }
+            }
+            receiveSlot.inFlight = true;
+            taskReceiveSlots[receiveIndex] = true;
+            recyclingReceiveSlots.push_back(receiveIndex);
+            slot.inFlight = true;
+            if (!pending.abandoned) { recyclingSlots.push_back(pending.slot); }
+            if (collectiveFailed) { break; }
+            // Issue the next collective before paying for slot recycling: the
+            // host only blocks when every slot is genuinely still in flight.
+            reclaimSlots(false);
+            submitReadyWindows();
+            if (active.empty() && nextWindow < task->windows.size()) {
+                reclaimSlots(true);
+                submitReadyWindows();
             }
         }
-        const auto completionStream = runtime_->LoadStream(0);
-        for (const auto& slot : loadSlots_) {
-            if (!slot->recorded) { continue; }
-            auto waitStatus = platform.WaitEvent(completionStream, slot->completion);
+        for (const auto& entry : active) {
+            // The loop stopped early; these backend loads still own their slots.
+            if (entry.submitted) { (void)backend_->Wait(entry.handle); }
+            loadSlots_[entry.slot]->inFlight = false;
+        }
+        for (const auto& entry : abandoned) {
+            // Every collective has been issued by now, so peers are not blocked
+            // while this drains. It bounds the damage of a stuck backend read to
+            // this task instead of letting a stale write land in the next one.
+            auto status = backend_->Wait(entry.handle);
+            if (status.Failure() && localBackendError.Success()) { localBackendError = status; }
+            loadSlots_[entry.slot]->inFlight = false;
+        }
+        const auto completionStream = runtime_->CompletionStream();
+        for (size_t i = 0; i < receiveSlots_.size(); ++i) {
+            if (!taskReceiveSlots[i]) { continue; }
+            // Every scatter ran on a receive slot's stream, and those streams are
+            // FIFO, so the latest scatter per slot covers all of this task's work.
+            auto waitStatus =
+                platform.WaitEvent(completionStream, receiveSlots_[i]->scattered);
             if (waitStatus.Failure() && firstError.Success()) { firstError = waitStatus; }
         }
         auto status = Status::OK();
@@ -1197,7 +1453,7 @@ private:
                            window.ownerSlots[i] * shardSize_};
             backendTask.push_back(std::move(shard));
         }
-        PendingBackend pending{windowIndex, slotIndex, 0, false, Status::OK()};
+        PendingBackend pending{windowIndex, slotIndex, 0, false, false, Status::OK()};
         if (backendTask.empty()) { return pending; }
         auto balanced = BalanceDescriptors(std::move(descriptors));
         auto status = Status::OK();
@@ -1337,7 +1593,9 @@ private:
     size_t frameMetadataBytes_{0};
     size_t frameBytes_{0};
     size_t loadSlotCount_{kDefaultLoadSlots};
-    size_t loadGroupCount_{1};
+    size_t requestedLoadGroups_{1};
+    size_t receiveSlotCount_{kDefaultReceiveSlots};
+    double backendWaitTimeoutMs_{kDefaultBackendWaitTimeoutMs};
     size_t dumpSlotCount_{kDefaultDumpSlots};
     uint32_t collectiveBufferMb_{kDefaultCollectiveBufferMb};
     std::string collectiveModeName_{"host"};
@@ -1348,6 +1606,7 @@ private:
     StageMemoryPlan plan_;
     DeviceBuffer chunkLayout_;
     std::vector<std::unique_ptr<LoadSlot>> loadSlots_;
+    std::vector<std::unique_ptr<ReceiveSlot>> receiveSlots_;
     std::vector<std::unique_ptr<DumpSlot>> dumpSlots_;
     std::shared_ptr<AllGatherRuntime> runtime_;
     std::atomic<Detail::TaskHandle> nextHandle_{1};
@@ -1357,11 +1616,9 @@ private:
     size_t stageTraceSampleEvery_{0};
     bool asyncCompletion_{false};
     bool separateDumpQueue_{true};
-    bool collectiveCountCrop_{true};
-    bool variableCollective_{false};
-    bool dynamicWindows_{false};
     bool skipLoadCollective_{false};
     bool skipLoadScatter_{false};
+    bool loadBackendOnly_{false};
     std::mutex tasksMutex_;
     std::unordered_map<Detail::TaskHandle, std::shared_ptr<TaskState>> tasks_;
     bool stopping_{false};
