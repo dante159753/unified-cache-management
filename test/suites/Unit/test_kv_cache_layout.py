@@ -98,6 +98,7 @@ def _load_layout_symbols():
     selected_names = {
         "_get_store_gc_block_size",
         "_get_store_io_sizes",
+        "_has_minimax_m3_sparse_indexer",
         "_has_shared_indexer_layers",
         "KVCacheSegment",
         "KVCacheTensorInfo",
@@ -284,6 +285,33 @@ class KVCacheLayoutTest(unittest.TestCase):
             addrs[1], layout.base_ptrs + layout.block_stride_lists
         )
 
+    def test_direct_layout_handles_minimax_m3_three_dimensional_index_cache(self):
+        kvcaches = {
+            "model.layers.0.self_attn.attn": (
+                FakeTensor(0x100000, 32768),
+                FakeTensor(0x200000, 32768),
+            ),
+            "model.layers.0.self_attn.attn.index_cache": (
+                FakeTensor(0x300000, 32768, dimensions=3),
+            ),
+        }
+        vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(num_hidden_layers=1)
+            ),
+        )
+
+        layout = KVCacheLayout(
+            kvcaches,
+            {"use_layerwise": False},
+            vllm_config,
+            SimpleNamespace(num_blocks=2),
+        )
+
+        self.assertEqual(layout.tensor_size_list, [32768, 32768, 32768])
+        self.assertEqual(layout.buffer_sizes.tolist(), [65536, 65536, 65536])
+
     def test_generic_layerwise_layout_accepts_regular_matrix(self):
         layout = _build_layout(
             [[131072, 16384, 32768], [131072, 16384, 32768]],
@@ -320,6 +348,75 @@ class KVCacheLayoutTest(unittest.TestCase):
         self.assertIs(type(glm51_layout), KVCacheLayout)
         self.assertIs(type(glm52_layout), SharedIndexerKVCacheLayout)
 
+    def test_minimax_m3_sparse_config_selects_dedicated_layout(self):
+        sparse_config = {
+            "use_sparse_attention": True,
+            "sparse_attention_freq": [0, 0, 0, *([1] * 57)],
+        }
+        vllm_config = SimpleNamespace(
+            additional_config={},
+            parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(
+                    model_type="minimax_m3_text",
+                    num_hidden_layers=60,
+                    sparse_attention_config=sparse_config,
+                )
+            ),
+        )
+
+        self.assertTrue(
+            SharedIndexerKVCacheLayout.supports(
+                vllm_config, {"use_layerwise": True}
+            )
+        )
+
+    def test_minimax_m3_ascend_layout_handles_three_dimensional_index_cache(self):
+        next_ptr = 0x100000
+        kvcaches = {}
+        indexer_ptrs = {}
+        for layer_id in range(60):
+            attention_name = f"model.layers.{layer_id}.self_attn.attn"
+            kvcaches[attention_name] = (
+                FakeTensor(next_ptr, 32768),
+                FakeTensor(next_ptr + 0x100000, 32768),
+            )
+            next_ptr += 0x200000
+            if layer_id >= 3:
+                indexer_name = f"{attention_name}.index_cache"
+                indexer_ptrs[layer_id] = next_ptr
+                kvcaches[indexer_name] = (
+                    FakeTensor(next_ptr, 32768, dimensions=3),
+                )
+                next_ptr += 0x100000
+        vllm_config = SimpleNamespace(
+            additional_config={},
+            parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(
+                    model_type="minimax_m3_text",
+                    num_hidden_layers=60,
+                    sparse_attention_config={"use_sparse_attention": True},
+                )
+            ),
+        )
+
+        layout = SharedIndexerKVCacheLayout(
+            kvcaches,
+            {"use_layerwise": True},
+            vllm_config,
+            SimpleNamespace(num_blocks=2),
+        )
+
+        self.assertEqual(layout.tensor_size_list, [32768, 32768, 32768])
+        self.assertEqual(layout.base_ptrs.shape, (60, 3))
+        np.testing.assert_array_equal(layout.base_ptrs[:3, 2], [0, 0, 0])
+        self.assertEqual(layout.base_ptrs[3, 2], indexer_ptrs[3])
+        self.assertEqual(layout.base_ptrs[59, 2], indexer_ptrs[59])
+        np.testing.assert_array_equal(layout.block_stride_lists[:3, 2], [0, 0, 0])
+        self.assertTrue(np.all(layout.block_stride_lists[3:, 2] == 32768))
+        self.assertTrue(np.all(layout.buffer_sizes[3:, 2] == 65536))
+
     def test_shared_indexer_layout_supports_cuda(self):
         supports_globals = SharedIndexerKVCacheLayout.supports.__func__.__globals__
         original_platform = supports_globals["current_platform"]
@@ -342,6 +439,12 @@ class KVCacheLayoutTest(unittest.TestCase):
         self.assertEqual(
             SharedIndexerKVCacheLayout._cache_role(
                 "model.layers.0.self_attn.indexer.k_cache"
+            ),
+            "indexer",
+        )
+        self.assertEqual(
+            SharedIndexerKVCacheLayout._cache_role(
+                "model.layers.0.self_attn.attn.index_cache"
             ),
             "indexer",
         )

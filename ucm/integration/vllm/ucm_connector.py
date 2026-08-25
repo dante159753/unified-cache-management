@@ -92,6 +92,29 @@ def _has_shared_indexer_layers(vllm_config: "VllmConfig") -> bool:
     return False
 
 
+def _has_minimax_m3_sparse_indexer(vllm_config: "VllmConfig") -> bool:
+    model_config = getattr(vllm_config, "model_config", None)
+    configs = (
+        getattr(model_config, "hf_text_config", None),
+        getattr(model_config, "hf_config", None),
+        getattr(getattr(model_config, "hf_config", None), "text_config", None),
+    )
+    for config in configs:
+        model_type = str(getattr(config, "model_type", "")).lower()
+        if not model_type.startswith("minimax_m3"):
+            continue
+        sparse_config = getattr(config, "sparse_attention_config", None)
+        if isinstance(sparse_config, dict):
+            use_sparse_attention = sparse_config.get("use_sparse_attention", False)
+        else:
+            use_sparse_attention = getattr(
+                sparse_config, "use_sparse_attention", False
+            )
+        if use_sparse_attention:
+            return True
+    return False
+
+
 def _short_list(values: list[int], limit: int = 12) -> list[int]:
     return values[:limit]
 
@@ -395,7 +418,10 @@ class KVCacheLayout:
                 )
         elif isinstance(kv_layer, Tuple):
             for tensor in kv_layer:
-                handle_tensor(tensor, (-3, -2, -1))
+                if tensor.dim() == 3:
+                    handle_tensor(tensor, (-2, -1))
+                else:
+                    handle_tensor(tensor, (-3, -2, -1))
         else:
             raise TypeError(
                 f"Unsupported KV cache type: layer={layer_name}, "
@@ -530,7 +556,7 @@ class KVCacheLayout:
 
 
 class SharedIndexerKVCacheLayout(KVCacheLayout):
-    """Layerwise layout for checkpoint-level shared Indexer models.
+    """Layerwise layout for models with per-layer Indexer side caches.
 
     Missing semantic slots use ``base_ptr=0`` and ``block_stride=0``. This keeps
     their computed device address at nullptr for every block without adding
@@ -540,7 +566,7 @@ class SharedIndexerKVCacheLayout(KVCacheLayout):
     TENSOR_ROLE_PATTERNS = {
         "indexer": (
             re.compile(
-                r"(?:^|\.)indexer(?:\.|$)",
+                r"(?:^|\.)(?:indexer|index_cache)(?:\.|$)",
                 re.IGNORECASE,
             ),
         ),
@@ -553,7 +579,10 @@ class SharedIndexerKVCacheLayout(KVCacheLayout):
         return (
             bool(ucm_config.get("use_layerwise", False))
             and device_type in ("npu", "cuda")
-            and _has_shared_indexer_layers(vllm_config)
+            and (
+                _has_shared_indexer_layers(vllm_config)
+                or _has_minimax_m3_sparse_indexer(vllm_config)
+            )
         )
 
     @staticmethod

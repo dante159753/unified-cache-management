@@ -73,9 +73,11 @@ def _read_vllm_ascend_version_raw() -> Optional[str]:
 def _norm_vllm_ascend_version(v: Optional[str]) -> Optional[str]:
     if not v:
         return None
-    # common suffixes: 0.11.0.post1 / 0.11.0rc1
+    # common suffixes: 0.11.0.post1 / 0.11.0rc1 / 0.11.0.dev1
+    v = v.split("+", 1)[0]
     v = v.split(".post", 1)[0]
     v = v.split("rc", 1)[0]
+    v = v.split(".dev", 1)[0]
     return v
 
 
@@ -87,6 +89,33 @@ def get_vllm_ascend_version_full() -> Optional[str]:
 def get_vllm_ascend_version() -> Optional[str]:
     """Detect normalized vllm_ascend version (e.g. 0.18.0rc1 -> 0.18.0)."""
     return _norm_vllm_ascend_version(_read_vllm_ascend_version_raw())
+
+
+def get_vllm_ascend_patch_version(
+    vllm_version: Optional[str] = None,
+) -> Optional[str]:
+    raw_version = _read_vllm_ascend_version_raw()
+    ascend_version = _norm_vllm_ascend_version(raw_version)
+    if not raw_version or ".dev" not in raw_version:
+        return ascend_version
+
+    if vllm_version is None:
+        vllm_version = get_vllm_version()
+    compatible_version = _norm_vllm_ascend_version(vllm_version)
+    if (
+        compatible_version
+        and compatible_version != ascend_version
+        and compatible_version in get_supported_versions()
+    ):
+        logger.warning(
+            "vllm-ascend reports development version %s, but vLLM is %s; "
+            "using %s for vllm-ascend patch selection.",
+            raw_version,
+            vllm_version,
+            compatible_version,
+        )
+        return compatible_version
+    return ascend_version
 
 
 _vllm_version: Optional[str] = None
@@ -151,7 +180,7 @@ def apply_all_patches() -> None:
                 f"Versions applicable for UCM patches: {', '.join(supported_versions)}."
             )
 
-        ascend_version = get_vllm_ascend_version()
+        ascend_version = get_vllm_ascend_patch_version(version)
         # UCM PATCH: vllm-ascend registers UCMConnector as an alias for the
         # concrete UCMConnectorV1 class used by MultiConnector metrics.
         if ascend_version in {
