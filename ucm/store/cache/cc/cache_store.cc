@@ -78,6 +78,15 @@ public:
         if (!res) [[unlikely]] { UC_ERROR("Failed({}) to lookup blocks({}).", res.Error(), num); }
         return res;
     }
+    Expected<std::vector<DataLocation>> LookupDataLocation(const Detail::Shard* shards,
+                                                           size_t num) override
+    {
+        auto result = bufferMgr_.LookupDataLocation(shards, num);
+        if (!result) {
+            UC_ERROR("Failed({}) to locate shards({}).", result.Error(), num);
+        }
+        return result;
+    }
     Expected<ssize_t> LookupOnPrefix(const Detail::BlockId* blocks, size_t num) override
     {
         auto res = bufferMgr_.LookupOnPrefix(blocks, num);

@@ -556,6 +556,28 @@ bool TransBuffer::Exist(const Detail::BlockId& blockId, size_t shardIdx)
     return exist;
 }
 
+bool TransBuffer::Probe(const Detail::BlockId& blockId, size_t shardIdx, State& state)
+{
+    auto iBucket = Hash(blockId, shardIdx);
+    strategy_->BucketLock(iBucket);
+    auto iNode = strategy_->FirstAt(iBucket);
+    while (iNode != invalidIndex) {
+        auto meta = strategy_->MetaAt(iNode);
+        strategy_->NodeLock(iNode);
+        if (meta->block == blockId && meta->shard == shardIdx) {
+            state = meta->state;
+            strategy_->NodeUnlock(iNode);
+            strategy_->BucketUnlock(iBucket);
+            return true;
+        }
+        auto next = meta->next;
+        strategy_->NodeUnlock(iNode);
+        iNode = next;
+    }
+    strategy_->BucketUnlock(iBucket);
+    return false;
+}
+
 bool TransBuffer::ExistAt(size_t iBucket, const Detail::BlockId& blockId, size_t shardIdx)
 {
     auto iNode = strategy_->FirstAt(iBucket);

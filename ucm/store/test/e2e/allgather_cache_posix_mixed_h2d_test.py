@@ -176,9 +176,7 @@ def _seed_posix(
     tasks = []
     for block_ids in requests:
         owned = [
-            block_id
-            for block_id in block_ids
-            if _owner(block_id, world_size) == rank
+            block_id for block_id in block_ids if _owner(block_id, world_size) == rank
         ]
         if owned:
             tasks.append(store.dump(owned, [0] * len(owned), [[packed]] * len(owned)))
@@ -231,6 +229,7 @@ def _run_round(
     requests: list[list[bytes]],
     tensors,
     device: str,
+    batch_load_requests: bool,
 ) -> dict[str, float]:
     request_tensors = []
     offset = 0
@@ -241,19 +240,21 @@ def _run_round(
     dist.barrier()
     _synchronize(torch, "npu")
     started = time.perf_counter()
-    tasks = [
-        store.load(block_ids, [0] * len(block_ids), dst)
-        for block_ids, dst in zip(requests, request_tensors)
-    ]
+    if batch_load_requests:
+        flat_ids = [block_id for request in requests for block_id in request]
+        tasks = [store.load(flat_ids, [0] * len(flat_ids), tensors)]
+    else:
+        tasks = [
+            store.load(block_ids, [0] * len(block_ids), dst)
+            for block_ids, dst in zip(requests, request_tensors)
+        ]
     submitted = time.perf_counter()
     for task in tasks:
         store.wait(task)
     _synchronize(torch, "npu")
     completed = time.perf_counter()
     return {
-        "submit_seconds": _group_max_seconds(
-            torch, dist, submitted - started, device
-        ),
+        "submit_seconds": _group_max_seconds(torch, dist, submitted - started, device),
         "wait_seconds": _group_max_seconds(torch, dist, completed - submitted, device),
         "total_seconds": _group_max_seconds(torch, dist, completed - started, device),
     }
@@ -346,7 +347,13 @@ def _worker(
             _warm_cache(load_store, requests, tensors, positions)
             _synchronize(torch, "npu")
             record = _run_round(
-                torch, dist, load_store, requests, tensors, device
+                torch,
+                dist,
+                load_store,
+                requests,
+                tensors,
+                device,
+                args.batch_load_requests,
             )
             if placement is None:
                 flat_ids = [block_id for request in requests for block_id in request]
@@ -396,6 +403,7 @@ def _worker(
                 "devices": list(devices),
                 "input_tokens": args.input_tokens,
                 "concurrency": args.concurrency,
+                "batch_load_requests": args.batch_load_requests,
                 "aggregate_input_tokens": args.input_tokens * args.concurrency,
                 "block_tokens": args.block_tokens,
                 "blocks_per_request": args.blocks_per_request,
@@ -487,6 +495,7 @@ def main() -> None:
     parser.add_argument("--timeout-ms", type=int, default=300000)
     parser.add_argument("--master-port", type=int, default=0)
     parser.add_argument("--print-each", action="store_true")
+    parser.add_argument("--batch-load-requests", action="store_true")
     args = parser.parse_args()
 
     args.devices = _parse_devices(parser, args.devices)
@@ -498,21 +507,24 @@ def main() -> None:
     ]
     tensor_sizes = _parse_tensor_bytes(parser, args.tensor_bytes)
     shard_size = _aligned_size(tensor_sizes)
-    if min(
-        args.input_tokens,
-        args.concurrency,
-        args.block_tokens,
-        args.iterations,
-        args.load_slots,
-        args.receive_slots,
-        args.cache_capacity_gb,
-        args.cache_streams,
-        args.collective_buffer_mb,
-        args.scatter_aiv_cores,
-        args.posix_concurrency,
-        args.posix_lookup_concurrency,
-        args.timeout_ms,
-    ) <= 0:
+    if (
+        min(
+            args.input_tokens,
+            args.concurrency,
+            args.block_tokens,
+            args.iterations,
+            args.load_slots,
+            args.receive_slots,
+            args.cache_capacity_gb,
+            args.cache_streams,
+            args.collective_buffer_mb,
+            args.scatter_aiv_cores,
+            args.posix_concurrency,
+            args.posix_lookup_concurrency,
+            args.timeout_ms,
+        )
+        <= 0
+    ):
         parser.error("numeric size and concurrency arguments must be positive")
     if args.warmup < 0:
         parser.error("--warmup must be non-negative")

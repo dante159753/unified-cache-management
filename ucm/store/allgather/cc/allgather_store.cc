@@ -31,13 +31,7 @@ constexpr uint32_t kDefaultCollectiveBufferMb = 8;
 constexpr size_t kDefaultLoadSlots = 2;
 constexpr size_t kDefaultDumpSlots = 2;
 constexpr size_t kDefaultReceiveSlots = 2;
-constexpr double kDefaultBackendWaitTimeoutMs = 300000.0;
 using Clock = std::chrono::steady_clock;
-/* Backend readiness has to be polled, so back off instead of spinning: on
- * networked storage a window can take milliseconds and the progress thread is
- * shared by every task in the process. */
-constexpr auto kBackendPollMinSleep = std::chrono::microseconds(5);
-constexpr auto kBackendPollMaxSleep = std::chrono::microseconds(100);
 
 Status ParseCollectiveMode(const std::string& value, uint32_t* mode, std::string* canonical)
 {
@@ -227,7 +221,6 @@ struct PendingBackend {
     size_t slot{};
     Detail::TaskHandle handle{};
     bool submitted{false};
-    bool abandoned{false};
     Status status{Status::OK()};
     size_t ownedRows{};
     Clock::time_point slotReadyAt;
@@ -237,6 +230,7 @@ struct PendingBackend {
 
 struct LoadMetrics {
     double queueWaitMs{};
+    double placementMs{};
     double slotWaitMs{};
     double backendSubmitMs{};
     double backendWaitMs{};
@@ -355,6 +349,11 @@ struct TaskState {
     HostBuffer<uint32_t> hostError;
     DeviceBuffer destinations;
     HostBuffer<uint64_t> hostDestinations;
+    DeviceBuffer locationSend;
+    DeviceBuffer locationReceive;
+    HostBuffer<uint8_t> hostLocationSend;
+    HostBuffer<uint8_t> hostLocationReceive;
+    bool placementRequired{false};
     EventHandle metadataReady{nullptr};
     Clock::time_point queuedAt;
     Clock::time_point enqueuedAt;
@@ -413,7 +412,6 @@ public:
         config.GetNumber("allgather_load_groups", requestedLoadGroups_);
         config.GetNumber("allgather_dump_slots", dumpSlotCount_);
         config.GetNumber("allgather_receive_slots", receiveSlotCount_);
-        config.GetNumber("allgather_backend_wait_timeout_ms", backendWaitTimeoutMs_);
         config.GetNumber("allgather_hccl_buffer_mb", collectiveBufferMb_);
         config.GetNumber("allgather_collective_buffer_mb", collectiveBufferMb_);
         config.Get("allgather_collective_mode", collectiveModeName_);
@@ -459,9 +457,6 @@ public:
         }
         // More landing areas than stageable windows cannot be reached.
         receiveSlotCount_ = std::min(receiveSlotCount_, loadSlotCount_);
-        if (backendWaitTimeoutMs_ <= 0.0) {
-            return Status::InvalidParam("allgather backend wait timeout must be positive");
-        }
         if (requestedLoadGroups_ > 1) {
             // Several communicators driving concurrent collectives on one device
             // is what the reference HCCL users on Ascend deliberately avoid, and
@@ -712,7 +707,10 @@ private:
                                 stageTraceSampleEvery_ > 0 &&
                                 sequence % stageTraceSampleEvery_ == 0;
         auto task = std::make_shared<TaskState>(operation, std::move(input), sequence, profile,
-                                                stageTrace, platform_);
+                                                 stageTrace, platform_);
+        task->windows = BuildWindows(task->input, operation);
+        task->placementRequired = operation == TaskState::Operation::Load && collectiveEnabled_ &&
+                                  !loadBackendOnly_ && task->windows.size() > 1;
         if (operation == TaskState::Operation::Load && collectiveEnabled_ && !loadBackendOnly_) {
             auto status = task->deviceError.Allocate(platform_, sizeof(uint32_t), true);
             if (status.Failure()) { return status; }
@@ -735,13 +733,24 @@ private:
                 }
                 status = platform_->CreateEvent(&task->metadataReady);
                 if (status.Failure()) { return status; }
+                if (task->placementRequired) {
+                    status = task->locationSend.Allocate(platform_, task->input.size());
+                    if (status.Failure()) { return status; }
+                    status = task->locationReceive.Allocate(
+                        platform_, task->input.size() * worldSize_);
+                    if (status.Failure()) { return status; }
+                    status = task->hostLocationSend.Allocate(platform_, task->input.size());
+                    if (status.Failure()) { return status; }
+                    status = task->hostLocationReceive.Allocate(
+                        platform_, task->input.size() * worldSize_);
+                    if (status.Failure()) { return status; }
+                }
             }
         }
         if (operation == TaskState::Operation::Load && asyncCompletion_) {
             auto status = platform_->CreateEvent(&task->completion);
             if (status.Failure()) { return status; }
         }
-        task->windows = BuildWindows(task->input, operation);
         const auto handle = nextHandle_.fetch_add(1);
         size_t queueDepth = 0;
         {
@@ -785,23 +794,32 @@ private:
         return Detail::TaskHandle(handle);
     }
 
-    std::vector<WindowPlan> BuildWindows(const Detail::TaskDesc& input,
-                                         TaskState::Operation operation) const
+    std::vector<WindowPlan> BuildWindows(
+        const Detail::TaskDesc& input, TaskState::Operation operation,
+        const std::vector<DataLocation>* locations = nullptr) const
     {
         const auto storageWorldSize =
             operation == TaskState::Operation::Load ? loadStorageWorldSize_ : dumpStorageWorldSize_;
         std::vector<size_t> counts(storageWorldSize, 0);
         std::vector<uint32_t> owners(input.size());
         std::vector<size_t> ownerSlots(input.size());
+        std::vector<size_t> order(input.size());
+        std::iota(order.begin(), order.end(), 0);
+        if (locations != nullptr) {
+            std::stable_sort(order.begin(), order.end(), [locations](size_t lhs, size_t rhs) {
+                return static_cast<uint8_t>((*locations)[lhs]) >
+                       static_cast<uint8_t>((*locations)[rhs]);
+            });
+        }
         size_t windowCount = 0;
-        for (size_t row = 0; row < input.size(); ++row) {
+        for (const auto row : order) {
             owners[row] = Owner(input[row].owner, storageWorldSize);
             ownerSlots[row] = counts[owners[row]]++;
             windowCount = std::max(windowCount, ownerSlots[row] / windowBlocks_ + 1);
         }
         std::vector<WindowPlan> windows(windowCount);
         for (auto& window : windows) { window.ownerCounts.assign(storageWorldSize, 0); }
-        for (size_t row = 0; row < input.size(); ++row) {
+        for (const auto row : order) {
             const size_t window = ownerSlots[row] / windowBlocks_;
             windows[window].rows.push_back(row);
             windows[window].owners.push_back(owners[row]);
@@ -823,11 +841,92 @@ private:
         return windows;
     }
 
+    Status PrepareLoadPlan(const std::shared_ptr<TaskState>& task, PlatformRuntime& platform,
+                           CollectiveHandle collective, LoadMetrics& metrics)
+    {
+        const auto started = Clock::now();
+        if (!task->placementRequired) {
+            metrics.windows = task->windows.size();
+            return Status::OK();
+        }
+        std::vector<DataLocation> locations(task->input.size(), DataLocation::MISSING);
+        std::vector<Detail::Shard> localShards;
+        std::vector<size_t> localRows;
+        localShards.reserve(task->input.size());
+        localRows.reserve(task->input.size());
+        for (size_t row = 0; row < task->input.size(); ++row) {
+            if (Owner(task->input[row].owner, loadStorageWorldSize_) != loadStorageRank_) {
+                continue;
+            }
+            localShards.push_back(
+                {task->input[row].owner, task->input[row].index, {}});
+            localRows.push_back(row);
+        }
+
+        Status lookupStatus = Status::OK();
+        if (!localShards.empty()) {
+            auto result = backend_->LookupDataLocation(localShards.data(), localShards.size());
+            if (!result) {
+                lookupStatus = result.Error();
+            } else if (result.Value().size() != localRows.size()) {
+                lookupStatus = Status::Error("location lookup returned unexpected result size");
+            } else {
+                std::vector<Detail::Shard> prefetch;
+                for (size_t i = 0; i < localRows.size(); ++i) {
+                    locations[localRows[i]] = result.Value()[i];
+                    if (result.Value()[i] == DataLocation::BACKEND) {
+                        prefetch.push_back(localShards[i]);
+                    }
+                }
+                if (!prefetch.empty()) { backend_->Prefetch(prefetch.data(), prefetch.size()); }
+            }
+        }
+
+        if (collectiveEnabled_) {
+            std::memset(task->hostLocationSend.data, 0, task->hostLocationSend.count);
+            for (const auto row : localRows) {
+                task->hostLocationSend.data[row] = static_cast<uint8_t>(locations[row]);
+            }
+            const auto stream = runtime_->CollectiveStream();
+            auto status = platform.CopyHostToDevice(
+                task->locationSend.data, task->locationSend.size,
+                task->hostLocationSend.data, task->hostLocationSend.count, stream);
+            if (status.Success()) {
+                status = platform.AllGather(task->locationSend.data, task->locationReceive.data,
+                                            task->input.size(), collective, stream);
+            }
+            if (status.Success()) {
+                status = platform.CopyDeviceToHost(
+                    task->hostLocationReceive.data, task->hostLocationReceive.count,
+                    task->locationReceive.data, task->locationReceive.size, stream);
+            }
+            if (status.Success()) { status = platform.SynchronizeStream(stream); }
+            if (status.Failure()) {
+                return Status::StoreUnhealthy(
+                    fmt::format("allgather placement exchange failed: {}", status));
+            }
+            for (size_t row = 0; row < task->input.size(); ++row) {
+                const auto owner = Owner(task->input[row].owner, worldSize_);
+                const auto encoded = task->hostLocationReceive.data[
+                    owner * task->input.size() + row];
+                if (encoded <= static_cast<uint8_t>(DataLocation::CACHE_READY)) {
+                    locations[row] = static_cast<DataLocation>(encoded);
+                } else {
+                    locations[row] = DataLocation::MISSING;
+                }
+            }
+        }
+        task->windows = BuildWindows(task->input, TaskState::Operation::Load, &locations);
+        metrics.windows = task->windows.size();
+        metrics.placementMs = Milliseconds(Clock::now() - started);
+        return lookupStatus;
+    }
+
     PendingBackend SubmitLoadWindow(const std::shared_ptr<TaskState>& task, size_t windowIndex,
                                     size_t slotIndex, LoadMetrics& metrics)
     {
         auto& slot = *loadSlots_[slotIndex];
-        PendingBackend pending{windowIndex, slotIndex, 0, false, false, Status::OK()};
+        PendingBackend pending{windowIndex, slotIndex, 0, false, Status::OK()};
         try {
             // The caller only hands over slots whose previous AllGather has
             // already consumed the send buffer, so no synchronization is needed
@@ -962,39 +1061,12 @@ private:
         submitReadyWindows();
         while (!active.empty()) {
             const auto waitStarted = Clock::now();
-            auto ready = active.end();
-            auto backoff = kBackendPollMinSleep;
-            while (ready == active.end()) {
-                for (auto candidate = active.begin(); candidate != active.end(); ++candidate) {
-                    if (candidate->status.Failure() || !candidate->submitted) {
-                        ready = candidate;
-                        break;
-                    }
-                    auto checked = backend_->Check(candidate->handle);
-                    if (!checked) {
-                        candidate->status = checked.Error();
-                        ready = candidate;
-                        break;
-                    }
-                    if (!checked.Value()) { continue; }
-                    candidate->status = backend_->Wait(candidate->handle);
-                    ready = candidate;
-                    break;
-                }
-                if (ready != active.end()) { break; }
-                if (Milliseconds(Clock::now() - waitStarted) > backendWaitTimeoutMs_) {
-                    ready = active.begin();
-                    ready->status = Status::Error(fmt::format(
-                        "allgather backend-only load exceeded {}ms", backendWaitTimeoutMs_));
-                    if (ready->submitted) { (void)backend_->Wait(ready->handle); }
-                    break;
-                }
-                std::this_thread::sleep_for(backoff);
-                backoff = std::min(backoff * 2, kBackendPollMaxSleep);
+            auto pending = std::move(active.front());
+            active.pop_front();
+            if (pending.status.Success() && pending.submitted) {
+                pending.status = backend_->Wait(pending.handle);
             }
             metrics.backendWaitMs += Milliseconds(Clock::now() - waitStarted);
-            auto pending = *ready;
-            active.erase(ready);
             if (pending.status.Failure() && firstError.Success()) { firstError = pending.status; }
             freeSlots.push_back(pending.slot);
             submitReadyWindows();
@@ -1012,18 +1084,22 @@ private:
             return;
         }
         (void)stream;
-        (void)collective;
         const auto taskStarted = Clock::now();
         LoadMetrics metrics;
         metrics.queueWaitMs = Milliseconds(taskStarted - task->queuedAt);
-        metrics.windows = task->windows.size();
         Status firstError = Status::OK();
         Status localBackendError = Status::OK();
         bool collectiveFailed = false;
         std::deque<PendingBackend> active;
-        // Windows whose backend timed out. Their send buffer may still be written
-        // by the backend, so the slot stays out of circulation until the drain.
-        std::vector<PendingBackend> abandoned;
+        auto planStatus = PrepareLoadPlan(task, platform, collective, metrics);
+        if (IsFatalCommunication(planStatus)) {
+            runtime_->Poison(planStatus);
+            metrics.totalMs = Milliseconds(Clock::now() - taskStarted);
+            RecordLoadMetrics(metrics, task->profile);
+            Finish(task, planStatus);
+            return;
+        }
+        if (planStatus.Failure()) { firstError = planStatus; }
         std::vector<TimingWindow> timingWindows;
         std::vector<StageTraceRecord> stageTraceRecords;
         if (task->stageTrace) { stageTraceRecords.reserve(task->windows.size()); }
@@ -1036,7 +1112,6 @@ private:
             }
         }
         size_t nextWindow = 0;
-        Prefetch(task->input.data(), task->input.size());
         // A slot is busy from the moment the backend refills its send buffer
         // until the AllGather reading that buffer completes. With asynchronous
         // completion a task returns before its device work drains, so this state
@@ -1131,49 +1206,15 @@ private:
         reclaimSlots(true);
         submitReadyWindows();
         while (!active.empty()) {
-            // Pick whichever window the backend finished first. On networked
-            // storage reads land out of order, so a fixed window order would
-            // stall every round on one straggler.
             const auto waitStarted = Clock::now();
             const auto backendWaitStartedAt = waitStarted;
-            auto ready = active.end();
-            auto backoff = kBackendPollMinSleep;
-            while (true) {
-                for (auto candidate = active.begin(); candidate != active.end(); ++candidate) {
-                    if (candidate->status.Failure() || !candidate->submitted) {
-                        ready = candidate;
-                        break;
-                    }
-                    auto checked = backend_->Check(candidate->handle);
-                    if (!checked) {
-                        candidate->status = checked.Error();
-                        ready = candidate;
-                        break;
-                    }
-                    if (!checked.Value()) { continue; }
-                    candidate->status = backend_->Wait(candidate->handle);
-                    ready = candidate;
-                    break;
-                }
-                if (ready != active.end()) { break; }
-                if (Milliseconds(Clock::now() - waitStarted) > backendWaitTimeoutMs_) {
-                    // Fail this round rather than hang: the frame marks its rows
-                    // failed and the collective sequence still runs to the end, so
-                    // peer ranks are not left waiting on a missing contribution.
-                    ready = active.begin();
-                    ready->status = Status::Error(fmt::format(
-                        "allgather backend load exceeded {}ms", backendWaitTimeoutMs_));
-                    ready->abandoned = true;
-                    abandoned.push_back(*ready);
-                    break;
-                }
-                std::this_thread::sleep_for(backoff);
-                backoff = std::min(backoff * 2, kBackendPollMaxSleep);
+            auto pending = std::move(active.front());
+            active.pop_front();
+            if (pending.status.Success() && pending.submitted) {
+                pending.status = backend_->Wait(pending.handle);
             }
             const auto backendReadyAt = Clock::now();
             metrics.backendWaitMs += Milliseconds(backendReadyAt - waitStarted);
-            auto pending = *ready;
-            active.erase(ready);
             auto& slot = *loadSlots_[pending.slot];
             // Receive slots rotate with the collective order, which is the same on
             // every rank. Metadata copies and the scatter run on that slot's
@@ -1305,7 +1346,7 @@ private:
             taskReceiveSlots[receiveIndex] = true;
             recyclingReceiveSlots.push_back(receiveIndex);
             slot.inFlight = true;
-            if (!pending.abandoned) { recyclingSlots.push_back(pending.slot); }
+            recyclingSlots.push_back(pending.slot);
             if (collectiveFailed) { break; }
             // Issue the next collective before paying for slot recycling: the
             // host only blocks when every slot is genuinely still in flight.
@@ -1319,14 +1360,6 @@ private:
         for (const auto& entry : active) {
             // The loop stopped early; these backend loads still own their slots.
             if (entry.submitted) { (void)backend_->Wait(entry.handle); }
-            loadSlots_[entry.slot]->inFlight = false;
-        }
-        for (const auto& entry : abandoned) {
-            // Every collective has been issued by now, so peers are not blocked
-            // while this drains. It bounds the damage of a stuck backend read to
-            // this task instead of letting a stale write land in the next one.
-            auto status = backend_->Wait(entry.handle);
-            if (status.Failure() && localBackendError.Success()) { localBackendError = status; }
             loadSlots_[entry.slot]->inFlight = false;
         }
         const auto completionStream = runtime_->CompletionStream();
@@ -1412,6 +1445,8 @@ private:
                                  static_cast<double>(metrics.windows));
         UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_task_queue_wait_ms"),
                                  metrics.queueWaitMs);
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_load_placement_ms"),
+                                 metrics.placementMs);
         UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_load_slot_reclaim_wait_ms"),
                                  metrics.slotWaitMs);
         UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_load_backend_submit_ms"),
@@ -1429,14 +1464,15 @@ private:
         UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_load_scatter_device_ms"),
                                  metrics.scatterDeviceMs);
         UC_INFO(
-            "AllGather load profile: queue_ms={:.3f}, slot_ms={:.3f}, "
+            "AllGather load profile: queue_ms={:.3f}, placement_ms={:.3f}, slot_ms={:.3f}, "
             "backend_submit_ms={:.3f}, backend_wait_ms={:.3f}, "
             "collective_submit_ms={:.3f}, collective_device_ms={:.3f}, "
             "scatter_submit_ms={:.3f}, scatter_device_ms={:.3f}, "
             "sync_ms={:.3f}, total_ms={:.3f}, windows={}.",
-            metrics.queueWaitMs, metrics.slotWaitMs, metrics.backendSubmitMs, metrics.backendWaitMs,
-            metrics.collectiveSubmitMs, metrics.collectiveDeviceMs, metrics.scatterSubmitMs,
-            metrics.scatterDeviceMs, metrics.syncMs, metrics.totalMs, metrics.windows);
+            metrics.queueWaitMs, metrics.placementMs, metrics.slotWaitMs, metrics.backendSubmitMs,
+            metrics.backendWaitMs, metrics.collectiveSubmitMs, metrics.collectiveDeviceMs,
+            metrics.scatterSubmitMs, metrics.scatterDeviceMs, metrics.syncMs, metrics.totalMs,
+            metrics.windows);
     }
 
     static std::pair<std::vector<uint64_t>, std::vector<uint32_t>> BalanceDescriptors(
@@ -1493,7 +1529,7 @@ private:
                            window.ownerSlots[i] * shardSize_};
             backendTask.push_back(std::move(shard));
         }
-        PendingBackend pending{windowIndex, slotIndex, 0, false, false, Status::OK()};
+        PendingBackend pending{windowIndex, slotIndex, 0, false, Status::OK()};
         if (backendTask.empty()) { return pending; }
         auto balanced = BalanceDescriptors(std::move(descriptors));
         auto status = Status::OK();
@@ -1635,7 +1671,6 @@ private:
     size_t loadSlotCount_{kDefaultLoadSlots};
     size_t requestedLoadGroups_{1};
     size_t receiveSlotCount_{kDefaultReceiveSlots};
-    double backendWaitTimeoutMs_{kDefaultBackendWaitTimeoutMs};
     size_t dumpSlotCount_{kDefaultDumpSlots};
     uint32_t collectiveBufferMb_{kDefaultCollectiveBufferMb};
     std::string collectiveModeName_{"host"};

@@ -233,7 +233,6 @@ def _make_store_config(
                 "allgather_separate_dump_queue": not args.shared_dump_queue,
                 "allgather_collective_count_crop": not args.disable_count_crop,
                 "allgather_scatter_aiv_cores": args.scatter_aiv_cores,
-                "allgather_dynamic_windows": not args.disable_dynamic_windows,
                 "allgather_load_backend_only": args.load_backend_only,
             }
         )
@@ -427,7 +426,6 @@ def _print_summary(
         f"blocks={args.blocks}, inflight_tasks={args.inflight_tasks}, dtype={args.dtype}, "
         f"mixed_dump={args.mixed_dump}, local_coalesced={args.local_coalesced}, "
         f"scatter_only={args.scatter_only}, "
-        f"dynamic_windows={not args.disable_dynamic_windows}, "
         f"tensor_count={len(workload.tensor_shapes)}"
     )
     print(f"tensor_shapes={list(workload.tensor_shapes)}")
@@ -595,7 +593,6 @@ def _build_parser(direction: str, store_mode: str) -> argparse.ArgumentParser:
     )
     parser.set_defaults(variable_counts=None)
     parser.add_argument("--scatter-aiv-cores", type=int, default=1)
-    parser.add_argument("--disable-dynamic-windows", action="store_true")
     parser.add_argument(
         "--fake-load-delay-us",
         type=lambda value: [int(delay) for delay in value.split(",")],

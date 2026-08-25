@@ -37,7 +37,6 @@ PipelineStore configuration plus:
 | `allgather_collective_mode` | `host` | Collective engine: `host`, `aicpu_ts`, `aiv`, or `auto` |
 | `allgather_collective_variable_counts` | `true` | Use `HcclAllGatherV` for deterministic single-window loads and omit unused payload slots |
 | `allgather_scatter_aiv_cores` | 1 | Maximum AIV cores used by one load scatter kernel, in `[1, 40]` |
-| `allgather_dynamic_windows` | false | Dispatches whichever in-flight owner load completes first instead of waiting in source-window order |
 
 The actual window is reduced if the requested window does not fit the budget.
 Initialization fails when even one block per rank cannot fit. The store logs
@@ -46,10 +45,15 @@ and configured capacity.
 
 ## Ownership and windowing
 
-For a block id `b`, `owner(b) = little_endian_u64(b[0:8]) % TP`. Owner-local
-slot numbers are assigned in input order. Window `j` contains every block whose
-owner-local slot is in `[jW, (j+1)W)`. Every rank derives the same load windows
-without exchanging metadata.
+For a block id `b`, `owner(b) = little_endian_u64(b[0:8]) % TP`. Before load,
+each owner classifies its rows as Cache READY, Cache LOADING, backend-only, or
+missing. A single one-byte-per-row AllGather gives every rank the same placement
+table. Rows are stably ordered by that table and then assigned owner-local slot
+numbers. Window `j` contains every block whose owner-local slot is in
+`[jW, (j+1)W)`. Cache-ready rows therefore enter early windows without allowing
+rank-local completion timing to alter collective order. A request that already
+fits one window skips placement lookup, buffers, and exchange because no ordering
+decision exists.
 
 In rank-local aggregation mode the effective storage world size is one, so all
 local blocks are owned and window slots follow input order.
@@ -67,8 +71,8 @@ All collectives use fixed tensors:
 `S` is the direct-I/O-aligned Store shard size. Unused send slots may contain
 old data but are never referenced by scatter descriptors.
 
-The completion-ordered load path keeps the collective allocation fixed but
-formats each rank contribution as a self-describing frame:
+The load path keeps the collective allocation fixed and formats each rank
+contribution as a self-describing frame:
 
 ```text
 [frame header][block records][compacted shard payload][unused tail]
@@ -76,12 +80,11 @@ formats each rank contribution as a self-describing frame:
 
 The header identifies the task sequence and source window and gives the number
 of valid block records. A block record identifies its task-global destination
-row, payload slot, and status. Metadata travels in the same fixed-size
-AllGather as the payload; there is no shared-memory round plan and no metadata
-collective. Scatter parses every received rank frame on device and computes
-local tensor addresses from the task-wide destination table and immutable model
-layout. Different ranks may contribute different source windows to one
-collective because every record is self-describing.
+row, payload slot, and status. Frame metadata travels in the same fixed-size
+AllGather as the payload. Scatter parses every received rank frame on device and
+computes local tensor addresses from the task-wide destination table and
+immutable model layout. The preceding placement exchange fixes the window
+sequence identically on every rank.
 
 For a single-window load, every rank derives the same per-owner valid counts
 from the request. When variable counts are enabled, HcclAllGatherV transfers
@@ -130,7 +133,7 @@ Scatter-only payload memory is `Kl * W * S + Kd * W * S`.
 
 Persistent descriptor and offset buffers are included in the hard capacity
 calculation. Load-task metadata uses
-`blocks * (tensor_count * 8 + 8)` bytes outside the payload pool and is released
+`blocks * (tensor_count * 8 + TP + 1)` device bytes outside the payload pool and is released
 with its task.
 With the measured DeepSeek-V4 direct-layout shard `S = 3,186,688` bytes,
 `W=32`, `Kl=Kd=2`, payload is about 1.14 GiB at TP4 and 1.90 GiB at TP8.
@@ -138,12 +141,20 @@ Layerwise shards are much smaller; the 256 MiB default normally retains W=32.
 
 ## Load pipeline
 
-`load_data` immediately submits up to `Kl` owner-local PipelineStore loads, so
-POSIX/H2D starts before completion. With dynamic windows enabled, the progress
-worker polls all in-flight backend handles and processes whichever completes
-first:
+For the native PipelineStore implementation, the vLLM connector concatenates
+all synchronous requests in one scheduler batch before calling `load_data`.
+Direct mode therefore submits one Store task per scheduler batch, and layerwise
+mode submits one Store task per layer. Async requests and the legacy prepared
+Python implementation remain per request. A batched Store failure marks every
+request represented by that task as failed; vLLM will not consume any of their
+loaded tensors.
 
-1. poll the owner-local PipelineStore loads until any window is ready;
+The progress worker first performs one placement exchange. Backend-only rows are
+prefetched immediately, then the worker builds the same cache-tier-prioritized
+window list on every rank. It submits up to `Kl` owner-local PipelineStore loads,
+so later POSIX/H2D work overlaps the current collective:
+
+1. wait for the next fixed-order owner-local PipelineStore load;
 2. AllGather the fixed send payload into the slot receive payload;
 3. launch compact scatter into the original vLLM tensor addresses;
 4. record the slot completion event and submit the next window.
@@ -154,14 +165,11 @@ the current stream is synchronized once. A rank then reports its local failure
 to vLLM; the request-level load fails if any rank reports failure, so the store
 does not add a separate error collective.
 
-This removes head-of-line blocking when an earlier source window misses or has
-slower POSIX I/O. The Nth ready window always uses collective group and stream
-`N % load_group_count`, independent of its buffer slot. All ranks therefore
-submit the same collective ordinal to the same communicator even when their
-source-window completion orders differ. Every rank still submits exactly the
-same number of collectives for a task, while the task sequence prevents frames
-from crossing task boundaries. Setting `allgather_dynamic_windows=false`
-retains the source-window FIFO behavior for A/B validation.
+Tier ordering avoids placing known Cache-ready rows behind known POSIX rows while
+retaining one deterministic collective sequence. Runtime completion order does
+not participate in scheduling, and the backend is not polled with `Check()`.
+Every rank submits exactly the same number of collectives for a task, while the
+task sequence prevents frames from crossing task boundaries.
 
 This overlaps owner I/O for later windows with collective/scatter for the
 current window. A completed slot is reused after event query succeeds. If the
@@ -180,8 +188,7 @@ outside the scheduler thread. Metadata uploads record an event on the caller's
 stream; the progress stream waits for that event before scatter.
 `check` only reads task completion state and never waits for I/O or the device.
 `wait` blocks on the same completion condition. Keeping one progress worker per
-rank preserves task order; embedded global rows remove the former requirement
-that owner-local window readiness be identical.
+rank preserves task and collective order.
 The shared progressor owns one dedicated HCCL process group with the same TP
 membership, so its background collectives cannot interleave with model
 collectives on the vLLM TP group. The group is initialized with a barrier on
@@ -198,7 +205,7 @@ On an owner failure, the affected rank skips local scatter but still enters all
 payload collectives with its valid staging allocation, preserving collective
 order. The failing rank raises after the final stream synchronization.
 
-In the completion-ordered path, a backend miss or I/O failure produces a
+On load, a backend miss or I/O failure produces a
 `FAILED` block record with no payload instead of removing that block from the
 round. Every rank receives the record, skips its scatter, and marks the local
 task failed. This propagates owner data failures without an error AllReduce and
@@ -206,11 +213,9 @@ also guarantees that failed blocks count toward task completion. Collective,
 H2D, metadata-allocation, and kernel-launch failures remain rank-local runtime
 failures because a failed collective cannot carry its own error record.
 
-The current destination table is task-owned and remains alive until all slot
-events complete, so dynamic windows cannot write through reused metadata. A
-future cross-task completion scheduler would need a shared task table with
-`task_slot + generation`; that reuse mechanism is deliberately outside this
-phase.
+The current destination and placement tables are task-owned and remain alive
+until all slot events complete, so slot reuse cannot write through stale
+metadata.
 
 ## Dump pipeline
 
@@ -266,7 +271,7 @@ CacheStore/POSIX implementation.
 ## Constraints
 
 - All TP ranks must submit load tasks in the same order and with identical task
-  row layouts. Source-window completion order may differ by rank.
+  row layouts. The placement exchange establishes one fixed window order.
 - Load-pool mutation is owned by the per-rank progress worker. Submission,
   completion state, and prepared metadata lifetime are protected by its
   condition lock.

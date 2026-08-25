@@ -112,6 +112,7 @@ public:
     Handle Get(const Detail::BlockId& blockId, size_t shardIdx, bool allowReserved = false,
                bool isLoad = false);
     bool Exist(const Detail::BlockId& blockId, size_t shardIdx);
+    bool Probe(const Detail::BlockId& blockId, size_t shardIdx, State& state);
 
 private:
     bool ExistAt(size_t iBucket, const Detail::BlockId& blockId, size_t shardIdx);

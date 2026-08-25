@@ -928,6 +928,13 @@ class PendingLoadTask:
     failed: bool = False
 
 
+@dataclass
+class ConnectorLoadBatch:
+    task: Task
+    request_ids: tuple[str, ...]
+    load_blocks_by_request: dict[str, int]
+
+
 class RequestHasher:
     """hash(md5) request to generate ucm block id"""
 
@@ -1742,12 +1749,19 @@ class UCMDirectConnector(KVConnectorBase_V1):
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, UCMConnectorMetadata)
 
-        request_to_task: dict[str, Task] = {}
+        load_batches: list[ConnectorLoadBatch] = []
+        batch_request_blocks: dict[str, list[bytes]] = {}
+        batch_store_block_ids: list[bytes] = []
+        batch_shard_indices: list[int] = []
+        batch_ptrs: list[np.ndarray] = []
+        batch_load_blocks: dict[str, int] = {}
+        batch_native_allgather = (
+            self._allgather_store_enabled and not self._prepared_allgather_load_enabled
+        )
         is_load = False
         num_loaded_block = 0
         num_loaded_request = 0
         load_start_time = time.perf_counter() * 1000
-        request_to_load_blocks: dict[str, int] = {}
         for request_id, request in metadata.request_meta.items():
             if len(request.load_block_ids[0]) == 0:
                 continue
@@ -1779,6 +1793,13 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 total_ptrs = self.kv_cache_layout.extract_block_addrs(vllm_block_ids)
                 total_ptrs = total_ptrs.reshape(total_ptrs.shape[0], -1)
                 shard_indexs = [0] * len(ucm_block_ids)
+                if batch_native_allgather:
+                    batch_request_blocks[request_id] = list(ucm_block_ids)
+                    batch_store_block_ids.extend(store_block_ids)
+                    batch_shard_indices.extend(shard_indexs)
+                    batch_ptrs.append(total_ptrs)
+                    batch_load_blocks[request_id] = len(ucm_block_ids)
+                    continue
                 task = self._rank_consistency.submit_load(
                     self.store,
                     {request_id: ucm_block_ids},
@@ -1786,8 +1807,13 @@ class UCMDirectConnector(KVConnectorBase_V1):
                     shard_indexs,
                     total_ptrs,
                 )
-                request_to_task[request_id] = task
-                request_to_load_blocks[request_id] = len(ucm_block_ids)
+                load_batches.append(
+                    ConnectorLoadBatch(
+                        task=task,
+                        request_ids=(request_id,),
+                        load_blocks_by_request={request_id: len(ucm_block_ids)},
+                    )
+                )
             except Exception as e:
                 logger.error(
                     f"request {request_id} submit load task error. "
@@ -1801,21 +1827,54 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 self._connector_worker_meta.mark_failed(request_id)
                 num_loaded_block -= len(ucm_block_ids)
 
-        for request_id, task in request_to_task.items():
+        if batch_request_blocks:
             try:
-                self._rank_consistency.wait_load(task)
+                task = self._rank_consistency.submit_load(
+                    self.store,
+                    batch_request_blocks,
+                    batch_store_block_ids,
+                    batch_shard_indices,
+                    np.concatenate(batch_ptrs, axis=0),
+                )
+                load_batches.append(
+                    ConnectorLoadBatch(
+                        task=task,
+                        request_ids=tuple(batch_request_blocks),
+                        load_blocks_by_request=batch_load_blocks,
+                    )
+                )
             except Exception as e:
                 logger.error(
-                    f"request {request_id} wait load task error. "
-                    f"{type(e).__name__}: {e}"
+                    "submit batched load task for requests "
+                    f"{list(batch_request_blocks)} error. {type(e).__name__}: {e}"
                 )
-                self._record_load_error(
-                    "connector_load_wait_errors_total",
-                    metadata.request_meta[request_id].load_block_ids[1]
-                    + metadata.request_meta[request_id].dump_block_ids[1],
+                for request_id, block_count in batch_load_blocks.items():
+                    self._record_load_error(
+                        "connector_load_submit_errors_total",
+                        metadata.request_meta[request_id].load_block_ids[1]
+                        + metadata.request_meta[request_id].dump_block_ids[1],
+                    )
+                    self._connector_worker_meta.mark_failed(request_id)
+                    num_loaded_block -= block_count
+
+        for load_batch in load_batches:
+            try:
+                self._rank_consistency.wait_load(load_batch.task)
+            except Exception as e:
+                logger.error(
+                    "wait load task for requests "
+                    f"{list(load_batch.request_ids)} error. {type(e).__name__}: {e}"
                 )
-                self._connector_worker_meta.mark_failed(request_id)
-                num_loaded_block -= request_to_load_blocks.get(request_id, 0)
+                for request_id in load_batch.request_ids:
+                    self._record_load_error(
+                        "connector_load_wait_errors_total",
+                        metadata.request_meta[request_id].load_block_ids[1]
+                        + metadata.request_meta[request_id].dump_block_ids[1],
+                    )
+                    self._connector_worker_meta.mark_failed(request_id)
+                    num_loaded_block -= load_batch.load_blocks_by_request.get(
+                        request_id, 0
+                    )
 
         load_end_time = time.perf_counter() * 1000
         load_duration_ms = load_end_time - load_start_time
@@ -2221,8 +2280,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         kv_cache_config: Optional["KVCacheConfig"] = None,
     ):
         super().__init__(vllm_config, role, kv_cache_config)
-        # {layer_id: {request_id: Task}}
-        self.load_tasks: dict[int, dict[str, Task]] = defaultdict(dict)
+        self.load_tasks: dict[int, list[ConnectorLoadBatch]] = defaultdict(list)
         self.use_layerwise = True
         self.is_save = False
         self.need_load = False
@@ -2414,6 +2472,14 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         local_row: int,
         metadata: "UCMConnectorMetadata",
     ) -> None:
+        batch_native_allgather = (
+            self._allgather_store_enabled and not self._prepared_allgather_load_enabled
+        )
+        batch_request_blocks: dict[str, list[bytes]] = {}
+        batch_store_block_ids: list[bytes] = []
+        batch_shard_indices: list[int] = []
+        batch_ptrs: list[np.ndarray] = []
+        batch_load_blocks: dict[str, int] = {}
         for (
             request_id,
             ucm_block_ids,
@@ -2426,6 +2492,13 @@ class UCMLayerWiseConnector(UCMDirectConnector):
             try:
                 shard_indexs = [layer_id] * len(ucm_block_ids)
                 layer_ptrs = total_ptrs[local_row]
+                if batch_native_allgather:
+                    batch_request_blocks[request_id] = list(ucm_block_ids)
+                    batch_store_block_ids.extend(store_block_ids)
+                    batch_shard_indices.extend(shard_indexs)
+                    batch_ptrs.append(layer_ptrs)
+                    batch_load_blocks[request_id] = len(ucm_block_ids)
+                    continue
                 task = self._rank_consistency.submit_load(
                     self.store,
                     {request_id: ucm_block_ids},
@@ -2435,12 +2508,49 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                     prepared_load,
                     local_row,
                 )
-                self.load_tasks[layer_id][request_id] = task
+                self.load_tasks[layer_id].append(
+                    ConnectorLoadBatch(
+                        task=task,
+                        request_ids=(request_id,),
+                        load_blocks_by_request={request_id: len(ucm_block_ids)},
+                    )
+                )
             except Exception as e:
                 logger.error(
                     f"request {request_id} submit load task for layer {layer_id} "
                     f"error. {type(e).__name__}: {e}"
                 )
+                self._record_load_error(
+                    "connector_load_submit_errors_total",
+                    metadata.request_meta[request_id].load_block_ids[1]
+                    + metadata.request_meta[request_id].dump_block_ids[1],
+                )
+                self._failure_req_ids.add(request_id)
+                self._connector_worker_meta.mark_failed(request_id)
+
+        if not batch_request_blocks:
+            return
+        try:
+            task = self._rank_consistency.submit_load(
+                self.store,
+                batch_request_blocks,
+                batch_store_block_ids,
+                batch_shard_indices,
+                np.concatenate(batch_ptrs, axis=0),
+            )
+            self.load_tasks[layer_id].append(
+                ConnectorLoadBatch(
+                    task=task,
+                    request_ids=tuple(batch_request_blocks),
+                    load_blocks_by_request=batch_load_blocks,
+                )
+            )
+        except Exception as e:
+            logger.error(
+                f"submit batched load task for layer {layer_id}, requests "
+                f"{list(batch_request_blocks)} error. {type(e).__name__}: {e}"
+            )
+            for request_id in batch_request_blocks:
                 self._record_load_error(
                     "connector_load_submit_errors_total",
                     metadata.request_meta[request_id].load_block_ids[1]
@@ -2580,23 +2690,24 @@ class UCMLayerWiseConnector(UCMDirectConnector):
 
         # Pop before wait so MTP / rollback paths that revisit the same layer_name
         # do not call store.wait() again on already-completed handles.
-        layer_tasks = self.load_tasks.pop(current_layer_id, {})
+        layer_tasks = self.load_tasks.pop(current_layer_id, [])
         n_tasks = len(layer_tasks)
-        for request_id, task in layer_tasks.items():
+        for load_batch in layer_tasks:
             try:
-                self._rank_consistency.wait_load(task)
+                self._rank_consistency.wait_load(load_batch.task)
             except Exception as e:
                 logger.error(
-                    f"request {request_id} wait {layer_name} load failed. "
-                    f"{type(e).__name__}: {e}"
+                    f"requests {list(load_batch.request_ids)} wait {layer_name} "
+                    f"load failed. {type(e).__name__}: {e}"
                 )
-                self._record_load_error(
-                    "connector_load_wait_errors_total",
-                    metadata.request_meta[request_id].load_block_ids[1]
-                    + metadata.request_meta[request_id].dump_block_ids[1],
-                )
-                self._connector_worker_meta.mark_failed(request_id)
-                self._failure_req_ids.add(request_id)
+                for request_id in load_batch.request_ids:
+                    self._record_load_error(
+                        "connector_load_wait_errors_total",
+                        metadata.request_meta[request_id].load_block_ids[1]
+                        + metadata.request_meta[request_id].dump_block_ids[1],
+                    )
+                    self._connector_worker_meta.mark_failed(request_id)
+                    self._failure_req_ids.add(request_id)
 
         wait_end = time.perf_counter()
 

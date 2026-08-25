@@ -77,6 +77,47 @@ public:
         }
         return LookupOnPrefixFast(blocks, num);
     }
+    Expected<std::vector<StoreV1::DataLocation>> LookupDataLocation(
+        const Detail::Shard* shards, size_t num)
+    {
+        if (!buffer_ || loadBackendOnly_) {
+            return backend_->LookupDataLocation(shards, num);
+        }
+        std::vector<StoreV1::DataLocation> locations(num, StoreV1::DataLocation::MISSING);
+        std::vector<Detail::Shard> backendShards;
+        std::vector<size_t> backendRows;
+        backendShards.reserve(num);
+        backendRows.reserve(num);
+        for (size_t i = 0; i < num; ++i) {
+            TransBuffer::State state;
+            if (!buffer_->Probe(shards[i].owner, shards[i].index, state)) {
+                backendShards.push_back(shards[i]);
+                backendRows.push_back(i);
+                continue;
+            }
+            if (state == TransBuffer::State::READY) {
+                locations[i] = StoreV1::DataLocation::CACHE_READY;
+            } else if (state == TransBuffer::State::LOADING) {
+                locations[i] = StoreV1::DataLocation::CACHE_LOADING;
+            } else {
+                backendShards.push_back(shards[i]);
+                backendRows.push_back(i);
+            }
+        }
+        if (backendShards.empty()) { return locations; }
+        auto backendResult =
+            backend_->LookupDataLocation(backendShards.data(), backendShards.size());
+        if (!backendResult) { return backendResult.Error(); }
+        if (backendResult.Value().size() != backendRows.size()) {
+            return Status::Error("backend lookup returned unexpected result size");
+        }
+        for (size_t i = 0; i < backendRows.size(); ++i) {
+            locations[backendRows[i]] = backendResult.Value()[i] == StoreV1::DataLocation::MISSING
+                                            ? StoreV1::DataLocation::MISSING
+                                            : StoreV1::DataLocation::BACKEND;
+        }
+        return locations;
+    }
     void Prefetch(const Detail::BlockId* blocks, size_t num)
     {
         if (backend_) { backend_->Prefetch(blocks, num); }

@@ -61,6 +61,35 @@ TEST_P(UCCacheTransBufferTest, GetFirstNode)
     ASSERT_TRUE(handle2.Ready());
 }
 
+TEST_P(UCCacheTransBufferTest, ProbeReportsStateWithoutAllocating)
+{
+    using UC::CacheStore::TransBuffer;
+    TransBuffer transBuffer;
+    UC::CacheStore::Config config;
+    config.uniqueId = rd.RandomString(10);
+    config.shardSize = 32768;
+    config.bufferCapacity = config.shardSize * 32768;
+    config.shareBufferEnable = GetParam();
+    config.deviceId = 0;
+    config.loadExclusiveBufferNumber = 0;
+    ASSERT_EQ(transBuffer.Setup(config), UC::Status::OK());
+    auto blockId = UC::Test::Detail::TypesHelper::MakeBlockId(
+        "a1b2c3d4e5f6789012345678901234ab");
+    constexpr size_t shardIdx = 3;
+    TransBuffer::State state;
+    ASSERT_FALSE(transBuffer.Probe(blockId, shardIdx, state));
+
+    auto handle = transBuffer.Get(blockId, shardIdx);
+    ASSERT_TRUE(transBuffer.Probe(blockId, shardIdx, state));
+    ASSERT_EQ(state, TransBuffer::State::LOADING);
+    handle.MarkReady();
+    ASSERT_TRUE(transBuffer.Probe(blockId, shardIdx, state));
+    ASSERT_EQ(state, TransBuffer::State::READY);
+    handle.MarkFailed(UC::Status::NotFound());
+    ASSERT_TRUE(transBuffer.Probe(blockId, shardIdx, state));
+    ASSERT_EQ(state, TransBuffer::State::FAILED);
+}
+
 TEST_P(UCCacheTransBufferTest, BackendOnlyLoadReusesIdleCacheEntry)
 {
     UC::CacheStore::TransBuffer transBuffer;
