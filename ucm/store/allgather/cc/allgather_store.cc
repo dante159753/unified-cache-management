@@ -718,7 +718,8 @@ private:
                                                  stageTrace, platform_);
         task->windows = BuildWindows(task->input, operation);
         task->placementRequired = operation == TaskState::Operation::Load && collectiveEnabled_ &&
-                                  !loadBackendOnly_ && task->windows.size() > 1;
+                                  !skipLoadCollective_ && !loadBackendOnly_ &&
+                                  task->windows.size() > 1;
         if (operation == TaskState::Operation::Load && collectiveEnabled_ && !loadBackendOnly_) {
             auto status = task->deviceError.Allocate(platform_, sizeof(uint32_t), true);
             if (status.Failure()) { return status; }
@@ -1029,15 +1030,17 @@ private:
             plan_.chunkCount;
         const auto usedWorkers = static_cast<uint32_t>(std::min(scatterAivCores_, taskCount));
         if (usedWorkers == 0) { return Status::OK(); }
-        void* receive = collectiveEnabled_ ? receiveSlot.receive.data : slot.send.data;
+        void* receive =
+            collectiveEnabled_ && !skipLoadCollective_ ? receiveSlot.receive.data : slot.send.data;
         if (collectiveEnabled_) {
-            // Rows are routed by the frame each rank sent, so the round the local
-            // window happens to carry is irrelevant to the kernel.
+            // Repeating the valid local frame preserves scatter work in the
+            // collective ablation without reading uninitialized receive frames.
+            const auto frameStride = skipLoadCollective_ ? 0 : frameBytes_;
             return platform.LaunchFramedScatter(
-                stream, receive, task->destinations.data, chunkLayout_.data,
-                task->deviceError.data, static_cast<uint32_t>(task->input.size()), worldSize_,
+                stream, receive, task->destinations.data, chunkLayout_.data, task->deviceError.data,
+                static_cast<uint32_t>(task->input.size()), worldSize_,
                 static_cast<uint32_t>(windowBlocks_), static_cast<uint32_t>(plan_.chunkCount),
-                static_cast<uint32_t>(tensorSizes_.size()), frameBytes_, frameMetadataBytes_,
+                static_cast<uint32_t>(tensorSizes_.size()), frameStride, frameMetadataBytes_,
                 shardSize_, task->sequence, kAnyFrameRound, usedWorkers);
         }
         return platform.LaunchCompactScatter(
