@@ -234,6 +234,8 @@ def _make_store_config(
                 "allgather_collective_count_crop": not args.disable_count_crop,
                 "allgather_scatter_aiv_cores": args.scatter_aiv_cores,
                 "allgather_load_backend_only": args.load_backend_only,
+                "allgather_load_skip_collective": args.skip_collective,
+                "allgather_load_skip_scatter": args.skip_scatter,
             }
         )
         if args.variable_counts is not None:
@@ -583,6 +585,8 @@ def _build_parser(direction: str, store_mode: str) -> argparse.ArgumentParser:
     parser.add_argument("--local-coalesced", action="store_true")
     parser.add_argument("--scatter-only", action="store_true")
     parser.add_argument("--load-backend-only", action="store_true")
+    parser.add_argument("--skip-collective", action="store_true")
+    parser.add_argument("--skip-scatter", action="store_true")
     parser.add_argument("--disable-count-crop", action="store_true")
     variable_counts = parser.add_mutually_exclusive_group()
     variable_counts.add_argument(
@@ -646,6 +650,13 @@ def run(direction: str, store_mode: str = "allgather") -> None:
         parser.error("--scatter-only requires the AllGatherStore benchmark")
     if args.scatter_only and args.local_coalesced:
         parser.error("--scatter-only and --local-coalesced are mutually exclusive")
+    if (args.skip_collective or args.skip_scatter) and store_mode != "allgather":
+        parser.error("--skip-collective and --skip-scatter require AllGatherStore")
+    if args.verify_roundtrip and (args.skip_collective or args.skip_scatter):
+        parser.error(
+            "--verify-roundtrip cannot be combined with --skip-collective or "
+            "--skip-scatter"
+        )
     if direction != "h2d" and args.inflight_tasks != 1:
         parser.error("--inflight-tasks is currently supported only for h2d")
     if direction != "h2d" and args.mixed_dump:

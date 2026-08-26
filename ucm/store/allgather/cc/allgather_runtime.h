@@ -70,7 +70,12 @@ private:
 
     std::string key_;
     int32_t deviceId_;
+    uint32_t rank_{0};
+    uint32_t worldSize_{0};
+    uint32_t collectiveBufferMb_{0};
     uint32_t collectiveMode_{0};
+    bool collectiveEnabled_{false};
+    std::vector<uint8_t> rootInfo_;
     std::shared_ptr<PlatformRuntime> platform_;
     StreamHandle collectiveStream_{nullptr};
     StreamHandle completionStream_{nullptr};

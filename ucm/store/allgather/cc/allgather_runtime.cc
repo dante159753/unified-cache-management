@@ -31,10 +31,28 @@ Expected<std::shared_ptr<AllGatherRuntime>> AllGatherRuntime::Acquire(
     const auto found = gRegistry.find(key);
     if (found != gRegistry.end()) {
         if (auto runtime = found->second.lock()) {
+            if (runtime->deviceId_ != deviceId) {
+                return Status::InvalidParam("allgather runtime device mismatch({}/{})", deviceId,
+                                            runtime->deviceId_);
+            }
+            if (runtime->rank_ != rank || runtime->worldSize_ != worldSize) {
+                return Status::InvalidParam("allgather runtime rank mismatch({}:{}/{}:{})", rank,
+                                            worldSize, runtime->rank_, runtime->worldSize_);
+            }
+            if (runtime->collectiveEnabled_ != collectiveEnabled) {
+                return Status::InvalidParam("allgather runtime collective state mismatch");
+            }
+            if (runtime->collectiveBufferMb_ != collectiveBufferMb) {
+                return Status::InvalidParam("allgather runtime collective buffer mismatch({}/{})",
+                                            collectiveBufferMb, runtime->collectiveBufferMb_);
+            }
             if (runtime->collectiveMode_ != collectiveMode) {
                 return Status::InvalidParam(
                     "allgather runtime collective mode mismatch({}/{})", collectiveMode,
                     runtime->collectiveMode_);
+            }
+            if (collectiveEnabled && runtime->rootInfo_ != rootInfo) {
+                return Status::InvalidParam("allgather runtime root info mismatch");
             }
             if (runtime->slotStreams_.size() < slotStreamCount) {
                 return Status::InvalidParam(
@@ -59,6 +77,11 @@ Status AllGatherRuntime::Setup(uint32_t rank, uint32_t worldSize, uint32_t colle
     if (slotStreamCount == 0) {
         return Status::InvalidParam("allgather slot stream count must be positive");
     }
+    rank_ = rank;
+    worldSize_ = worldSize;
+    collectiveBufferMb_ = collectiveBufferMb;
+    collectiveEnabled_ = collectiveEnabled;
+    rootInfo_ = rootInfo;
     platform_ = CreatePlatformRuntime();
     collectiveMode_ = collectiveMode;
     if (platform_ == nullptr) { return Status::Error("allgather platform runtime unavailable"); }

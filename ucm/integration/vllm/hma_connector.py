@@ -29,6 +29,7 @@ from ucm.sparse.utils import round_up
 from ucm.store.allgather.memory_plan import (
     COLLECTIVE_GROUPS_PER_STAGE,
     DEFAULT_FA_LOAD_SLOTS,
+    DEFAULT_RECEIVE_SLOTS,
     DEFAULT_WA_LOAD_SLOTS,
 )
 from ucm.store.factory_v1 import UcmConnectorFactoryV1
@@ -736,6 +737,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         name, module_path, config = self._base_store_config(store_suffix)
         self._set_default_shm_buffer_capacity(config)
         suffix = label.lower()
+        base_load_slots = config.get("allgather_load_slots")
         for setting in (
             "allgather_window_blocks_per_rank",
             "allgather_load_slots",
@@ -750,6 +752,25 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 DEFAULT_FA_LOAD_SLOTS if suffix == "fa" else DEFAULT_WA_LOAD_SLOTS
             )
             config.setdefault("allgather_load_slots", default_slots)
+            receive_slots = int(
+                config.get("allgather_receive_slots", DEFAULT_RECEIVE_SLOTS)
+            )
+            fa_default_slots = (
+                DEFAULT_FA_LOAD_SLOTS
+                if base_load_slots is None
+                else int(base_load_slots)
+            )
+            wa_default_slots = (
+                DEFAULT_WA_LOAD_SLOTS
+                if base_load_slots is None
+                else int(base_load_slots)
+            )
+            fa_load_slots = int(config.get("allgather_load_slots_fa", fa_default_slots))
+            wa_load_slots = int(config.get("allgather_load_slots_wa", wa_default_slots))
+            config["allgather_runtime_slot_streams"] = max(
+                min(receive_slots, fa_load_slots),
+                min(receive_slots, wa_load_slots),
+            )
             # A stage always runs one collective domain. Slots size the
             # side-stream pipeline and no longer imply extra communicators.
             requested_groups = int(
@@ -791,8 +812,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 config["allgather_async_completion"] = self.load_async
                 dp_rank = self._vllm_config.parallel_config.data_parallel_rank
                 config["allgather_runtime_key"] = (
-                    f"{self.unique_id}:dp{dp_rank}:device{self.local_rank}:"
-                    f"{store_suffix}"
+                    f"{self.unique_id}:dp{dp_rank}:device{self.local_rank}:fawa"
                 )
             if cpu_affinity_cores:
                 config["cpu_affinity_cores"] = list(cpu_affinity_cores)

@@ -600,6 +600,51 @@ class TestWorkerSide:
 
 
 class TestFAWAWorkerSide:
+    def test_fa_and_wa_share_collective_runtime(self, monkeypatch):
+        from ucm.integration.vllm import hma_connector as module
+
+        conn = module.UCMFAWAConnector.__new__(module.UCMFAWAConnector)
+        conn._role = module.KVConnectorRole.WORKER
+        conn._allgather_store_enabled = True
+        conn.local_rank = 1
+        conn.tp_rank = 1
+        conn.tp_size = 4
+        conn.is_mla = True
+        conn.device = None
+        conn.unique_id = "engine"
+        conn.load_async = False
+        conn.file_size = {"FA": 4096, "WA": 4096}
+        conn._vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(data_parallel_rank=2)
+        )
+        base_config = {
+            "store_pipeline": "AllGather|Cache|Fake",
+            "allgather_receive_slots": 6,
+            "allgather_load_slots_fa": 2,
+            "allgather_load_slots_wa": 5,
+        }
+        conn._base_store_config = lambda _: ("pipeline", None, dict(base_config))
+        conn._set_default_shm_buffer_capacity = lambda _: None
+        created = []
+        monkeypatch.setattr(module, "_set_cache_numa_node", lambda *args: None)
+        monkeypatch.setattr(
+            module.UcmConnectorFactoryV1,
+            "create_connector",
+            lambda name, config, path: created.append(config) or FakeStore(),
+        )
+
+        conn._create_store("FA", "fa", [4096])
+        conn._create_store("WA", "wa", [4096])
+
+        assert [config["allgather_load_slots"] for config in created] == [2, 5]
+        assert {config["allgather_runtime_key"] for config in created} == {
+            "engine:dp2:device1:fawa"
+        }
+        assert [config["allgather_runtime_slot_streams"] for config in created] == [
+            5,
+            5,
+        ]
+
     def test_aborted_pending_load_is_not_reported_as_finished_sending(
         self, monkeypatch
     ):

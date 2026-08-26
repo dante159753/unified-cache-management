@@ -122,16 +122,7 @@ def calculate_vllm_reservation(worker: Any) -> int:
             else DEFAULT_FA_LOAD_SLOTS
         )
 
-    if is_fawa:
-        stage_specs = {
-            suffix: next(spec for spec in spec_values if _stage_suffix(spec) == suffix)
-            for suffix in stage_suffixes
-        }
-        # FA and WA run on separate runtimes, so they hold one communicator
-        # each. Any allgather_load_groups value in the config is ignored.
-        collective_group_count = len(stage_specs) * COLLECTIVE_GROUPS_PER_STAGE
-    else:
-        collective_group_count = COLLECTIVE_GROUPS_PER_STAGE
+    collective_group_count = COLLECTIVE_GROUPS_PER_STAGE
 
     if use_layerwise:
         stage_inputs = [
@@ -185,8 +176,8 @@ def calculate_vllm_reservation(worker: Any) -> int:
             stage_dump_slots,
         ) in stage_inputs
     ]
-    # One layerwise runtime reuses its buffers across layers. FA and WA are the
-    # exception because they are backed by separate runtimes.
+    # FA and WA keep separate stage buffers even though their collective runtime
+    # is shared.
     total = sum(stage_totals) if not use_layerwise or is_fawa else max(stage_totals)
     if replicated and tp_size > 1:
         total += (

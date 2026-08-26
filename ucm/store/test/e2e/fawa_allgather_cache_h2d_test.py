@@ -14,6 +14,7 @@ from _allgather_cache_store_benchmark import (
     _group_max_seconds,
     _make_block_ids,
     _parse_devices,
+    _parse_numa_nodes,
     _percentile,
     _setup_device,
     _synchronize,
@@ -49,9 +50,10 @@ def _store_config(
     variable_counts: bool,
     scatter_only: bool,
     load_backend_only: bool,
+    cache_numa_node: int | None,
 ) -> dict[str, object]:
     shard_size = _aligned_size(sizes)
-    return {
+    config: dict[str, object] = {
         "store_pipeline": "AllGather|Cache|Empty",
         "unique_id": f"{unique_id}-{stage}",
         "device_id": device_id,
@@ -64,7 +66,6 @@ def _store_config(
         "cache_buffer_capacity_gb": 8,
         "cache_stream_number": 4,
         "cache_load_exclusive_buffer_number": 32,
-        "cache_numa_node": rank,
         "cache_sdma_direct": False,
         "timeout_ms": 120000,
         "allgather_rank": rank,
@@ -82,6 +83,9 @@ def _store_config(
         "allgather_collective_variable_counts": variable_counts,
         "allgather_load_backend_only": load_backend_only,
     }
+    if cache_numa_node is not None:
+        config["cache_numa_node"] = cache_numa_node
+    return config
 
 
 def _worker(
@@ -91,7 +95,7 @@ def _worker(
     unique_id: str,
     master_port: int,
 ) -> None:
-    torch, device, backend = _setup_device("npu", devices[rank])
+    torch, device, backend = _setup_device(args.device_type, devices[rank])
     import torch.distributed as dist
 
     dist.init_process_group(
@@ -138,6 +142,7 @@ def _worker(
                 args.variable_counts,
                 args.scatter_only,
                 args.load_backend_only,
+                None if args.cache_numa_nodes is None else args.cache_numa_nodes[rank],
             )
         )
         wa_store = UcmPipelineStore(
@@ -156,6 +161,7 @@ def _worker(
                 args.variable_counts,
                 args.scatter_only,
                 args.load_backend_only,
+                None if args.cache_numa_nodes is None else args.cache_numa_nodes[rank],
             )
         )
 
@@ -170,18 +176,18 @@ def _worker(
         wa_dump = wa_store.dump(wa_ids, wa_indexes, wa_tensors)
         fa_store.wait(fa_dump)
         wa_store.wait(wa_dump)
-        _synchronize(torch, "npu")
+        _synchronize(torch, args.device_type)
 
         latencies = []
         for iteration in range(args.warmup + args.iterations):
             dist.barrier()
-            _synchronize(torch, "npu")
+            _synchronize(torch, args.device_type)
             started = time.perf_counter()
             fa_task = fa_store.load(fa_ids, fa_indexes, fa_tensors)
             wa_task = wa_store.load(wa_ids, wa_indexes, wa_tensors)
             fa_store.wait(fa_task)
             wa_store.wait(wa_task)
-            _synchronize(torch, "npu")
+            _synchronize(torch, args.device_type)
             elapsed = _group_max_seconds(
                 torch, dist, time.perf_counter() - started, device
             )
@@ -220,6 +226,8 @@ def _worker(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--devices", default="0,1,2,3")
+    parser.add_argument("--device-type", choices=("npu", "cuda"), default="npu")
+    parser.add_argument("--cache-numa-nodes")
     parser.add_argument("--fa-blocks", type=int, default=240)
     parser.add_argument("--fa-window-blocks", type=int, default=4)
     parser.add_argument("--wa-window-blocks", type=int, default=4)
@@ -233,6 +241,9 @@ def main() -> None:
     parser.add_argument("--load-backend-only", action="store_true")
     args = parser.parse_args()
     args.devices = _parse_devices(parser, args.devices)
+    args.cache_numa_nodes = _parse_numa_nodes(
+        parser, args.cache_numa_nodes, len(args.devices)
+    )
     if (
         min(
             args.fa_blocks,

@@ -200,7 +200,7 @@ def test_fawa_default_load_slots_and_groups_are_reserved(monkeypatch):
     )
 
     assert [call[4] for call in calls] == [4, 1]
-    assert result == 151552 + 4096 + 2 * 2 * 1024 * 1024
+    assert result == 151552 + 4096 + 2 * 1024 * 1024
 
 
 def test_explicit_blocks_per_chunk_overrides_connector(monkeypatch):

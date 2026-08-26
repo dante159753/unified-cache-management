@@ -412,6 +412,7 @@ public:
         config.GetNumber("allgather_load_groups", requestedLoadGroups_);
         config.GetNumber("allgather_dump_slots", dumpSlotCount_);
         config.GetNumber("allgather_receive_slots", receiveSlotCount_);
+        config.GetNumber("allgather_runtime_slot_streams", runtimeSlotStreamCount_);
         config.GetNumber("allgather_hccl_buffer_mb", collectiveBufferMb_);
         config.GetNumber("allgather_collective_buffer_mb", collectiveBufferMb_);
         config.Get("allgather_collective_mode", collectiveModeName_);
@@ -457,6 +458,12 @@ public:
         }
         // More landing areas than stageable windows cannot be reached.
         receiveSlotCount_ = std::min(receiveSlotCount_, loadSlotCount_);
+        if (runtimeSlotStreamCount_ == 0) { runtimeSlotStreamCount_ = receiveSlotCount_; }
+        if (runtimeSlotStreamCount_ < receiveSlotCount_) {
+            return Status::InvalidParam(
+                "allgather runtime slot streams({}) are fewer than receive slots({})",
+                runtimeSlotStreamCount_, receiveSlotCount_);
+        }
         if (requestedLoadGroups_ > 1) {
             // Several communicators driving concurrent collectives on one device
             // is what the reference HCCL users on Ascend deliberately avoid, and
@@ -496,23 +503,24 @@ public:
         if (status.Failure()) { return status; }
         auto runtime = AllGatherRuntime::Acquire(runtimeKey_, deviceId_, rank_, worldSize_,
                                                  collectiveBufferMb_, collectiveMode_, rootInfo_,
-                                                 collectiveEnabled_, receiveSlotCount_);
+                                                 collectiveEnabled_, runtimeSlotStreamCount_);
         if (!runtime) { return runtime.Error(); }
         runtime_ = runtime.Value();
         UC_INFO(
             "AllGatherStore: shard={}, world={}, window_blocks={}, load_slots={}, "
-            "receive_slots={}, dump_slots={}, frame_bytes={}, collective_message_bytes={}, "
+            "receive_slots={}, runtime_slot_streams={}, dump_slots={}, frame_bytes={}, "
+            "collective_message_bytes={}, "
             "payload_bytes={}, "
             "metadata_bytes={}, collective_buffer_bytes={}, scatter_only={}, "
             "skip_load_collective={}, skip_load_scatter={}, load_backend_only={}, "
             "collective_mode={}, variable_counts={}, scatter_aiv_cores={}, platform={}.",
             shardSize_, worldSize_, windowBlocks_, loadSlotCount_, receiveSlotCount_,
-            dumpSlotCount_, frameBytes_,
+            runtimeSlotStreamCount_, dumpSlotCount_, frameBytes_,
             collectiveEnabled_ ? worldSize_ * frameBytes_ : 0, plan_.PayloadBytes(),
             plan_.MetadataBytes(),
-            CalculateCollectiveBytes(collectiveBufferMb_, collectiveEnabled_, 1),
-            scatterOnly_, skipLoadCollective_, skipLoadScatter_, loadBackendOnly_,
-            collectiveModeName_, variableCollectiveEnabled_, scatterAivCores_, platform_->Name());
+            CalculateCollectiveBytes(collectiveBufferMb_, collectiveEnabled_, 1), scatterOnly_,
+            skipLoadCollective_, skipLoadScatter_, loadBackendOnly_, collectiveModeName_,
+            variableCollectiveEnabled_, scatterAivCores_, platform_->Name());
         return Status::OK();
     }
 
@@ -1671,6 +1679,7 @@ private:
     size_t loadSlotCount_{kDefaultLoadSlots};
     size_t requestedLoadGroups_{1};
     size_t receiveSlotCount_{kDefaultReceiveSlots};
+    size_t runtimeSlotStreamCount_{0};
     size_t dumpSlotCount_{kDefaultDumpSlots};
     uint32_t collectiveBufferMb_{kDefaultCollectiveBufferMb};
     std::string collectiveModeName_{"host"};
