@@ -607,7 +607,8 @@ public:
             auto completionStatus = platform_->SynchronizeEvent(completion);
             if (status.Success() && completionStatus.Failure()) { status = completionStatus; }
         }
-        if (status.Success() && task->hostError.data != nullptr && task->hostError.data[0] != 0) {
+        if (status.Success() && !skipLoadCollective_ && task->hostError.data != nullptr &&
+            task->hostError.data[0] != 0) {
             status = Status::Error("allgather owner backend load failed");
         }
         EraseTask(handle, task);
@@ -1383,7 +1384,7 @@ private:
             if (waitStatus.Failure() && firstError.Success()) { firstError = waitStatus; }
         }
         auto status = Status::OK();
-        if (collectiveEnabled_) {
+        if (collectiveEnabled_ && !skipLoadCollective_) {
             status = platform.CopyDeviceToHost(task->hostError.data, sizeof(uint32_t),
                                                task->deviceError.data, sizeof(uint32_t),
                                                completionStream);
@@ -1420,7 +1421,7 @@ private:
         }
         if (firstError.Success() && localBackendError.Failure()) { firstError = localBackendError; }
         if (!asyncCompletion_ && firstError.Success() && collectiveEnabled_ &&
-            task->hostError.data[0] != 0) {
+            !skipLoadCollective_ && task->hostError.data[0] != 0) {
             firstError = Status::Error("allgather owner backend load failed");
         }
         metrics.totalMs = Milliseconds(Clock::now() - taskStarted);
