@@ -9,7 +9,13 @@ logger = init_logger(__name__)
 
 @when_imported("vllm.v1.worker.gpu_worker")
 def patch_gpu_worker_memory_reservation(mod):
-    worker = mod.GPUWorker
+    worker = getattr(mod, "GPUWorker", None)
+    if worker is None:
+        worker = getattr(mod, "Worker", None)
+    if worker is None:
+        raise AttributeError(
+            "vllm.v1.worker.gpu_worker exposes neither GPUWorker nor Worker"
+        )
     if getattr(worker, "_ucm_allgather_reservation_patched", False):
         return
     original = worker.determine_available_memory
