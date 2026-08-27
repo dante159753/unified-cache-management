@@ -1929,6 +1929,7 @@ def test_vllm_dashboard_uses_combined_prefix_cache_hit_rate_breakdown():
     for target in panel["targets"]:
         legend = target["legendFormat"]
         assert target["legendFormat"] == legend
+        assert target["interval"] == "15s"
         expr = target["expr"]
         for metric_name in expected[legend]:
             assert metric_name in expr
