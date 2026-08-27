@@ -92,6 +92,20 @@ def _has_shared_indexer_layers(vllm_config: "VllmConfig") -> bool:
     return False
 
 
+def _is_minimax_m3(vllm_config: "VllmConfig") -> bool:
+    model_config = getattr(vllm_config, "model_config", None)
+    configs = (
+        getattr(model_config, "hf_text_config", None),
+        getattr(model_config, "hf_config", None),
+        getattr(getattr(model_config, "hf_config", None), "text_config", None),
+    )
+    for config in configs:
+        model_type = str(getattr(config, "model_type", "")).lower()
+        if model_type.startswith("minimax_m3"):
+            return True
+    return False
+
+
 def _short_list(values: list[int], limit: int = 12) -> list[int]:
     return values[:limit]
 
@@ -1009,6 +1023,298 @@ class SharedIndexerKVCacheLayout(KVCacheLayout):
         )
 
 
+class MiniMaxM3KVCacheLayout(KVCacheLayout):
+    """MiniMax M3 layout with fixed Attention slots and optional Indexer padding."""
+
+    @classmethod
+    def supports(cls, vllm_config: "VllmConfig") -> bool:
+        return getattr(current_platform, "device_type", None) in (
+            "cuda",
+            "npu",
+        ) and _is_minimax_m3(vllm_config)
+
+    @staticmethod
+    def _is_indexer(layer_name: str) -> bool:
+        components = layer_name.lower().split(".")
+        return "indexer" in components or "index_cache" in components
+
+    @staticmethod
+    def _tensor_span(tensor: torch.Tensor) -> int:
+        elements = 1 + sum(
+            (int(size) - 1) * int(tensor.stride(dim))
+            for dim, size in enumerate(tensor.shape)
+        )
+        return elements * int(tensor.element_size())
+
+    def _block_segment(
+        self,
+        layer_name: str,
+        tensor: torch.Tensor,
+        *,
+        copy_size: int | None = None,
+        block_stride: int | None = None,
+    ) -> KVCacheSegment:
+        num_blocks = int(tensor.shape[0])
+        if num_blocks < self.num_blocks:
+            raise ValueError(
+                "MiniMax M3 KV cache has fewer physical blocks than configured: "
+                f"layer={layer_name}, minimum={self.num_blocks}, "
+                f"actual={num_blocks}, shape={tuple(tensor.shape)}."
+            )
+        element_size = int(tensor.element_size())
+        size = (
+            math.prod(int(value) for value in tensor.shape[1:]) * element_size
+            if copy_size is None
+            else int(copy_size)
+        )
+        stride = (
+            int(tensor.stride(0)) * element_size
+            if block_stride is None
+            else int(block_stride)
+        )
+        if stride < size:
+            raise ValueError(
+                "MiniMax M3 KV cache blocks overlap: "
+                f"layer={layer_name}, copy_size={size}, block_stride={stride}, "
+                f"shape={tuple(tensor.shape)}."
+            )
+        return KVCacheSegment(
+            ptr=int(tensor.data_ptr()),
+            copy_size=size,
+            block_stride=stride,
+            buffer_size=(num_blocks - 1) * stride + size,
+        )
+
+    def _five_dimensional_segments(
+        self, layer_name: str, tensor: torch.Tensor, is_indexer: bool
+    ) -> tuple[KVCacheSegment, ...]:
+        if is_indexer:
+            raise ValueError(
+                "MiniMax M3 Indexer cache cannot use a combined 5D layout: "
+                f"layer={layer_name}, shape={tuple(tensor.shape)}."
+            )
+
+        shape = tuple(int(value) for value in tensor.shape)
+        block_major = shape[0] >= self.num_blocks and shape[1] == 2
+        kv_major = shape[0] == 2 and shape[1] >= self.num_blocks
+        if block_major and kv_major:
+            raise ValueError(
+                "Ambiguous MiniMax M3 5D KV cache layout: "
+                f"layer={layer_name}, num_blocks={self.num_blocks}, shape={shape}."
+            )
+
+        element_size = int(tensor.element_size())
+        component_size = math.prod(shape[2:]) * element_size
+        if kv_major:
+            num_blocks = shape[1]
+            block_stride = int(tensor.stride(1)) * element_size
+            kv_stride = int(tensor.stride(0)) * element_size
+        elif block_major:
+            num_blocks = shape[0]
+            block_stride = int(tensor.stride(0)) * element_size
+            kv_stride = int(tensor.stride(1)) * element_size
+            if kv_stride <= component_size:
+                return (
+                    self._block_segment(
+                        layer_name,
+                        tensor,
+                        copy_size=2 * component_size,
+                        block_stride=block_stride,
+                    ),
+                )
+        else:
+            raise ValueError(
+                "Unsupported MiniMax M3 5D KV cache layout: expected "
+                "[2, num_blocks, ...] or [num_blocks, 2, ...], "
+                f"layer={layer_name}, shape={shape}."
+            )
+
+        if num_blocks < self.num_blocks or block_stride < component_size:
+            raise ValueError(
+                "Invalid MiniMax M3 combined KV cache geometry: "
+                f"layer={layer_name}, minimum_blocks={self.num_blocks}, "
+                f"actual_blocks={num_blocks}, component_size={component_size}, "
+                f"block_stride={block_stride}."
+            )
+        ptr = int(tensor.data_ptr())
+        return (
+            KVCacheSegment(
+                ptr=ptr,
+                copy_size=component_size,
+                block_stride=block_stride,
+                buffer_size=self._tensor_span(tensor),
+            ),
+            KVCacheSegment(
+                ptr=ptr + kv_stride,
+                copy_size=component_size,
+                block_stride=block_stride,
+                buffer_size=0,
+            ),
+        )
+
+    def _entry_segments(
+        self, layer_name: str, value, is_indexer: bool
+    ) -> tuple[KVCacheSegment, ...]:
+        tensors = value if isinstance(value, (tuple, list)) else (value,)
+        segments = []
+        for tensor in tensors:
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(
+                    "Unsupported MiniMax M3 KV cache value: "
+                    f"layer={layer_name}, type={type(tensor)}."
+                )
+            if tensor.dim() == 5:
+                segments.extend(
+                    self._five_dimensional_segments(layer_name, tensor, is_indexer)
+                )
+            elif tensor.dim() in (3, 4):
+                segments.append(self._block_segment(layer_name, tensor))
+            else:
+                raise ValueError(
+                    "Unsupported MiniMax M3 KV cache tensor shape: "
+                    f"layer={layer_name}, shape={tuple(tensor.shape)}."
+                )
+        return tuple(segments)
+
+    def _collect_layers(self, kvcaches):
+        layers: dict[int, dict[str, Optional[tuple[KVCacheSegment, ...]]]] = {}
+        for layer_name, value in kvcaches.items():
+            layer_id = self.layer_name_to_id[layer_name]
+            role = "indexer" if self._is_indexer(layer_name) else "attention"
+            layer = layers.setdefault(layer_id, {"attention": None, "indexer": None})
+            if layer[role] is not None:
+                raise ValueError(
+                    f"Duplicate MiniMax M3 {role} cache for layer {layer_id}."
+                )
+            layer[role] = self._entry_segments(layer_name, value, role == "indexer")
+        return layers
+
+    @staticmethod
+    def _ghost(size: int) -> KVCacheSegment:
+        return KVCacheSegment(ptr=0, copy_size=size, block_stride=0, buffer_size=0)
+
+    def _normalize_layer(self, layer_id: int, layer):
+        attention = layer["attention"]
+        if not attention:
+            raise ValueError(f"MiniMax M3 layer {layer_id} has no Attention KV cache.")
+        indexer = layer["indexer"]
+        if indexer is not None and len(indexer) != 1:
+            raise ValueError(
+                f"MiniMax M3 layer {layer_id} must have one Indexer cache."
+            )
+        if len(attention) == 3:
+            if indexer is not None:
+                raise ValueError(
+                    f"MiniMax M3 layer {layer_id} has duplicate Indexer caches."
+                )
+            attention, indexer = attention[:2], attention[2:]
+        elif len(attention) == 2 and indexer is None:
+            key, value = attention
+            if key.copy_size == 2 * value.copy_size:
+                attention = (
+                    KVCacheSegment(
+                        ptr=key.ptr,
+                        copy_size=value.copy_size,
+                        block_stride=key.block_stride,
+                        buffer_size=key.buffer_size,
+                    ),
+                    value,
+                )
+                indexer = (
+                    KVCacheSegment(
+                        ptr=key.ptr + value.copy_size,
+                        copy_size=value.copy_size,
+                        block_stride=key.block_stride,
+                        buffer_size=0,
+                    ),
+                )
+        elif len(attention) > 2:
+            raise ValueError(
+                f"MiniMax M3 layer {layer_id} has too many Attention cache slots."
+            )
+        return tuple(attention), indexer[0] if indexer else None
+
+    def _set_rows(self, rows: list[list[KVCacheSegment]]) -> None:
+        self.base_ptrs = np.asarray(
+            [[segment.ptr for segment in row] for row in rows], dtype=np.uint64
+        )
+        self.tensor_size_lists = np.asarray(
+            [[segment.copy_size for segment in row] for row in rows], dtype=np.uint64
+        )
+        self.block_stride_lists = np.asarray(
+            [[segment.block_stride for segment in row] for row in rows], dtype=np.uint64
+        )
+        self.buffer_sizes = np.asarray(
+            [[segment.buffer_size for segment in row] for row in rows], dtype=np.uint64
+        )
+
+    def _build_layout(self, kvcaches) -> None:
+        collected = self._collect_layers(kvcaches)
+        layer_ids = sorted(collected)
+        if not layer_ids:
+            raise ValueError("MiniMax M3 KV cache layout is empty.")
+        self.first_layer_id = layer_ids[0]
+        layers = [
+            self._normalize_layer(layer_id, collected[layer_id])
+            for layer_id in layer_ids
+        ]
+
+        attention_sizes = [segment.copy_size for segment in layers[0][0]]
+        for layer_id, (attention, _) in zip(layer_ids, layers):
+            sizes = [segment.copy_size for segment in attention]
+            if sizes != attention_sizes:
+                raise ValueError(
+                    "MiniMax M3 layers use incompatible Attention layouts: "
+                    f"expected={attention_sizes}, layer={layer_id}, actual={sizes}."
+                )
+
+        indexers = [indexer for _, indexer in layers if indexer is not None]
+        if not indexers:
+            if self.use_layerwise:
+                raise ValueError(
+                    "MiniMax M3 KV cache layout did not find an Indexer cache."
+                )
+            indexer_size = None
+        else:
+            indexer_sizes = {indexer.copy_size for indexer in indexers}
+            if len(indexer_sizes) != 1:
+                raise ValueError(
+                    f"MiniMax M3 Indexer block sizes differ: {sorted(indexer_sizes)}."
+                )
+            indexer_size = indexers[0].copy_size
+
+        rows = []
+        for attention, indexer in layers:
+            row = list(attention)
+            if indexer_size is not None:
+                row.append(indexer or self._ghost(indexer_size))
+            rows.append(row)
+        if self.use_layerwise:
+            self._set_rows(rows)
+        else:
+            segments = [segment for row in rows for segment in row if segment.ptr != 0]
+            self.base_ptrs = np.asarray(
+                [segment.ptr for segment in segments], dtype=np.uint64
+            )
+            self.tensor_size_lists = np.asarray(
+                [segment.copy_size for segment in segments], dtype=np.uint64
+            )
+            self.block_stride_lists = np.asarray(
+                [segment.block_stride for segment in segments], dtype=np.uint64
+            )
+            self.buffer_sizes = np.asarray(
+                [segment.buffer_size for segment in segments], dtype=np.uint64
+            )
+        logger.info(
+            "MiniMax M3 KV cache layout: device=%s, slot_sizes=%s, "
+            "indexer_layers=%s/%s",
+            getattr(current_platform, "device_type", None),
+            attention_sizes + ([indexer_size] if indexer_size is not None else []),
+            len(indexers),
+            len(layers),
+        )
+
+
 @dataclass
 class UCMConnectorMetadata(KVConnectorMetadata):
     request_meta: dict[str, RequestDispatchMeta] = field(default_factory=dict)
@@ -1413,13 +1719,12 @@ class UCMDirectConnector(KVConnectorBase_V1):
             # vllm_ascend >= 0.10.0 uses Tuple for kvcaches
             for i, tensor in enumerate(sample_kv_layer):
                 logger.info(f"kv cache shape {i}: {tensor.shape}")
-        layout_cls = (
-            SharedIndexerKVCacheLayout
-            if SharedIndexerKVCacheLayout.supports(
-                self._vllm_config, self.launch_config
-            )
-            else KVCacheLayout
-        )
+        if MiniMaxM3KVCacheLayout.supports(self._vllm_config):
+            layout_cls = MiniMaxM3KVCacheLayout
+        elif SharedIndexerKVCacheLayout.supports(self._vllm_config, self.launch_config):
+            layout_cls = SharedIndexerKVCacheLayout
+        else:
+            layout_cls = KVCacheLayout
         self.kv_cache_layout = layout_cls(
             self.kv_caches,
             self.launch_config,
