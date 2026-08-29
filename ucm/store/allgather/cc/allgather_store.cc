@@ -556,6 +556,11 @@ public:
         return backend_->LookupOnPrefix(blocks, num);
     }
 
+    Expected<ssize_t> LookupOnReverse(const Detail::BlockId* blocks, size_t num) override
+    {
+        return backend_->LookupOnReverse(blocks, num);
+    }
+
     void Prefetch(const Detail::BlockId* blocks, size_t num) override
     {
         if (deviceId_ < 0 || !distributedLoadEnabled_) {
@@ -607,7 +612,7 @@ public:
         auto task = FindTask(handle);
         if (!task) { return Status::InvalidParam("invalid allgather task({})", handle); }
         std::lock_guard<std::mutex> lock(task->mutex);
-        return task->done;
+        return bool(task->done);
     }
 
     Status Wait(Detail::TaskHandle handle) override
