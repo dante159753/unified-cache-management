@@ -39,6 +39,8 @@ namespace UC {
  */
 class StoreV1 {
 public:
+    enum class DataLocation : uint8_t { MISSING, BACKEND, CACHE_LOADING, CACHE_READY };
+
     virtual ~StoreV1() = default;
 
     /**
@@ -78,6 +80,25 @@ public:
      *   - On failure: appropriate Status code.
      */
     virtual Expected<std::vector<uint8_t>> Lookup(const Detail::BlockId* blocks, size_t num) = 0;
+
+    virtual Expected<std::vector<DataLocation>> LookupDataLocation(const Detail::Shard* shards,
+                                                                   size_t num)
+    {
+        std::vector<Detail::BlockId> blocks;
+        blocks.reserve(num);
+        for (size_t i = 0; i < num; ++i) { blocks.push_back(shards[i].owner); }
+        auto result = Lookup(blocks.data(), blocks.size());
+        if (!result) { return result.Error(); }
+        if (result.Value().size() != num) {
+            return Status::Error("lookup returned unexpected result size");
+        }
+        std::vector<DataLocation> locations;
+        locations.reserve(num);
+        for (const auto hit : result.Value()) {
+            locations.push_back(hit ? DataLocation::BACKEND : DataLocation::MISSING);
+        }
+        return locations;
+    }
 
     /**
      * @brief Check whether the given blocks exist in storage.
@@ -128,6 +149,14 @@ public:
      * @note Default implementation does nothing.
      */
     virtual void Prefetch(const Detail::BlockId* blocks, size_t num) = 0;
+
+    virtual void Prefetch(const Detail::Shard* shards, size_t num)
+    {
+        std::vector<Detail::BlockId> blocks;
+        blocks.reserve(num);
+        for (size_t i = 0; i < num; ++i) { blocks.push_back(shards[i].owner); }
+        Prefetch(blocks.data(), blocks.size());
+    }
 
     /**
      * @brief Check whether this store's own read/write path is healthy.

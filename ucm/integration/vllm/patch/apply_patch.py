@@ -219,6 +219,14 @@ def apply_all_patches() -> None:
             logger.info("UCM patching vllm for load-failure recovery...")
             import ucm.integration.vllm.patch.load_failure_patch
 
+        from vllm.platforms import current_platform
+
+        if current_platform.is_cuda_alike():
+            logger.info(
+                "UCM patching vLLM CUDA worker for AllGather memory reservation..."
+            )
+            import ucm.integration.vllm.patch.gpu_worker_memory_reservation_patch
+
         # vllm_ascend patches
         # Disable CpuAlloc.bind_memory BEFORE any cpu_binding_patch so that
         # bind_memory is a no-op before bind_threads replacement is installed.
@@ -270,6 +278,7 @@ def apply_all_patches() -> None:
                 import ucm.integration.vllm.patch.v0230.vllm_ascend.ascend_hybrid_cache_patch
                 import ucm.integration.vllm.patch.v0230.vllm_ascend.cpu_binding_patch
                 import ucm.integration.vllm.patch.v0230.vllm_ascend.sfa_kv_transfer_patch
+                import ucm.integration.vllm.patch.v0230.vllm_ascend.worker_memory_reservation_patch
             case "0.24.0":
                 logger.info(
                     "UCM patching vllm-ascend 0.24.0 for hybrid cache "

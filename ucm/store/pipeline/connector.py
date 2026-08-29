@@ -27,6 +27,7 @@ import copy
 import ctypes
 import importlib
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List
@@ -37,6 +38,8 @@ import torch
 from ucm.store.ucmstore_v1 import Task, UcmKVStoreBaseV1
 
 _preloaded_libraries: Dict[Path, ctypes.CDLL] = {}
+_allgather_root_infos: Dict[str, List[int]] = {}
+_allgather_root_infos_lock = threading.Lock()
 
 
 def _preload_library(path: Path) -> None:
@@ -91,6 +94,11 @@ class UcmPipelineStoreTransTask(Task):
 class UcmPipelineStore(UcmKVStoreBaseV1):
     def __init__(self, config: Dict[str, object]) -> None:
         super().__init__(config)
+        self._allgather_rank = int(config.get("allgather_rank", 0))
+        self._allgather_world_size = int(config.get("allgather_world_size", 1))
+        self._allgather_replicated_data = bool(
+            config.get("allgather_replicated_data", False)
+        )
         self.store_ = ucmpipelinestore.PipelineStore()
         builder = UcmPipelineStoreBuilder.get(config["store_pipeline"])
         if builder is None:
@@ -99,6 +107,13 @@ class UcmPipelineStore(UcmKVStoreBaseV1):
 
     def cc_store(self) -> int:
         return self.store_.Self()
+
+    def close(self) -> None:
+        if self.store_ is None:
+            return
+        store = self.store_
+        self.store_ = None
+        store.Close()
 
     def lookup(self, block_ids: List[bytes]) -> List[bool]:
         flat = np.frombuffer(b"".join(block_ids), dtype=np.uint8)
@@ -116,6 +131,12 @@ class UcmPipelineStore(UcmKVStoreBaseV1):
     def prefetch(self, block_ids: List[bytes]) -> None:
         flat = np.frombuffer(b"".join(block_ids), dtype=np.uint8)
         self.store_.Prefetch(flat)
+
+    def owns(self, block_id: bytes) -> bool:
+        if not self._allgather_replicated_data:
+            return True
+        owner = int.from_bytes(block_id[:8], byteorder="little")
+        return owner % self._allgather_world_size == self._allgather_rank
 
     def _tensor_normalize(self, tensors: List[List[torch.Tensor]]) -> np.ndarray:
         n_rows = len(tensors)
@@ -219,6 +240,140 @@ def _cache_posix_pipeline_builder(
     _preload_metrics(store_dir)
     pipeline.Stack("Posix", str(store_dir / "posix/libposixstore.so"), posix_config)
     pipeline.Stack("Cache", str(store_dir / "cache/libcachestore.so"), config)
+
+
+def _allgather_root_info(config: Dict[str, object]) -> List[int]:
+    runtime_key = str(config["allgather_runtime_key"])
+    with _allgather_root_infos_lock:
+        cached = _allgather_root_infos.get(runtime_key)
+        if cached is not None:
+            return cached
+
+        import torch.distributed as dist
+        from vllm.distributed.parallel_state import get_tp_group
+
+        from ucm.store.allgather import ucm_allgather_runtime
+
+        tp_group = get_tp_group()
+        group = tp_group.device_group
+        group_rank = dist.get_rank(group)
+        group_ranks = dist.get_process_group_ranks(group)
+        root = group_ranks[0]
+        size = int(ucm_allgather_runtime.root_info_size())
+        platform = str(ucm_allgather_runtime.platform_name())
+        device_type = "npu" if platform == "ascend" else platform
+        # Ascend uses this as the collective root; CUDA uses it as the
+        # cross-rank IPC bootstrap key.
+        if group_rank == 0:
+            tensor = torch.tensor(
+                ucm_allgather_runtime.create_root_info(),
+                dtype=torch.uint8,
+                device=f"{device_type}:{int(config['device_id'])}",
+            )
+        else:
+            tensor = torch.empty(
+                size,
+                dtype=torch.uint8,
+                device=f"{device_type}:{int(config['device_id'])}",
+            )
+        dist.broadcast(tensor, src=root, group=group)
+        cached = tensor.cpu().tolist()
+        _allgather_root_infos[runtime_key] = cached
+        return cached
+
+
+def _allgather_stage_configs(
+    config: Dict[str, object],
+) -> tuple[Dict[str, object], Dict[str, object]]:
+    cache_config = copy.deepcopy(config)
+    allgather_config = copy.deepcopy(config)
+    if config.get("device_id", -1) >= 0:
+        scatter_only = bool(config.get("allgather_scatter_only", False))
+        cache_config["tensor_size_list"] = [config["shard_size"]]
+        if not scatter_only:
+            cache_config["share_buffer_enable"] = False
+            cache_config["local_rank_size"] = 1
+        cache_config.pop("gpu_kv_buffer_addrs", None)
+        cache_config.pop("gpu_kv_buffer_sizes", None)
+        cache_config["use_gdr"] = False
+        cache_config["cache_sdma_direct"] = False
+        if (
+            bool(config.get("allgather_replicated_data", False))
+            and not scatter_only
+            and int(config.get("allgather_world_size", 1)) > 1
+            and "allgather_collective_root_info" not in allgather_config
+            and "allgather_hccl_root_info" not in allgather_config
+        ):
+            allgather_config["allgather_collective_root_info"] = _allgather_root_info(
+                allgather_config
+            )
+    return cache_config, allgather_config
+
+
+def _stack_allgather_stage(
+    store_dir: Path,
+    pipeline: ucmpipelinestore.PipelineStore,
+    cache_config: Dict[str, object],
+    allgather_config: Dict[str, object],
+) -> None:
+    _preload_metrics(store_dir)
+    _preload_library(store_dir / "allgather/libucm_segmented_copy_kernels.so")
+    _preload_library(store_dir / "allgather/libucm_compact_scatter_kernels.so")
+    pipeline.Stack("Cache", str(store_dir / "cache/libcachestore.so"), cache_config)
+    if (
+        int(allgather_config.get("device_id", -1)) >= 0
+        and bool(allgather_config.get("allgather_replicated_data", False))
+        and int(allgather_config.get("allgather_world_size", 1)) > 1
+    ):
+        import torch.distributed as dist
+
+        if dist.is_initialized():
+            group = None
+            try:
+                from vllm.distributed.parallel_state import get_tp_group
+
+                group = get_tp_group().device_group
+            except (AssertionError, RuntimeError):
+                pass
+            dist.barrier(group=group)
+    pipeline.Stack(
+        "AllGather",
+        str(store_dir / "allgather/liballgatherstore.so"),
+        allgather_config,
+    )
+
+
+def _allgather_cache_posix_pipeline_builder(
+    config: Dict[str, object], pipeline: ucmpipelinestore.PipelineStore
+) -> None:
+    store_dir = Path(__file__).resolve().parent.parent
+    posix_config = copy.deepcopy(config)
+    if config.get("device_id", -1) >= 0:
+        posix_config["tensor_size"] = config["shard_size"]
+    cache_config, allgather_config = _allgather_stage_configs(config)
+    _preload_metrics(store_dir)
+    pipeline.Stack("Posix", str(store_dir / "posix/libposixstore.so"), posix_config)
+    _stack_allgather_stage(store_dir, pipeline, cache_config, allgather_config)
+
+
+def _allgather_cache_empty_pipeline_builder(
+    config: Dict[str, object], pipeline: ucmpipelinestore.PipelineStore
+) -> None:
+    store_dir = Path(__file__).resolve().parent.parent
+    cache_config, allgather_config = _allgather_stage_configs(config)
+    pipeline.Stack("Empty", str(store_dir / "empty/libemptystore.so"), config)
+    _stack_allgather_stage(store_dir, pipeline, cache_config, allgather_config)
+
+
+def _allgather_cache_fake_pipeline_builder(
+    config: Dict[str, object], pipeline: ucmpipelinestore.PipelineStore
+) -> None:
+    store_dir = Path(__file__).resolve().parent.parent
+    fake_config = copy.deepcopy(config)
+    fake_config["share_buffer_enable"] = True
+    cache_config, allgather_config = _allgather_stage_configs(config)
+    pipeline.Stack("Fake", str(store_dir / "fake/libfakestore.so"), fake_config)
+    _stack_allgather_stage(store_dir, pipeline, cache_config, allgather_config)
 
 
 def _build_cache_compress_posix_pipeline(
@@ -365,6 +520,15 @@ def _yuanrong_posix_pipeline_builder(
 UcmPipelineStoreBuilder.register("Cache|Ds3fs", _cache_ds3fs_pipeline_builder)
 UcmPipelineStoreBuilder.register("Cache|Empty", _cache_empty_pipeline_builder)
 UcmPipelineStoreBuilder.register("Cache|Posix", _cache_posix_pipeline_builder)
+UcmPipelineStoreBuilder.register(
+    "AllGather|Cache|Posix", _allgather_cache_posix_pipeline_builder
+)
+UcmPipelineStoreBuilder.register(
+    "AllGather|Cache|Empty", _allgather_cache_empty_pipeline_builder
+)
+UcmPipelineStoreBuilder.register(
+    "AllGather|Cache|Fake", _allgather_cache_fake_pipeline_builder
+)
 UcmPipelineStoreBuilder.register("Empty", _empty_pipeline_builder)
 UcmPipelineStoreBuilder.register("Fake", _fake_pipeline_builder)
 UcmPipelineStoreBuilder.register("Posix", _posix_pipeline_builder)

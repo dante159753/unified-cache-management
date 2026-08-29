@@ -81,3 +81,45 @@ TEST_F(UCFakeStoreImplTest, Lookup)
         ASSERT_TRUE(founds == expected);
     }
 }
+
+TEST_F(UCFakeStoreImplTest, AlwaysHit)
+{
+    UC::FakeStore::FakeStore store;
+    UC::Detail::Dictionary config;
+    config.Set("unique_id", rd.RandomString(10));
+    config.SetNumber("buffer_number", size_t(1024));
+    config.Set("fake_always_hit", true);
+    ASSERT_TRUE(store.Setup(config).Success());
+
+    std::vector<UC::Detail::BlockId> blocks(3);
+    std::for_each(blocks.begin(), blocks.end(), [](auto& block) {
+        block = UC::Test::Detail::TypesHelper::MakeBlockIdRandomly();
+    });
+    auto foundIdx = store.LookupOnPrefix(blocks.data(), blocks.size()).Value();
+    ASSERT_EQ(foundIdx, 2);
+    auto founds = store.Lookup(blocks.data(), blocks.size()).Value();
+    ASSERT_EQ(founds, std::vector<uint8_t>(blocks.size(), true));
+
+    UC::Detail::TaskDesc desc;
+    desc.push_back(UC::Detail::Shard{blocks.front(), 0, {nullptr}});
+    auto handle = store.Load(std::move(desc)).Value();
+    ASSERT_TRUE(store.Wait(handle).Success());
+}
+
+TEST_F(UCFakeStoreImplTest, InjectLoadFailure)
+{
+    UC::FakeStore::FakeStore store;
+    UC::Detail::Dictionary config;
+    config.Set("unique_id", rd.RandomString(10));
+    config.SetNumber("buffer_number", size_t(1024));
+    config.Set("fake_fail_load", true);
+    ASSERT_TRUE(store.Setup(config).Success());
+
+    UC::Detail::TaskDesc desc;
+    desc.push_back(UC::Detail::Shard{
+        UC::Test::Detail::TypesHelper::MakeBlockIdRandomly(), 0, {nullptr}});
+    auto result = store.Load(std::move(desc));
+    ASSERT_FALSE(result);
+    ASSERT_NE(result.Error().ToString().find("injected fake load failure"),
+              std::string::npos);
+}

@@ -52,6 +52,13 @@ Status LoadQueue::Setup(const Config& config, TaskIdSet* failureSet, TransBuffer
     waiting_.Setup(config.waitingQueueDepth);
     running_.Setup(config.runningQueueDepth);
     holder_.reserve(1024);
+    auto startedPrefetch = prefetchPool_
+                               .SetWorkerFn([this](std::vector<PrefetchShardTask>& tasks,
+                                                   void* const&) { CompletePrefetch(tasks); })
+                               .SetNWorker(1)
+                               .SetCpuAffinity(cpuAffinityCores_)
+                               .Run();
+    if (!startedPrefetch) { return Status::Error("failed to start cache prefetch worker"); }
     dispatcher_ = std::thread{&LoadQueue::DispatchStage, this};
     std::promise<Status> started;
     auto fut = started.get_future();
@@ -59,11 +66,67 @@ Status LoadQueue::Setup(const Config& config, TaskIdSet* failureSet, TransBuffer
     return fut.get();
 }
 
+void LoadQueue::Prefetch(const Detail::Shard* shards, size_t num)
+{
+    std::vector<PrefetchShardTask> pending;
+    pending.reserve(num);
+    for (size_t i = 0; i < num; ++i) {
+        auto bufferHandle = buffer_->Get(shards[i].owner, shards[i].index, true, false);
+        if (!bufferHandle || !bufferHandle.Owner() || bufferHandle.Ready()) { continue; }
+        Detail::TaskDesc backendTask{
+            Detail::Shard{shards[i].owner, shards[i].index, {bufferHandle.Data()}}
+        };
+        backendTask.brief = "Backend2CachePrefetch";
+        auto result = backend_->Load(std::move(backendTask));
+        if (!result) {
+            bufferHandle.MarkFailed(result.Error());
+            UC_ERROR("Failed({}) to submit cache prefetch.", result.Error());
+            continue;
+        }
+        pending.push_back({std::move(bufferHandle), result.Value()});
+    }
+    if (!pending.empty()) { prefetchPool_.Push(std::move(pending)); }
+}
+
+void LoadQueue::CompletePrefetch(std::vector<PrefetchShardTask>& tasks)
+{
+    while (!tasks.empty()) {
+        bool completed = false;
+        for (auto iter = tasks.begin(); iter != tasks.end();) {
+            auto checked = backend_->Check(iter->backendTaskHandle);
+            if (!checked) {
+                iter->bufferHandle.MarkFailed(checked.Error());
+                UC_ERROR("Failed({}) to check cache prefetch task({}).", checked.Error(),
+                         iter->backendTaskHandle);
+            } else if (!checked.Value()) {
+                ++iter;
+                continue;
+            } else {
+                auto status = backend_->Wait(iter->backendTaskHandle);
+                if (status.Success()) {
+                    iter->bufferHandle.MarkReady();
+                } else {
+                    iter->bufferHandle.MarkFailed(status);
+                    UC_ERROR("Failed({}) to wait cache prefetch task({}).", status,
+                             iter->backendTaskHandle);
+                }
+            }
+            iter = tasks.erase(iter);
+            completed = true;
+        }
+        if (!completed) { std::this_thread::yield(); }
+    }
+}
+
 void LoadQueue::Submit(TaskPtr task, WaiterPtr waiter)
 {
     waiter->Up();
     auto success = waiting_.TryPush({task, waiter});
-    if (success) { return; }
+    if (success) {
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_waiting_queue_depth"),
+                                 static_cast<double>(waiting_.Size()));
+        return;
+    }
     UC_ERROR("Waiting queue full, submit load task({}) failed.", task->id);
     UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_queue_full_total"), 1.0);
     RecordFailedShards(task->desc.size());
@@ -144,6 +207,7 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
         shardTask.task = task;
         shardTask.shard = std::move(shard);
         shardTask.waiter = (i + 1 < nShard) ? nullptr : waiter;
+        shardTask.transferEnqueueTp = NowTime::Now();
         running_.Push(std::move(shardTask));
     }
     auto tpDispatch = NowTime::Now();
@@ -161,6 +225,8 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
                              (tpDispatch - tpWait) * 1e3);
     UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_backend_shards_total"),
                              static_cast<double>(backendSubmitCount));
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_transfer_queue_depth"),
+                             static_cast<double>(running_.Size()));
     RecordLoadSourceShards(nShard, waitShardCount);
 }
 
@@ -188,6 +254,11 @@ void LoadQueue::TransferStage(std::promise<Status>& started)
 
 void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& task)
 {
+    const auto transferPickupTp = NowTime::Now();
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_transfer_queue_wait_ms"),
+                             (transferPickupTp - task.transferEnqueueTp) * 1e3);
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_backend_wait_queue_depth"),
+                             static_cast<double>(running_.Size()));
     auto parentTask = task.task;
     const auto taskHandle = parentTask->id;
     if (failureSet_->Contains(taskHandle)) {
@@ -212,6 +283,7 @@ void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& task)
         UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_shard_backend_wait_ms"),
                                  (tpBackendReady - tpBackendWait) * 1e3);
 
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_h2d_batch_shards"), 1.0);
         auto* host = cacheSdmaDirect_ ? task.bufferHandle.DeviceData() : task.bufferHandle.Data();
         s = HostToDeviceAsync(stream, host, task.shard.addrs.data());
         auto tpH2dSubmitted = NowTime::Now();

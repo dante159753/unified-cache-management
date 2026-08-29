@@ -18,12 +18,19 @@ from ucm.integration.vllm.device import create_device
 from ucm.integration.vllm.ucm_connector import (
     UCMDirectConnector,
     _check_shm_capacity,
+    _set_cache_numa_node,
     _use_ucm_connector_cpu_affinity,
 )
 from ucm.logger import init_logger
 from ucm.shared.metrics import ucmmetrics
 from ucm.sparse.utils import round_up
+from ucm.store.allgather.memory_plan import (
+    COLLECTIVE_GROUPS_PER_STAGE,
+    DEFAULT_FA_LOAD_SLOTS,
+    DEFAULT_WA_LOAD_SLOTS,
+)
 from ucm.store.factory_v1 import UcmConnectorFactoryV1
+from ucm.store.pipeline.errors import StoreUnhealthyError
 from ucm.store.ucmstore_v1 import Task, UcmKVStoreBaseV1
 
 if TYPE_CHECKING:
@@ -708,10 +715,53 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             config.setdefault("cache_io_aggregation", True)
         else:
             config["cache_io_aggregation"] = False
+        suffix = label.lower()
+        base_load_slots = config.get("allgather_load_slots")
+        for setting in (
+            "allgather_window_blocks_per_rank",
+            "allgather_load_slots",
+            "allgather_load_groups",
+            "allgather_dump_slots",
+        ):
+            stage_key = f"{setting}_{suffix}"
+            if stage_key in config:
+                config[setting] = int(config[stage_key])
+        if self._allgather_stage_enabled:
+            default_slots = (
+                DEFAULT_FA_LOAD_SLOTS if suffix == "fa" else DEFAULT_WA_LOAD_SLOTS
+            )
+            config.setdefault("allgather_load_slots", default_slots)
+            fa_default_slots = (
+                DEFAULT_FA_LOAD_SLOTS
+                if base_load_slots is None
+                else int(base_load_slots)
+            )
+            wa_default_slots = (
+                DEFAULT_WA_LOAD_SLOTS
+                if base_load_slots is None
+                else int(base_load_slots)
+            )
+            fa_load_slots = int(config.get("allgather_load_slots_fa", fa_default_slots))
+            wa_load_slots = int(config.get("allgather_load_slots_wa", wa_default_slots))
+            config["allgather_runtime_slot_streams"] = max(fa_load_slots, wa_load_slots)
+            requested_groups = int(
+                config.get("allgather_load_groups", COLLECTIVE_GROUPS_PER_STAGE)
+            )
+            if requested_groups != COLLECTIVE_GROUPS_PER_STAGE:
+                logger.warning(
+                    f"Ignoring allgather_load_groups={requested_groups} for {label}: "
+                    f"the stage uses one ordered data path. Raise "
+                    f"allgather_load_slots_{suffix} to pipeline instead."
+                )
+            config["allgather_load_groups"] = COLLECTIVE_GROUPS_PER_STAGE
         if self._role == KVConnectorRole.WORKER:
             if tensor_size_list is None:
                 raise RuntimeError(f"Worker FAWA {label} store needs tensor sizes.")
             config["device_id"] = self.local_rank
+            if self._allgather_stage_enabled or not bool(
+                config.get("share_buffer_enable", False)
+            ):
+                _set_cache_numa_node(config, self.device, self.local_rank)
             config["tensor_size_list"] = tensor_size_list
             # io_direct requires shard and block sizes to be 4KB aligned.
             aligned_size = 4096
@@ -725,6 +775,15 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 )
             # MLA stores aggregate TP shards under one logical rank group.
             config["local_rank_size"] = self.tp_size if self.is_mla else 1
+            if self._allgather_stage_enabled:
+                config["allgather_rank"] = self.tp_rank % self.tp_size
+                config["allgather_world_size"] = self.tp_size
+                config["allgather_replicated_data"] = True
+                config["allgather_layerwise"] = False
+                dp_rank = self._vllm_config.parallel_config.data_parallel_rank
+                config["allgather_runtime_key"] = (
+                    f"{self.unique_id}:dp{dp_rank}:device{self.local_rank}:fawa"
+                )
             if cpu_affinity_cores:
                 config["cpu_affinity_cores"] = list(cpu_affinity_cores)
         else:
@@ -1172,6 +1231,12 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         )
         self._connector_worker_meta.mark_failed(request_id)
 
+    @property
+    def _collective_load_active(self) -> bool:
+        """Whether loads go through a cross-rank collective on this worker."""
+
+        return self._allgather_stage_enabled and self.tp_size > 1
+
     def _wait_load_task(
         self,
         load_task: FAWALoadTask,
@@ -1180,6 +1245,15 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
 
         try:
             self._rank_consistency.wait_load(load_task.task)
+        except StoreUnhealthyError:
+            # The collective domain is broken, not this request. Every rank in
+            # the group is now out of step, so failing one request would leave
+            # the peers waiting on collectives this worker will never issue.
+            logger.exception(
+                f"request {load_task.request_id} hit an unrecoverable "
+                f"{load_task.label} store failure; the engine cannot continue."
+            )
+            raise
         except Exception as e:
             logger.error(
                 f"request {load_task.request_id} wait FAWA load "
@@ -1308,12 +1382,17 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             if not request.load_keys:
                 continue
 
+            submitted: list[FAWALoadTask] = []
             try:
                 if self.fa_store is None:
                     raise RuntimeError("FA store is not initialized.")
                 if self.wa_store is None:
                     raise RuntimeError("WA store is not initialized.")
 
+                # Build every argument before submitting anything. A submit that
+                # succeeds for FA and then fails for WA cannot be taken back, and
+                # under a collective each store's task count has to match on all
+                # ranks, so a partial submit desynchronizes the whole TP group.
                 # FA groups are loaded for every external-hit canonical block.
                 fa_ptrs = self._extract_fa_ptr(
                     request.load_keys,
@@ -1321,35 +1400,55 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                     request.load_hash_end,
                     request.load_vllm_block_ids,
                 )
-                fa_task = self._submit_load_task(
-                    request_id,
-                    "FA",
-                    self.fa_store,
-                    request.load_keys,
-                    fa_ptrs,
-                )
-                tasks.append(fa_task)
-
                 # WA groups only need the final matched boundary.
                 window_keys = request.load_keys[-1:]
                 window_ptrs = self._extract_wa_ptr(
                     window_keys,
                     request.load_vllm_block_ids,
                 )
-                wa_task = self._submit_load_task(
-                    request_id,
-                    "WA",
-                    self.wa_store,
-                    window_keys,
-                    window_ptrs,
-                )
-                tasks.append(wa_task)
             except Exception as e:
+                logger.error(
+                    f"request {request_id} build FAWA load task "
+                    f"error. {type(e).__name__}: {e}"
+                )
+                self._handle_load_err(request_id)
+                continue
+
+            try:
+                submitted.append(
+                    self._submit_load_task(
+                        request_id,
+                        "FA",
+                        self.fa_store,
+                        request.load_keys,
+                        fa_ptrs,
+                    )
+                )
+                submitted.append(
+                    self._submit_load_task(
+                        request_id,
+                        "WA",
+                        self.wa_store,
+                        window_keys,
+                        window_ptrs,
+                    )
+                )
+            except Exception as e:
+                if self._collective_load_active:
+                    raise RuntimeError(
+                        f"request {request_id} submitted {len(submitted)} of 2 FAWA "
+                        f"load tasks; the TP group's collective sequence can no "
+                        f"longer match across ranks."
+                    ) from e
                 logger.error(
                     f"request {request_id} submit FAWA load task "
                     f"error. {type(e).__name__}: {e}"
                 )
                 self._handle_load_err(request_id)
+                tasks.extend(submitted)
+                continue
+
+            tasks.extend(submitted)
 
         self._wait_all_load_task(tasks)
 
@@ -1381,7 +1480,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         fa_dump_blocks_by_request: dict[str, set[bytes]] = {}
         wa_dump_blocks_by_request: dict[str, set[bytes]] = {}
         save_bytes = 0
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not self._allgather_stage_enabled:
             # Split FA rows by canonical block index. Block-wise WA follows the same
             # TP key slice; chunk-wise WA assigns one final boundary per request.
             wa_dump_ring_idx = 0

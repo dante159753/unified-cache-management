@@ -83,6 +83,15 @@ public:
         if (!res) [[unlikely]] { UC_ERROR("Failed({}) to lookup blocks({}).", res.Error(), num); }
         return res;
     }
+    Expected<std::vector<DataLocation>> LookupDataLocation(const Detail::Shard* shards,
+                                                           size_t num) override
+    {
+        auto result = bufferMgr_.LookupDataLocation(shards, num);
+        if (!result) {
+            UC_ERROR("Failed({}) to locate shards({}).", result.Error(), num);
+        }
+        return result;
+    }
     Expected<ssize_t> LookupOnPrefix(const Detail::BlockId* blocks, size_t num) override
     {
         auto res = bufferMgr_.LookupOnPrefix(blocks, num);
@@ -98,6 +107,14 @@ public:
     void Prefetch(const Detail::BlockId* blocks, size_t num) override
     {
         bufferMgr_.Prefetch(blocks, num);
+    }
+    void Prefetch(const Detail::Shard* shards, size_t num) override
+    {
+        if (!transEnable_ || bufferMgr_.GetTransBuffer() == nullptr) {
+            StoreV1::Prefetch(shards, num);
+            return;
+        }
+        transMgr_.Prefetch(shards, num);
     }
     Expected<Detail::TaskHandle> Load(Detail::TaskDesc task) override
     {
@@ -140,6 +157,7 @@ private:
         config.Get("unique_id", param.uniqueId);
         config.Get("cache_load_backend_only", param.cacheLoadBackendOnly);
         config.GetNumber("device_id", param.deviceId);
+        config.GetNumber("cache_numa_node", param.numaNode);
         size_t tensorSize = 0;
         config.GetNumber("tensor_size", tensorSize);
         config.GetNumber("shard_size", param.shardSize);
@@ -190,6 +208,9 @@ private:
         if (!config.storeBackend) { return Status::InvalidParam("invalid store backend"); }
         if (config.deviceId < -1) {
             return Status::InvalidParam("invalid device({})", config.deviceId);
+        }
+        if (config.numaNode < -1) {
+            return Status::InvalidParam("invalid NUMA node({})", config.numaNode);
         }
         if (config.uniqueId.empty()) { return Status::InvalidParam("invalid unique id"); }
         auto s =
@@ -243,6 +264,7 @@ private:
         UC_INFO("Set {}::UniqueId to {}.", ns, config.uniqueId);
         UC_INFO("Set {}::CacheLoadBackendOnly to {}.", ns, config.cacheLoadBackendOnly);
         UC_INFO("Set {}::DeviceId to {}.", ns, config.deviceId);
+        UC_INFO("Set {}::NumaNode to {}.", ns, config.numaNode);
         const auto& v = config.tensorSizes;
         if (v.empty()) {
             UC_INFO("Set {}::TensorSizes to [].", ns);

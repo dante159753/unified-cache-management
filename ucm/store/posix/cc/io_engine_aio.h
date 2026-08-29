@@ -157,7 +157,15 @@ private:
         io.length = shardSize_;
         io.buffer = shard.addrs.front();
         io.tag = tid;
-        io.callback = [this, task, w, fd = result.fd, last, id](AioImpl::Result ioResult) {
+        const auto ioStartTp = NowTime::Now();
+        io.callback = [this, task, w, fd = result.fd, last, id,
+                       ioStartTp](AioImpl::Result ioResult) {
+            static UC::Metrics::CachedMetric loadMetric{
+                "posix_load_io_completion_latency_ms"};
+            static UC::Metrics::CachedMetric dumpMetric{
+                "posix_dump_io_completion_latency_ms"};
+            UC::Metrics::UpdateStats(dump ? dumpMetric : loadMetric,
+                                     (NowTime::Now() - ioStartTp) * 1e3);
             OnIoCallback<dump>(task, w, fd, last, id, ioResult);
         };
         auto status = dump ? aio_.WriteAsync(std::move(io)) : aio_.ReadAsync(std::move(io));
@@ -184,6 +192,7 @@ private:
             task.activated = dump;
             task.flags = flags;
             task.tag = t->id;
+            task.dump = dump;
             task.callback = [this, t, w, i](BlockOperator::OpenResult result) {
                 OnOpenCallback<dump>(t, w, t->desc[i], result);
             };

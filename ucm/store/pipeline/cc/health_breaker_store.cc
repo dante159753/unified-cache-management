@@ -133,6 +133,11 @@ void HealthBreakerStore::Prefetch(const Detail::BlockId* blocks, size_t num)
     if (Enabled()) { store_->Prefetch(blocks, num); }
 }
 
+void HealthBreakerStore::Prefetch(const Detail::Shard* shards, size_t num)
+{
+    if (Enabled()) { store_->Prefetch(shards, num); }
+}
+
 Status HealthBreakerStore::CheckHealth()
 {
     if (!healthCheck_) { return Status::InvalidParam("health breaker store is not set up"); }

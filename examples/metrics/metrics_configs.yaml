@@ -88,6 +88,8 @@ counter:
     documentation: "Number of failed Posix health probes"
   - name: "posix_aio_timeout_total"
     documentation: "Number of Posix AIO task or submit timeouts"
+  - name: "posix_aio_eagain_total"
+    documentation: "Number of Posix AIO submit attempts rejected with EAGAIN because the kernel queue was saturated"
   - name: "posix_io_timeout_total"
     documentation: "Number of Posix synchronous worker task timeouts"
   - name: "posix_open_errors_total"
@@ -288,6 +290,18 @@ histogram:
   - name: "cache_load_backend_submit_duration_ms"
     documentation: "Cache load backend submit duration: buffer allocation plus synchronous backend load submission (ms)."
     buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500]
+  - name: "cache_load_waiting_queue_depth"
+    documentation: "Cache load dispatcher queue depth sampled after task submission"
+    buckets: [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+  - name: "cache_load_transfer_queue_depth"
+    documentation: "Cache load transfer queue depth sampled after a task's shards are dispatched"
+    buckets: [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  - name: "cache_load_transfer_queue_wait_ms"
+    documentation: "Per-shard time from transfer queue insertion until the transfer thread picks it up (ms)"
+    buckets: [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
+  - name: "cache_backend_wait_queue_depth"
+    documentation: "Number of later shards queued when the transfer thread starts waiting for the current shard backend completion"
+    buckets: [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
   - name: "cache_shard_backend_wait_ms"
     documentation: "Cache load per-shard time spent in WaitBackendTaskReady before H2D submit (ms). This is not a task-level duration."
     buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
@@ -297,6 +311,9 @@ histogram:
   - name: "cache_h2d_sync_ms"
     documentation: "Cache load residual H2D stream drain after the last shard submit (ms). Large => H2D copy is the bottleneck; ~0 with large cache_shard_backend_wait_ms => storage read is the bottleneck."
     buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
+  - name: "cache_h2d_batch_shards"
+    documentation: "Number of shards included in one Cache H2D launch"
+    buckets: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
   - name: "cache_dump_mkbuf_duration_ms"
     documentation: "Cache dump mk_buf phase: buffer allocation/reuse + D2H async submit before stream sync (ms)"
     buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
@@ -342,6 +359,42 @@ histogram:
   - name: "posix_dump_queue_wait_duration_ms"
     documentation: "Time a Posix dump task spent queued before first worker pickup (ms)"
     buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500]
+  - name: "posix_open_queue_depth"
+    documentation: "Posix open worker queue depth sampled on submission and worker pickup"
+    buckets: [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  - name: "posix_load_open_queue_wait_ms"
+    documentation: "Per-shard load time spent waiting for a Posix open worker (ms)"
+    buckets: [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
+  - name: "posix_dump_open_queue_wait_ms"
+    documentation: "Per-shard dump time spent waiting for a Posix open worker (ms)"
+    buckets: [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
+  - name: "posix_load_open_duration_ms"
+    documentation: "Posix load open syscall duration per shard (ms)"
+    buckets: [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50]
+  - name: "posix_dump_open_duration_ms"
+    documentation: "Posix dump open syscall duration per shard (ms)"
+    buckets: [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50]
+  - name: "posix_load_aio_submit_ms"
+    documentation: "Posix load io_submit duration including EAGAIN retry delay (ms)"
+    buckets: [0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100]
+  - name: "posix_dump_aio_submit_ms"
+    documentation: "Posix dump io_submit duration including EAGAIN retry delay (ms)"
+    buckets: [0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100]
+  - name: "posix_load_io_completion_latency_ms"
+    documentation: "Posix load latency from AIO request construction until its completion callback starts (ms)"
+    buckets: [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
+  - name: "posix_dump_io_completion_latency_ms"
+    documentation: "Posix dump latency from AIO request construction until its completion callback starts (ms)"
+    buckets: [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
+  - name: "posix_aio_inflight_depth"
+    documentation: "Posix AIO in-flight IO count sampled at submit and completion"
+    buckets: [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  - name: "posix_aio_completion_batch_size"
+    documentation: "Number of AIO completions harvested in one io_getevents batch"
+    buckets: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+  - name: "posix_aio_callback_batch_ms"
+    documentation: "Time spent executing callbacks and bookkeeping for one harvested AIO completion batch (ms)"
+    buckets: [0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50]
 
   # -- Mooncake stage -------------------------------------------------------
   - name: "mooncake_load_duration_ms"
@@ -458,6 +511,139 @@ histogram:
   # =========================================================================
   # Layerwise Connector — overlap / pipelining health
   # =========================================================================
+  # Primary signal: layerwise_wait_blocking_ms. If p99 is near 0, overlap is
+  # perfect; if it tracks load_duration closely, loading is the bottleneck
+  # and the layerwise design is degenerating into serial execution.
+  - name: "allgather_load_task_queue_depth"
+    documentation: "AllGather load task FIFO depth sampled after enqueue"
+    buckets: [1, 2, 4, 8, 16, 32, 64, 128]
+  - name: "allgather_load_windows"
+    documentation: "Number of fused windows processed by one AllGather load task"
+    buckets: [0, 1, 2, 4, 8, 16, 32, 64]
+  - name: "allgather_load_inner_wait_ms"
+    documentation: "Total time one AllGather task waits for inner Cache or Posix loads (ms)"
+    buckets: [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
+  - name: "allgather_load_collective_submit_ms"
+    documentation: "Total CPU time in all_gather_into_tensor calls for one load task (ms)"
+    buckets: [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100]
+  - name: "allgather_load_scatter_submit_ms"
+    documentation: "Total CPU time submitting compact scatter kernels for one load task (ms)"
+    buckets: [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100]
+  - name: "allgather_load_sync_ms"
+    documentation: "Final current-stream synchronization time after AllGather and compact scatter (ms)"
+    buckets: [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200]
+  - name: "allgather_load_slot_reclaim_wait_ms"
+    documentation: "Time blocked reclaiming a fused load slot whose completion event has not fired (ms)"
+    buckets: [0, 0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50]
+  - name: "allgather_task_queue_depth"
+    documentation: "AllGather tasks retained by one Store after enqueue"
+    buckets: [1, 2, 4, 8, 16, 32, 64, 128]
+  - name: "allgather_task_queue_wait_ms"
+    documentation: "Time from AllGather task submission until its shared runtime starts it (ms)"
+    buckets: [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
+  - name: "allgather_load_backend_submit_ms"
+    documentation: "Total backend load submission time for one AllGather load task (ms)"
+    buckets: [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50]
+  - name: "allgather_load_collective_device_ms"
+    documentation: "Sampled device execution time for AllGather collectives in one load task (ms)"
+    buckets: [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100]
+  - name: "allgather_load_scatter_device_ms"
+    documentation: "Sampled device execution time for compact scatter in one load task (ms)"
+    buckets: [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100]
+  - name: "allgather_load_total_ms"
+    documentation: "AllGather load runtime duration excluding shared FIFO wait (ms)"
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
+  - name: "allgather_dump_windows"
+    documentation: "Number of fused windows processed by one AllGather dump task"
+    buckets: [0, 1, 2, 4, 8, 16, 32, 64]
+  - name: "allgather_dump_backend_submit_ms"
+    documentation: "Total backend dump submission time for one AllGather dump task (ms)"
+    buckets: [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50]
+  - name: "allgather_dump_backend_wait_ms"
+    documentation: "Total backend wait time for one AllGather dump task (ms)"
+    buckets: [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
+  - name: "allgather_dump_sync_ms"
+    documentation: "Final AllGather dump progress-stream synchronization time (ms)"
+    buckets: [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100]
+  - name: "allgather_dump_total_ms"
+    documentation: "AllGather dump runtime duration excluding shared FIFO wait (ms)"
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
+  - name: "layerwise_batch_total_ms"
+    documentation: "Layerwise batch wall-clock time from start_load_kv entry to wait_for_save return (ms)"
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000]
+  - name: "layerwise_batch_total_load_only_ms"
+    documentation: "Layerwise load-only batch wall-clock time from start_load_kv entry to wait_for_save return (ms)"
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000]
+  - name: "layerwise_batch_total_save_only_ms"
+    documentation: "Layerwise save-only batch wall-clock time from start_load_kv entry to wait_for_save return (ms)"
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000]
+  - name: "layerwise_batch_total_load_save_ms"
+    documentation: "Layerwise load-and-save batch wall-clock time from start_load_kv entry to wait_for_save return (ms)"
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000]
+  - name: "layerwise_batch_total_no_transfer_ms"
+    documentation: "Layerwise batch wall-clock time with neither load nor save work (ms)"
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000]
+  - name: "layerwise_batch_load_wait_total_load_only_ms"
+    documentation: "Total wait_for_layer_load blocking time accumulated within one load-only layerwise batch (ms)"
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000]
+  - name: "layerwise_batch_load_wait_total_load_save_ms"
+    documentation: "Total wait_for_layer_load blocking time accumulated within one load-and-save layerwise batch (ms)"
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000]
+  - name: "layerwise_batch_save_tail_save_only_ms"
+    documentation: "wait_for_save tail duration within one save-only layerwise batch (ms)"
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000]
+  - name: "layerwise_batch_save_tail_load_save_ms"
+    documentation: "wait_for_save tail duration within one load-and-save layerwise batch (ms)"
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000]
+  - name: "layerwise_wait_blocking_ms"
+    documentation: "Time wait_for_layer_load blocked before returning (ms). Near 0 = good overlap."
+    buckets: [0, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
+  - name: "layerwise_wait_tasks_count"
+    documentation: "Number of per-request load tasks awaited in a single layer wait"
+    buckets: [0, 1, 2, 4, 8, 16, 32, 64]
+  - name: "layerwise_inter_wait_interval_ms"
+    documentation: "Interval between consecutive wait_for_layer_load calls (~forward time) (ms)"
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
+  - name: "layerwise_next_layer_submit_ms"
+    documentation: "Time to submit next layer's load tasks inside wait_for_layer_load (ms)"
+    buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50]
+  - name: "layerwise_first_layer_submit_ms"
+    documentation: "Time to submit first layer load tasks during start_load_kv - TTFT critical (ms)"
+    buckets: [0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100]
+  - name: "layerwise_first_layer_requests"
+    documentation: "Number of requests whose first-layer load was submitted in start_load_kv"
+    buckets: [0, 1, 2, 4, 8, 16, 32, 64, 128]
+  - name: "layerwise_save_submit_ms"
+    documentation: "Time to submit one layer's dump task in save_kv_layer (ms)"
+    buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50]
+  - name: "layerwise_save_tail_total_ms"
+    documentation: "Legacy metric; LayerWise no longer waits for dump completion in wait_for_save"
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000]
+
+  # =========================================================================
+  # FAWA Connector
+  # =========================================================================
+  # visualize major time span for TTFT
+
+  - name: "fawa_scheduler_lookup_external_hit_blocks_ms"
+    documentation: "store lookup latency"
+    buckets: [1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 30, 40, 50]
+
+  - name: "fawa_scheduler_get_num_new_matched_tokens_ms"
+    documentation: "store lookup latency + generate block hash latency"
+    buckets: [1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 30, 40, 50]
+
+  - name: "fawa_worker_wait_wait_all_load_task_ms"
+    documentation: "store load latency"
+    buckets: [1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800, 850, 900, 950, 1000, 1250, 1500, 1750, 2000]
+
+  - name: "fawa_worker_start_load_kv_ms"
+    documentation: "store load task latency + generate task latency"
+    buckets: [1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800, 850, 900, 950, 1000, 1250, 1500, 1750, 2000]
+
+  - name: "fawa_worker_wait_for_save_ms"
+    documentation: "store dump task latency"
+    buckets: [1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 100, 150, 200, 250, 300, 350, 400, 450, 500]
   - name: "layerwise_layer_load_duration_ms"
     documentation: "Layerwise per-layer wall-clock time from layer load start to wait_for_layer_load return (ms)"
     buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000]

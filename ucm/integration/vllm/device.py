@@ -107,6 +107,9 @@ class Device(ABC):
         )
         return worker_cores, store_cores
 
+    def get_numa_node(self, local_rank: int) -> Optional[int]:
+        return None
+
 
 class CudaDevice(Device):
     def __init__(self):
@@ -243,6 +246,7 @@ class NpuDevice(Device):
 
     def __init__(self):
         super().__init__()
+        self._numa_node_cache: Dict[int, Optional[int]] = {}
 
     def get_event_handle(self) -> int:
         import acl
@@ -349,6 +353,73 @@ class NpuDevice(Device):
             return sorted(list(self._get_device_map_info().keys()))
         except Exception:
             return list(range(torch.npu.device_count()))
+
+    def get_numa_node(self, local_rank: int) -> Optional[int]:
+        device_id = self._get_device_id(local_rank)
+        if device_id in self._numa_node_cache:
+            return self._numa_node_cache[device_id]
+
+        all_devices = {}
+        try:
+            all_devices = self._get_device_map_info()
+            self._get_pcie_info(all_devices)
+            self._get_numa_info(all_devices)
+
+            devices_by_node: Dict[int, List[int]] = {}
+            for physical_id, topology in all_devices.items():
+                if topology.numa_id is not None:
+                    devices_by_node.setdefault(topology.numa_id, []).append(physical_id)
+
+            used_nodes = set()
+            for pcie_numa_node in sorted(devices_by_node):
+                physical_id = min(devices_by_node[pcie_numa_node])
+                self._numa_node_cache[physical_id] = pcie_numa_node
+                used_nodes.add(pcie_numa_node)
+
+            for pcie_numa_node in sorted(devices_by_node):
+                physical_ids = sorted(devices_by_node[pcie_numa_node])
+                candidates = self._get_nearest_numa_nodes(pcie_numa_node)
+                for physical_id in physical_ids[1:]:
+                    assigned_node = next(
+                        (node for node in candidates if node not in used_nodes),
+                        pcie_numa_node,
+                    )
+                    self._numa_node_cache[physical_id] = assigned_node
+                    used_nodes.add(assigned_node)
+
+            for physical_id in all_devices:
+                self._numa_node_cache.setdefault(physical_id, None)
+        except Exception as e:
+            logger.warning(f"[NUMA] failed to resolve NUMA allocation nodes: {e}")
+
+        numa_node = self._numa_node_cache.get(device_id)
+        if numa_node is not None:
+            pcie_numa_node = all_devices.get(device_id)
+            logger.info(
+                f"[NUMA] local_rank={local_rank}, physical_device={device_id}, "
+                f"pcie_numa_node={getattr(pcie_numa_node, 'numa_id', None)}, "
+                f"allocation_numa_node={numa_node}"
+            )
+        else:
+            logger.warning(
+                f"[NUMA] cannot resolve allocation node for physical NPU device "
+                f"{device_id}, local_rank={local_rank}"
+            )
+        return numa_node
+
+    def _get_nearest_numa_nodes(self, numa_node: int) -> List[int]:
+        distance_path = f"/sys/devices/system/node/node{numa_node}/distance"
+        try:
+            with open(distance_path) as f:
+                distances = [int(value) for value in f.read().split()]
+            return sorted(
+                range(len(distances)), key=lambda node: (distances[node], node)
+            )
+        except Exception as e:
+            logger.warning(
+                f"[NUMA] failed to read distance matrix for node {numa_node}: {e}"
+            )
+            return [numa_node]
 
     def _get_device_map_info(self) -> Dict[int, "NpuDevice.NpuDeviceInfo"]:
         device_map_info: Dict[int, NpuDevice.NpuDeviceInfo] = {}

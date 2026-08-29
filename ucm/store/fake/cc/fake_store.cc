@@ -23,6 +23,11 @@
  * */
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
+#include <vector>
 #include "logger/logger.h"
 #include "meta_manager.h"
 #include "time/stopwatch.h"
@@ -40,6 +45,9 @@ public:
         inConfig.Get("unique_id", config.uniqueId);
         inConfig.GetNumber("buffer_number", config.bufferNumber);
         inConfig.Get("share_buffer_enable", config.shareBufferEnable);
+        inConfig.Get("fake_always_hit", config.alwaysHit);
+        inConfig.Get("fake_fail_load", config.failLoad);
+        inConfig.GetNumbers("fake_load_delay_us", loadDelaysUs_);
         auto s = CheckConfig(config);
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed to check config params: {}.", s);
@@ -47,12 +55,15 @@ public:
         }
         s = metaMgr_.Setup(config);
         if (s.Failure()) [[unlikely]] { return s; }
+        alwaysHit_ = config.alwaysHit;
+        failLoad_ = config.failLoad;
         ShowConfig(config);
         return Status::OK();
     }
     std::string Readme() const override { return "FakeStore"; }
     Expected<std::vector<uint8_t>> Lookup(const Detail::BlockId* blocks, size_t num) override
     {
+        if (alwaysHit_) { return std::vector<uint8_t>(num, true); }
         std::vector<uint8_t> founds(num);
         StopWatch sw;
         std::transform(blocks, blocks + num, founds.begin(),
@@ -62,6 +73,7 @@ public:
     }
     Expected<ssize_t> LookupOnPrefix(const Detail::BlockId* blocks, size_t num) override
     {
+        if (alwaysHit_) { return static_cast<ssize_t>(num) - 1; }
         ssize_t index = -1;
         StopWatch sw;
         for (size_t i = 0; i < num && metaMgr_.Exist(blocks[i]); i++) {
@@ -84,7 +96,20 @@ public:
         return static_cast<ssize_t>(-1);
     }
     void Prefetch(const Detail::BlockId* blocks, size_t num) override {}
-    Expected<Detail::TaskHandle> Load(Detail::TaskDesc task) override { return NextId(); }
+    Expected<Detail::TaskHandle> Load(Detail::TaskDesc task) override
+    {
+        if (failLoad_) { return Status::Error("injected fake load failure"); }
+        auto handle = NextId();
+        if (!loadDelaysUs_.empty()) {
+            const auto sequence = loadSequence_.fetch_add(1, std::memory_order_relaxed);
+            const auto readyAt = std::chrono::steady_clock::now() +
+                                 std::chrono::microseconds(loadDelaysUs_[sequence %
+                                                                       loadDelaysUs_.size()]);
+            std::lock_guard<std::mutex> lock(loadMutex_);
+            loadReadyAt_[handle] = readyAt;
+        }
+        return handle;
+    }
     Expected<Detail::TaskHandle> Dump(Detail::TaskDesc task) override
     {
         StopWatch sw;
@@ -93,8 +118,25 @@ public:
         UC_DEBUG("Fake dump({}) costs {:.3f}ms.", task.size(), sw.Elapsed().count() * 1e3);
         return NextId();
     }
-    Expected<bool> Check(Detail::TaskHandle taskId) override { return true; }
-    Status Wait(Detail::TaskHandle taskId) override { return Status::OK(); }
+    Expected<bool> Check(Detail::TaskHandle taskId) override
+    {
+        std::lock_guard<std::mutex> lock(loadMutex_);
+        const auto found = loadReadyAt_.find(taskId);
+        return found == loadReadyAt_.end() || std::chrono::steady_clock::now() >= found->second;
+    }
+    Status Wait(Detail::TaskHandle taskId) override
+    {
+        std::chrono::steady_clock::time_point readyAt;
+        {
+            std::lock_guard<std::mutex> lock(loadMutex_);
+            const auto found = loadReadyAt_.find(taskId);
+            if (found == loadReadyAt_.end()) { return Status::OK(); }
+            readyAt = found->second;
+            loadReadyAt_.erase(found);
+        }
+        std::this_thread::sleep_until(readyAt);
+        return Status::OK();
+    }
 
 private:
     static Detail::TaskHandle NextId() noexcept
@@ -120,7 +162,16 @@ private:
         UC_INFO("Set {}::UniqueId to {}.", ns, config.uniqueId);
         UC_INFO("Set {}::BufferNumber to {}.", ns, config.bufferNumber);
         UC_INFO("Set {}::ShareBufferEnable to {}.", ns, config.shareBufferEnable);
+        UC_INFO("Set {}::AlwaysHit to {}.", ns, config.alwaysHit);
+        UC_INFO("Set {}::FailLoad to {}.", ns, config.failLoad);
     }
+
+    bool alwaysHit_{false};
+    bool failLoad_{false};
+    std::vector<uint64_t> loadDelaysUs_;
+    std::atomic<size_t> loadSequence_{0};
+    std::mutex loadMutex_;
+    std::unordered_map<Detail::TaskHandle, std::chrono::steady_clock::time_point> loadReadyAt_;
 };
 
 }  // namespace UC::FakeStore

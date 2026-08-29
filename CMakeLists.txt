@@ -18,6 +18,10 @@ option(DOWNLOAD_DEPENDENCE "download dependence by cmake." ON)
 set(RUNTIME_ENVIRONMENT "simu" CACHE STRING "runtime: simu, ascend, ascend-a3, musa or cuda.")
 set(UCM_CXX11_ABI "" CACHE STRING "glibc++ ABI for MindIE builds: 0 or 1")
 
+if(RUNTIME_ENVIRONMENT STREQUAL "cuda")
+    enable_language(CUDA)
+endif()
+
 set(UCM_RUNTIME_ASCEND_FAMILY OFF)
 set(UCM_RUNTIME_ASCEND_IO_AGGREGATION OFF)
 set(UCM_RUNTIME_ASCEND_SDMA_DIRECT OFF)

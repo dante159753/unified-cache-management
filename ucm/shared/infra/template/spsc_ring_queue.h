@@ -42,7 +42,7 @@ class SpscRingQueue {
     size_t capacity_{0};
     std::unique_ptr<T[]> buffer_;
 
-    size_t Mod(size_t n) { return pow2_ ? (n & mask_) : (n % capacity_); }
+    size_t Mod(size_t n) const { return pow2_ ? (n & mask_) : (n % capacity_); }
 
 public:
     void Setup(size_t capacity)
@@ -86,6 +86,13 @@ public:
         value = std::move(buffer_[currentTail]);
         tail_.store(Mod(currentTail + 1), std::memory_order_release);
         return true;
+    }
+
+    size_t Size() const noexcept
+    {
+        const auto head = head_.load(std::memory_order_acquire);
+        const auto tail = tail_.load(std::memory_order_acquire);
+        return head >= tail ? head - tail : capacity_ - tail + head;
     }
 
     template <typename ConsumerHandler, typename... Args>

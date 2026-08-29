@@ -133,6 +133,13 @@ _COUNTER_METRICS = [
         "Number of Posix AIO task or submit timeouts",
     ),
     (
+        "posix_aio_eagain_total",
+        (
+            "Number of Posix AIO submit attempts rejected with EAGAIN because the "
+            "kernel queue was saturated"
+        ),
+    ),
+    (
         "posix_io_timeout_total",
         "Number of Posix synchronous worker task timeouts",
     ),
@@ -515,6 +522,32 @@ _HISTOGRAM_METRICS = [
         [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
     ),
     (
+        "cache_load_waiting_queue_depth",
+        "Cache load dispatcher queue depth sampled after task submission",
+        [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024],
+    ),
+    (
+        "cache_load_transfer_queue_depth",
+        "Cache load transfer queue depth sampled after a task's shards are dispatched",
+        [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
+    ),
+    (
+        "cache_load_transfer_queue_wait_ms",
+        (
+            "Per-shard time from transfer queue insertion until the transfer thread "
+            "picks it up (ms)"
+        ),
+        [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "cache_backend_wait_queue_depth",
+        (
+            "Number of later shards queued when the transfer thread starts waiting "
+            "for the current shard backend completion"
+        ),
+        [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
+    ),
+    (
         "cache_shard_backend_wait_ms",
         (
             "Cache load per-shard time spent in WaitBackendTaskReady before H2D submit "
@@ -538,6 +571,11 @@ _HISTOGRAM_METRICS = [
             "cache_shard_backend_wait_ms => storage read is the bottleneck."
         ),
         [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "cache_h2d_batch_shards",
+        "Number of shards included in one Cache H2D launch",
+        [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024],
     ),
     (
         "cache_dump_mkbuf_duration_ms",
@@ -616,6 +654,69 @@ _HISTOGRAM_METRICS = [
         "posix_dump_queue_wait_duration_ms",
         "Time a Posix dump task spent queued before first worker pickup (ms)",
         [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
+    ),
+    (
+        "posix_open_queue_depth",
+        "Posix open worker queue depth sampled on submission and worker pickup",
+        [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
+    ),
+    (
+        "posix_load_open_queue_wait_ms",
+        "Per-shard load time spent waiting for a Posix open worker (ms)",
+        [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "posix_dump_open_queue_wait_ms",
+        "Per-shard dump time spent waiting for a Posix open worker (ms)",
+        [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "posix_load_open_duration_ms",
+        "Posix load open syscall duration per shard (ms)",
+        [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50],
+    ),
+    (
+        "posix_dump_open_duration_ms",
+        "Posix dump open syscall duration per shard (ms)",
+        [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50],
+    ),
+    (
+        "posix_load_aio_submit_ms",
+        "Posix load io_submit duration including EAGAIN retry delay (ms)",
+        [0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100],
+    ),
+    (
+        "posix_dump_aio_submit_ms",
+        "Posix dump io_submit duration including EAGAIN retry delay (ms)",
+        [0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100],
+    ),
+    (
+        "posix_load_io_completion_latency_ms",
+        "Posix load latency from AIO request construction until its completion callback starts (ms)",
+        [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "posix_dump_io_completion_latency_ms",
+        "Posix dump latency from AIO request construction until its completion callback starts (ms)",
+        [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "posix_aio_inflight_depth",
+        "Posix AIO in-flight IO count sampled at submit and completion",
+        [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
+    ),
+    (
+        "posix_aio_completion_batch_size",
+        "Number of AIO completions harvested in one io_getevents batch",
+        [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
+    ),
+    (
+        "posix_aio_callback_batch_ms",
+        (
+            "Time spent executing callbacks and bookkeeping for one harvested AIO "
+            "completion batch (ms)"
+        ),
+        [0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50],
     ),
     (
         "mooncake_load_duration_ms",
@@ -714,6 +815,227 @@ _HISTOGRAM_METRICS = [
         "layerwise_batch_load_duration_sum_ms",
         "Sum of per-layer load durations within one Layerwise batch (ms)",
         [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000],
+    ),
+    (
+        "allgather_load_task_queue_depth",
+        "AllGather load task FIFO depth sampled after enqueue",
+        [1, 2, 4, 8, 16, 32, 64, 128],
+    ),
+    (
+        "allgather_load_windows",
+        "Number of fused windows processed by one AllGather load task",
+        [0, 1, 2, 4, 8, 16, 32, 64],
+    ),
+    (
+        "allgather_load_inner_wait_ms",
+        "Total time one AllGather task waits for inner Cache or Posix loads (ms)",
+        [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "allgather_load_collective_submit_ms",
+        "Total CPU time in all_gather_into_tensor calls for one load task (ms)",
+        [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100],
+    ),
+    (
+        "allgather_load_scatter_submit_ms",
+        "Total CPU time submitting compact scatter kernels for one load task (ms)",
+        [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100],
+    ),
+    (
+        "allgather_load_sync_ms",
+        "Final current-stream synchronization time after AllGather and compact scatter (ms)",
+        [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200],
+    ),
+    (
+        "allgather_load_slot_reclaim_wait_ms",
+        "Time blocked reclaiming a fused load slot whose completion event has not fired (ms)",
+        [0, 0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50],
+    ),
+    (
+        "allgather_task_queue_depth",
+        "AllGather tasks retained by one Store after enqueue",
+        [1, 2, 4, 8, 16, 32, 64, 128],
+    ),
+    (
+        "allgather_task_queue_wait_ms",
+        "Time from AllGather task submission until its shared runtime starts it (ms)",
+        [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "allgather_load_backend_submit_ms",
+        "Total backend load submission time for one AllGather load task (ms)",
+        [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50],
+    ),
+    (
+        "allgather_load_collective_device_ms",
+        "Sampled device execution time for AllGather collectives in one load task (ms)",
+        [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100],
+    ),
+    (
+        "allgather_load_scatter_device_ms",
+        "Sampled device execution time for compact scatter in one load task (ms)",
+        [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100],
+    ),
+    (
+        "allgather_load_total_ms",
+        "AllGather load runtime duration excluding shared FIFO wait (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "allgather_dump_windows",
+        "Number of fused windows processed by one AllGather dump task",
+        [0, 1, 2, 4, 8, 16, 32, 64],
+    ),
+    (
+        "allgather_dump_backend_submit_ms",
+        "Total backend dump submission time for one AllGather dump task (ms)",
+        [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50],
+    ),
+    (
+        "allgather_dump_backend_wait_ms",
+        "Total backend wait time for one AllGather dump task (ms)",
+        [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "allgather_dump_sync_ms",
+        "Final AllGather dump progress-stream synchronization time (ms)",
+        [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100],
+    ),
+    (
+        "allgather_dump_total_ms",
+        "AllGather dump runtime duration excluding shared FIFO wait (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "layerwise_batch_total_ms",
+        (
+            "Layerwise batch wall-clock time from start_load_kv entry to wait_for_save "
+            "return (ms)"
+        ),
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000],
+    ),
+    (
+        "layerwise_batch_total_load_only_ms",
+        (
+            "Layerwise load-only batch wall-clock time from start_load_kv entry to "
+            "wait_for_save return (ms)"
+        ),
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000],
+    ),
+    (
+        "layerwise_batch_total_save_only_ms",
+        (
+            "Layerwise save-only batch wall-clock time from start_load_kv entry to "
+            "wait_for_save return (ms)"
+        ),
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000],
+    ),
+    (
+        "layerwise_batch_total_load_save_ms",
+        (
+            "Layerwise load-and-save batch wall-clock time from start_load_kv entry to "
+            "wait_for_save return (ms)"
+        ),
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000],
+    ),
+    (
+        "layerwise_batch_total_no_transfer_ms",
+        "Layerwise batch wall-clock time with neither load nor save work (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000],
+    ),
+    (
+        "layerwise_batch_load_wait_total_load_only_ms",
+        (
+            "Total wait_for_layer_load blocking time accumulated within one load-only "
+            "layerwise batch (ms)"
+        ),
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000],
+    ),
+    (
+        "layerwise_batch_load_wait_total_load_save_ms",
+        (
+            "Total wait_for_layer_load blocking time accumulated within one "
+            "load-and-save layerwise batch (ms)"
+        ),
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000],
+    ),
+    (
+        "layerwise_batch_save_tail_save_only_ms",
+        "wait_for_save tail duration within one save-only layerwise batch (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000],
+    ),
+    (
+        "layerwise_batch_save_tail_load_save_ms",
+        "wait_for_save tail duration within one load-and-save layerwise batch (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000],
+    ),
+    (
+        "layerwise_wait_blocking_ms",
+        "Time wait_for_layer_load blocked before returning (ms). Near 0 = good overlap.",
+        [0, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "layerwise_wait_tasks_count",
+        "Number of per-request load tasks awaited in a single layer wait",
+        [0, 1, 2, 4, 8, 16, 32, 64],
+    ),
+    (
+        "layerwise_inter_wait_interval_ms",
+        "Interval between consecutive wait_for_layer_load calls (~forward time) (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "layerwise_next_layer_submit_ms",
+        "Time to submit next layer's load tasks inside wait_for_layer_load (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50],
+    ),
+    (
+        "layerwise_first_layer_submit_ms",
+        (
+            "Time to submit first layer load tasks during start_load_kv - TTFT critical "
+            "(ms)"
+        ),
+        [0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100],
+    ),
+    (
+        "layerwise_first_layer_requests",
+        "Number of requests whose first-layer load was submitted in start_load_kv",
+        [0, 1, 2, 4, 8, 16, 32, 64, 128],
+    ),
+    (
+        "layerwise_save_submit_ms",
+        "Time to submit one layer's dump task in save_kv_layer (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50],
+    ),
+    (
+        "layerwise_save_tail_total_ms",
+        "Legacy metric; LayerWise no longer waits for dump completion in wait_for_save",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000],
+    ),
+    (
+        "fawa_scheduler_lookup_external_hit_blocks_ms",
+        "store lookup latency",
+        [1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 30, 40, 50],
+    ),
+    (
+        "fawa_scheduler_get_num_new_matched_tokens_ms",
+        "store lookup latency + generate block hash latency",
+        [1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 30, 40, 50],
+    ),
+    (
+        "fawa_worker_wait_wait_all_load_task_ms",
+        "store load latency",
+        [1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800, 850, 900, 950, 1000, 1250, 1500, 1750, 2000],
+    ),
+    (
+        "fawa_worker_start_load_kv_ms",
+        "store load task latency + generate task latency",
+        [1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800, 850, 900, 950, 1000, 1250, 1500, 1750, 2000],
+    ),
+    (
+        "fawa_worker_wait_for_save_ms",
+        "store dump task latency",
+        [1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 100, 150, 200, 250, 300, 350, 400, 450, 500],
     ),
 ]
 

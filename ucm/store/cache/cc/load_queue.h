@@ -31,6 +31,7 @@
 #include "template/hashset.h"
 #include "template/spsc_ring_queue.h"
 #include "thread/latch.h"
+#include "thread/thread_pool.h"
 #include "trans_buffer.h"
 #include "trans_task.h"
 #include "ucmstore_v1.h"
@@ -48,7 +49,12 @@ class LoadQueue {
         TransBuffer::Handle bufferHandle;
         Detail::TaskHandle backendTaskHandle;
         WaiterPtr waiter;
+        double transferEnqueueTp{0};
         bool fromPosix{false};
+    };
+    struct PrefetchShardTask {
+        TransBuffer::Handle bufferHandle;
+        Detail::TaskHandle backendTaskHandle{};
     };
 
 private:
@@ -70,11 +76,13 @@ private:
     std::thread dispatcher_;
     std::thread transfer_;
     std::vector<ShardTask> holder_;
+    ThreadPool<std::vector<PrefetchShardTask>> prefetchPool_;
 
 public:
     ~LoadQueue();
     Status Setup(const Config& config, TaskIdSet* failureSet, TransBuffer* buffer);
     void Submit(TaskPtr task, WaiterPtr waiter);
+    void Prefetch(const Detail::Shard* shards, size_t num);
 
 private:
     void DispatchStage();
@@ -88,6 +96,7 @@ private:
     void RecordLoadSourceShards(size_t total, size_t wait) const;
     void RecordFailedShards(size_t count) const;
     void RecordH2dSyncMetrics(double h2dSyncMs) const;
+    void CompletePrefetch(std::vector<PrefetchShardTask>& tasks);
 };
 
 }  // namespace UC::CacheStore

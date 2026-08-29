@@ -47,6 +47,7 @@ public:
         if (s.Failure()) [[unlikely]] { return s; }
         return dumpQ_.Setup(config, &failureSet_, buffer);
     }
+    void Prefetch(const Detail::Shard* shards, size_t num) { loadQ_.Prefetch(shards, num); }
 
 protected:
     Status FailureStatus(const TaskPtr& task) const override { return task->FailureStatus(); }

@@ -144,9 +144,14 @@ public:
     PipelineStore() = default;
     ~PipelineStore()
     {
+        Close();
+    }
+    void Close()
+    {
         for (auto& healthBreakerStore : healthBreakerStores_) { healthBreakerStore->Stop(); }
         healthBreakerStores_.clear();
         while (!stores_.empty()) { stores_.pop_back(); }
+        entry_ = nullptr;
     }
     void Stack(const std::string& name, const std::string& path, const py::dict& dict)
     {
@@ -274,4 +279,5 @@ PYBIND11_MODULE(ucmpipelinestore, m)
           py::arg("addrs").noconvert(), py::arg("prerequisite_handle") = 0);
     s.def("Check", &PipelineStore::Check);
     s.def("Wait", &PipelineStore::Wait);
+    s.def("Close", &PipelineStore::Close, py::call_guard<py::gil_scoped_release>());
 }

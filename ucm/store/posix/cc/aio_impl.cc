@@ -32,6 +32,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #include "logger/logger.h"
+#include "metrics_api.h"
 #include "thread/cpu_affinity.h"
 #include "time/now_time.h"
 
@@ -215,7 +216,7 @@ Status AioImpl::ReadAsync(Io&& io)
     AioPrepareRead(cb.get(), io.fd, io.buffer, io.length, io.offset);
     cb->aio_data = (uintptr_t)(void*)data.get();
     Track(io.tag, cb.get());
-    auto status = SubmitIo(cb.get());
+    auto status = SubmitIo(cb.get(), false);
     if (status.Failure()) {
         Untrack(cb.get());
         UC_ERROR("Failed({}) to submit read io.", status);
@@ -232,7 +233,7 @@ Status AioImpl::WriteAsync(Io&& io)
     AioPrepareWrite(cb.get(), io.fd, io.buffer, io.length, io.offset);
     cb->aio_data = (uintptr_t)(void*)data.get();
     Track(io.tag, cb.get());
-    auto status = SubmitIo(cb.get());
+    auto status = SubmitIo(cb.get(), true);
     if (status.Failure()) {
         Untrack(cb.get());
         UC_ERROR("Failed({}) to submit write io.", status);
@@ -279,8 +280,16 @@ void AioImpl::MaybeSweep()
 void AioImpl::HarvestCompletions(std::vector<io_event>& events)
 {
     auto batchSize = static_cast<int>(events.size());
-    while (!stop_) {
-        auto num = AioGetEvents(ctx_, 1, batchSize, events.data(), nullptr);
+    for (;;) {
+        timespec timeout{};
+        auto num = AioGetEvents(ctx_, 0, batchSize, events.data(), &timeout);
+        if (num < 0) {
+            auto eno = errno;
+            if (eno == EINTR) { continue; }
+            UC_WARN("Failed({}) to harvest AIO completions.", eno);
+            break;
+        }
+        const auto callbackStartTp = NowTime::Now();
         for (auto i = 0; i < num; i++) {
             auto* iocbPtr = reinterpret_cast<struct iocb*>(events[i].obj);
             auto cb = (Callback*)(void*)events[i].data;
@@ -299,7 +308,17 @@ void AioImpl::HarvestCompletions(std::vector<io_event>& events)
             if (iocbPtr) {
                 Untrack(iocbPtr);
                 delete iocbPtr;
+                inflight_.fetch_sub(1, std::memory_order_relaxed);
             }
+        }
+        if (num > 0) {
+            UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("posix_aio_completion_batch_size"),
+                                     static_cast<double>(num));
+            UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("posix_aio_callback_batch_ms"),
+                                     (NowTime::Now() - callbackStartTp) * 1e3);
+            UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("posix_aio_inflight_depth"),
+                                     static_cast<double>(
+                                         inflight_.load(std::memory_order_relaxed)));
         }
         if (num < batchSize) { break; }
     }
@@ -360,6 +379,7 @@ void AioImpl::CancelTask(uint64_t tag)
             delete cb;
         }
         delete cbp;
+        inflight_.fetch_sub(1, std::memory_order_relaxed);
     }
     if (!cancelled.empty() || uncancellable > 0) {
         UC_WARN("AIO cancel task({}): {} cancelled, {} in-flight/uncancellable.", tag,
@@ -367,16 +387,35 @@ void AioImpl::CancelTask(uint64_t tag)
     }
 }
 
-Status AioImpl::SubmitIo(iocb* cb)
+Status AioImpl::SubmitIo(iocb* cb, bool write)
 {
     AioSetEventFd(cb, eventFd_);
+    const auto submitStartTp = NowTime::Now();
     const auto deadline = NowTime::Now() + static_cast<double>(submitTimeoutMs_) / 1000.0;
+    size_t eagainCount = 0;
+    const auto reservedDepth = inflight_.fetch_add(1, std::memory_order_relaxed) + 1;
     for (;;) {
         auto ret = AioSubmit(ctx_, 1, &cb);
         auto eno = errno;
-        if (ret == 1) { return Status::OK(); }
+        if (ret == 1) {
+            static UC::Metrics::CachedMetric loadMetric{"posix_load_aio_submit_ms"};
+            static UC::Metrics::CachedMetric dumpMetric{"posix_dump_aio_submit_ms"};
+            UC::Metrics::UpdateStats(write ? dumpMetric : loadMetric,
+                                     (NowTime::Now() - submitStartTp) * 1e3);
+            UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("posix_aio_inflight_depth"),
+                                     static_cast<double>(reservedDepth));
+            if (eagainCount != 0) {
+                UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("posix_aio_eagain_total"),
+                                         static_cast<double>(eagainCount));
+            }
+            return Status::OK();
+        }
         if (eno == EAGAIN) {
+            ++eagainCount;
             if (submitTimeoutMs_ > 0 && NowTime::Now() >= deadline) {
+                UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("posix_aio_eagain_total"),
+                                         static_cast<double>(eagainCount));
+                inflight_.fetch_sub(1, std::memory_order_relaxed);
                 UC_ERROR("io_submit EAGAIN for {}ms (in-flight queue saturated); giving up.",
                          submitTimeoutMs_);
                 return Status::Timeout();
@@ -384,6 +423,7 @@ Status AioImpl::SubmitIo(iocb* cb)
             std::this_thread::sleep_for(std::chrono::microseconds(200));
             continue;
         }
+        inflight_.fetch_sub(1, std::memory_order_relaxed);
         return Status::Error(std::string(strerror(eno)));
     }
 }

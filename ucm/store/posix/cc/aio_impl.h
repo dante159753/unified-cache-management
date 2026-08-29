@@ -74,7 +74,7 @@ private:
     void CompletionLoop();
     void MaybeSweep();
     void HarvestCompletions(std::vector<io_event>& events);
-    Status SubmitIo(struct iocb* cb);
+    Status SubmitIo(struct iocb* cb, bool write);
     void Track(uint64_t tag, struct iocb* cb);
     void Untrack(struct iocb* cb);
 
@@ -87,6 +87,7 @@ private:
     int32_t eventFd_{-1};
     int32_t epollFd_{-1};
     std::atomic_bool stop_{false};
+    std::atomic<size_t> inflight_{0};
     std::thread eventThread_;
     SweepFn sweepFn_{nullptr};
     double lastSweepTp_{0};
