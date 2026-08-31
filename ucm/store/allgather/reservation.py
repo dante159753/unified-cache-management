@@ -3,13 +3,9 @@ from __future__ import annotations
 from typing import Any
 
 from ucm.store.allgather.memory_plan import (
-    COLLECTIVE_BUFFER_COPIES,
-    COLLECTIVE_GROUPS_PER_STAGE,
-    DEFAULT_COLLECTIVE_BUFFER_MB,
     DEFAULT_DUMP_SLOTS,
     DEFAULT_FA_LOAD_SLOTS,
     DEFAULT_LOAD_SLOTS,
-    DEFAULT_RECEIVE_SLOTS,
     DEFAULT_WA_LOAD_SLOTS,
 )
 
@@ -105,11 +101,8 @@ def calculate_vllm_reservation(worker: Any) -> int:
     )
     load_slots = int(config.get("allgather_load_slots", DEFAULT_LOAD_SLOTS))
     dump_slots = int(config.get("allgather_dump_slots", DEFAULT_DUMP_SLOTS))
-    collective_buffer_mb = int(
-        config.get(
-            "allgather_collective_buffer_mb",
-            config.get("allgather_hccl_buffer_mb", DEFAULT_COLLECTIVE_BUFFER_MB),
-        )
+    buffered_remote_scatter = (
+        config.get("allgather_remote_scatter_mode", "batch_copy") == "copy_then_scatter"
     )
     blocks_per_chunk = _blocks_per_chunk(worker, config)
 
@@ -121,8 +114,6 @@ def calculate_vllm_reservation(worker: Any) -> int:
             if _stage_suffix(spec) == "wa"
             else DEFAULT_FA_LOAD_SLOTS
         )
-
-    collective_group_count = COLLECTIVE_GROUPS_PER_STAGE
 
     if use_layerwise:
         stage_inputs = [
@@ -151,19 +142,6 @@ def calculate_vllm_reservation(worker: Any) -> int:
 
     from ucm.store.allgather import ucm_allgather_runtime
 
-    remote_scatter = (
-        replicated
-        and tp_size > 1
-        and ucm_allgather_runtime.platform_name() == "cuda"
-    )
-    receive_slots = (
-        1
-        if remote_scatter
-        else int(config.get("allgather_receive_slots", DEFAULT_RECEIVE_SLOTS))
-    )
-    if not remote_scatter and receive_slots <= 0:
-        raise ValueError("allgather_receive_slots must be positive")
-
     stage_totals = [
         int(
             ucm_allgather_runtime.calculate_memory_plan(
@@ -174,8 +152,7 @@ def calculate_vllm_reservation(worker: Any) -> int:
                 stage_load_slots,
                 stage_dump_slots,
                 window_blocks,
-                min(receive_slots, stage_load_slots),
-                remote_scatter,
+                buffered_remote_scatter,
             )["total_bytes"]
         )
         for (
@@ -186,15 +163,5 @@ def calculate_vllm_reservation(worker: Any) -> int:
             stage_dump_slots,
         ) in stage_inputs
     ]
-    # FA and WA keep separate stage buffers even though their collective runtime
-    # is shared.
     total = sum(stage_totals) if not use_layerwise or is_fawa else max(stage_totals)
-    if replicated and tp_size > 1 and not remote_scatter:
-        total += (
-            collective_buffer_mb
-            * 1024
-            * 1024
-            * COLLECTIVE_BUFFER_COPIES
-            * collective_group_count
-        )
     return total

@@ -12,7 +12,7 @@ import statistics
 import time
 
 from _allgather_cache_store_benchmark import (
-    _broadcast_root_info,
+    _broadcast_remote_scatter_key,
     _find_free_port,
     _group_max_seconds,
     _make_block_ids,
@@ -124,7 +124,7 @@ def _make_load_store(
     world_size: int,
     device_id: int,
     unique_id: str,
-    root_info: list[int],
+    remote_scatter_key: list[int],
 ):
     from ucm.store.pipeline.connector import UcmPipelineStore
 
@@ -144,14 +144,10 @@ def _make_load_store(
             "allgather_world_size": world_size,
             "allgather_replicated_data": True,
             "allgather_runtime_key": f"allgather-cache-posix-mixed-{unique_id}",
-            "allgather_collective_root_info": root_info,
+            "allgather_remote_scatter_key": remote_scatter_key,
             "allgather_window_blocks_per_rank": args.window_blocks,
             "allgather_load_slots": args.load_slots,
-            "allgather_receive_slots": args.receive_slots,
             "allgather_dump_slots": 1,
-            "allgather_collective_buffer_mb": args.collective_buffer_mb,
-            "allgather_collective_mode": args.collective_mode,
-            "allgather_collective_variable_counts": args.variable_counts,
             "allgather_scatter_aiv_cores": args.scatter_aiv_cores,
             "allgather_profile_sample_every": args.profile_sample_every,
             "allgather_separate_dump_queue": True,
@@ -319,7 +315,7 @@ def _worker(
             torch, dist, time.perf_counter() - seed_started, device
         )
 
-        root_info = _broadcast_root_info(torch, dist, rank, device)
+        remote_scatter_key = _broadcast_remote_scatter_key(torch, dist, rank, device)
         load_store = _make_load_store(
             args,
             tensor_sizes,
@@ -328,7 +324,7 @@ def _worker(
             world_size,
             devices[rank],
             unique_id,
-            root_info,
+            remote_scatter_key,
         )
         tensors = _make_tensors(
             torch,
@@ -414,9 +410,6 @@ def _worker(
                 "shard_size": shard_size,
                 "window_blocks_per_rank": args.window_blocks,
                 "load_slots": args.load_slots,
-                "receive_slots": args.receive_slots,
-                "collective_mode": args.collective_mode,
-                "variable_counts": args.variable_counts,
                 "scatter_aiv_cores": args.scatter_aiv_cores,
                 "iterations": args.iterations,
                 "seed_posix_seconds": seed_seconds,
@@ -477,16 +470,8 @@ def main() -> None:
     parser.add_argument("--window-mb", type=float, default=8.0)
     parser.add_argument("--window-blocks", type=int, default=0)
     parser.add_argument("--load-slots", type=int, default=4)
-    parser.add_argument("--receive-slots", type=int, default=4)
     parser.add_argument("--cache-capacity-gb", type=int, default=4)
     parser.add_argument("--cache-streams", type=int, default=4)
-    parser.add_argument("--collective-buffer-mb", type=int, default=8)
-    parser.add_argument(
-        "--collective-mode",
-        choices=("auto", "host", "aicpu_ts", "aiv"),
-        default="host",
-    )
-    parser.add_argument("--disable-variable-counts", action="store_true")
     parser.add_argument("--scatter-aiv-cores", type=int, default=1)
     parser.add_argument("--posix-concurrency", type=int, default=128)
     parser.add_argument("--posix-lookup-concurrency", type=int, default=32)
@@ -513,10 +498,8 @@ def main() -> None:
             args.block_tokens,
             args.iterations,
             args.load_slots,
-            args.receive_slots,
             args.cache_capacity_gb,
             args.cache_streams,
-            args.collective_buffer_mb,
             args.scatter_aiv_cores,
             args.posix_concurrency,
             args.posix_lookup_concurrency,
@@ -544,7 +527,6 @@ def main() -> None:
     args.window_blocks = args.window_blocks or max(
         4, int(args.window_mb * 1024 * 1024) // shard_size
     )
-    args.variable_counts = not args.disable_variable_counts
     for path in args.storage_backends:
         os.makedirs(path, exist_ok=True)
 

@@ -1,6 +1,9 @@
 #include <acl/acl.h>
-#include <cstring>
-#include <hccl/hccl.h>
+#include <mutex>
+#include <random>
+#include <string>
+#include <unordered_map>
+#include <vector>
 #include "platform_runtime.h"
 
 namespace ucm_segmented_copy {
@@ -11,11 +14,9 @@ namespace ucm_compact_scatter {
 void Launch(void* stream, void* receiveBuffer, void* destinationAddresses, void* routes,
             void* chunks, uint32_t rowCount, uint32_t chunksPerBlock, uint32_t tensorCount,
             uint64_t rankStride, uint64_t shardSize, uint32_t usedCores);
-void LaunchFramed(void* stream, void* receiveBuffer, void* destinationAddresses, void* chunks,
-                  void* taskError, uint32_t rowCount, uint32_t worldSize, uint32_t windowBlocks,
-                  uint32_t chunksPerBlock, uint32_t tensorCount, uint64_t frameStride,
-                  uint64_t metadataBytes, uint64_t shardSize, uint64_t sequence, uint32_t round,
-                  uint32_t usedCores);
+void LaunchRemote(void* stream, void* peerBuffers, void* destinationAddresses, void* routes,
+                  void* chunks, uint32_t rowCount, uint32_t chunksPerBlock, uint32_t tensorCount,
+                  uint64_t shardSize, uint32_t usedCores);
 }  // namespace ucm_compact_scatter
 
 namespace UC::AllGatherStore {
@@ -29,16 +30,8 @@ Status AclStatus(aclError code, const char* operation)
                                      recent != nullptr ? recent : "no recent ACL message"));
 }
 
-Status HcclStatus(HcclResult code, const char* operation)
-{
-    if (code == HCCL_SUCCESS) { return Status::OK(); }
-    // HcclGetErrorString turns opaque codes such as 4 (HCCL_E_INTERNAL) into a
-    // description. Without it a collective failure only reports the number.
-    const auto* message = HcclGetErrorString(code);
-    return Status::Error(fmt::format("{} failed({}): {}", operation, static_cast<int>(code),
-                                     message != nullptr ? message : "unknown HCCL error"));
-}
-
+constexpr size_t kBootstrapKeyBytes = 32;
+constexpr size_t kIpcKeyBytes = 256;
 class AscendPlatformRuntime final : public PlatformRuntime {
 public:
     const char* Name() const override { return "ascend"; }
@@ -99,11 +92,6 @@ public:
         (void)timing;
         return AclStatus(aclrtCreateEvent(reinterpret_cast<aclrtEvent*>(event)),
                          "aclrtCreateEvent");
-    }
-
-    Status CreateInterprocessEvent(EventHandle*) override
-    {
-        return Status::Error("interprocess events are unavailable on Ascend");
     }
 
     void DestroyEvent(EventHandle event) override
@@ -182,86 +170,102 @@ public:
             "aclrtMemcpyAsync");
     }
 
-    bool SupportsRemoteScatter() const override { return false; }
-
-    Expected<std::vector<uint8_t>> ExportDeviceMemory(void*) override
+    Status CopyDeviceBatchAsync(StreamHandle stream, const DeviceCopy* copies,
+                                size_t count) override
     {
-        return Status::Error("device memory IPC is unavailable on Ascend");
-    }
-
-    Expected<std::vector<uint8_t>> ExportEvent(EventHandle) override
-    {
-        return Status::Error("event IPC is unavailable on Ascend");
-    }
-
-    Status OpenDeviceMemory(const std::vector<uint8_t>&, void**) override
-    {
-        return Status::Error("device memory IPC is unavailable on Ascend");
-    }
-
-    Status OpenEvent(const std::vector<uint8_t>&, EventHandle*) override
-    {
-        return Status::Error("event IPC is unavailable on Ascend");
-    }
-
-    void CloseDeviceMemory(void*) override {}
-
-    Expected<std::vector<uint8_t>> CreateRootInfo() override
-    {
-        HcclRootInfo info{};
-        auto status = HcclStatus(HcclGetRootInfo(&info), "HcclGetRootInfo");
-        if (status.Failure()) { return status; }
-        return std::vector<uint8_t>(
-            reinterpret_cast<uint8_t*>(info.internal),
-            reinterpret_cast<uint8_t*>(info.internal) + HCCL_ROOT_INFO_BYTES);
-    }
-
-    size_t RootInfoSize() const override { return HCCL_ROOT_INFO_BYTES; }
-
-    Status CreateCollective(uint32_t rank, uint32_t worldSize, uint32_t bufferMb,
-                            uint32_t expansionMode, const std::vector<uint8_t>& rootInfo,
-                            CollectiveHandle* collective) override
-    {
-        if (rootInfo.size() != HCCL_ROOT_INFO_BYTES) {
-            return Status::InvalidParam("invalid HCCL root info size({})", rootInfo.size());
+        if (count == 0) { return Status::OK(); }
+        if (stream == nullptr || copies == nullptr) {
+            return Status::InvalidParam("invalid device batch copy input");
         }
-        HcclRootInfo info{};
-        std::memcpy(info.internal, rootInfo.data(), HCCL_ROOT_INFO_BYTES);
-        HcclCommConfig config{};
-        HcclCommConfigInit(&config);
-        config.hcclBufferSize = bufferMb;
-        config.hcclOpExpansionMode = expansionMode;
-        return HcclStatus(HcclCommInitRootInfoConfig(worldSize, &info, rank, &config,
-                                                     reinterpret_cast<HcclComm*>(collective)),
-                          "HcclCommInitRootInfoConfig");
+        for (size_t i = 0; i < count; ++i) {
+            const auto& copy = copies[i];
+            if (copy.destination == nullptr || copy.source == nullptr || copy.bytes == 0) {
+                return Status::InvalidParam("invalid device batch copy descriptor({})", i);
+            }
+            const auto code =
+                aclrtMemcpyAsync(copy.destination, copy.bytes, copy.source, copy.bytes,
+                                 ACL_MEMCPY_DEFAULT, static_cast<aclrtStream>(stream));
+            if (code != ACL_SUCCESS) {
+                const auto* recent = aclGetRecentErrMsg();
+                return Status::Error(
+                    fmt::format("aclrtMemcpyAsync failed({}) at device batch item({}): {}", code, i,
+                                recent != nullptr ? recent : "no recent ACL message"));
+            }
+        }
+        return Status::OK();
     }
 
-    void DestroyCollective(CollectiveHandle collective) override
+    bool SupportsRemoteScatter() const override { return true; }
+
+    Expected<int32_t> IpcProcessId() override
     {
-        if (collective != nullptr) { (void)HcclCommDestroy(static_cast<HcclComm>(collective)); }
+        int32_t processId = 0;
+        auto status = AclStatus(aclrtDeviceGetBareTgid(&processId), "aclrtDeviceGetBareTgid");
+        if (status.Failure()) { return status; }
+        return processId;
     }
 
-    Status AllGather(void* send, void* receive, size_t bytes, CollectiveHandle collective,
-                     StreamHandle stream) override
+    Expected<std::vector<uint8_t>> ExportDeviceMemory(void* data, size_t bytes) override
     {
-        return HcclStatus(
-            HcclAllGather(send, receive, bytes, HCCL_DATA_TYPE_INT8,
-                          static_cast<HcclComm>(collective), static_cast<aclrtStream>(stream)),
-            "HcclAllGather");
+        std::vector<uint8_t> key(kIpcKeyBytes, 0);
+        auto status =
+            AclStatus(aclrtIpcMemGetExportKey(data, bytes, reinterpret_cast<char*>(key.data()),
+                                              key.size(), ACL_RT_IPC_MEM_EXPORT_FLAG_DEFAULT),
+                      "aclrtIpcMemGetExportKey");
+        if (status.Failure()) { return status; }
+        return key;
     }
 
-    bool SupportsAllGatherV() const override { return true; }
-
-    Status AllGatherV(void* send, size_t sendBytes, void* receive, const uint64_t* receiveCounts,
-                      const uint64_t* receiveDisplacements, CollectiveHandle collective,
-                      StreamHandle stream) override
+    Status AuthorizeDeviceMemory(const std::vector<uint8_t>& handle,
+                                 const std::vector<int32_t>& processIds) override
     {
-        return HcclStatus(
-            HcclAllGatherV(send, sendBytes, receive, receiveCounts, receiveDisplacements,
-                           HCCL_DATA_TYPE_INT8, static_cast<HcclComm>(collective),
-                           static_cast<aclrtStream>(stream)),
-            "HcclAllGatherV");
+        if (handle.size() != kIpcKeyBytes || processIds.empty()) {
+            return Status::InvalidParam("invalid Ascend IPC authorization input");
+        }
+        auto ids = processIds;
+        return AclStatus(aclrtIpcMemSetImportPid(reinterpret_cast<const char*>(handle.data()),
+                                                 ids.data(), ids.size()),
+                         "aclrtIpcMemSetImportPid");
     }
+
+    Status OpenDeviceMemory(const std::vector<uint8_t>& handle, void** data) override
+    {
+        if (handle.size() != kIpcKeyBytes) {
+            return Status::InvalidParam("invalid Ascend IPC memory handle size({})", handle.size());
+        }
+        auto status =
+            AclStatus(aclrtIpcMemImportByKey(data, reinterpret_cast<const char*>(handle.data()),
+                                             ACL_RT_IPC_MEM_IMPORT_FLAG_ENABLE_PEER_ACCESS),
+                      "aclrtIpcMemImportByKey");
+        if (status.Success()) {
+            std::lock_guard<std::mutex> lock(importsMutex_);
+            imports_[*data] = std::string(reinterpret_cast<const char*>(handle.data()));
+        }
+        return status;
+    }
+
+    void CloseDeviceMemory(void* data) override
+    {
+        std::string key;
+        {
+            std::lock_guard<std::mutex> lock(importsMutex_);
+            const auto found = imports_.find(data);
+            if (found == imports_.end()) { return; }
+            key = std::move(found->second);
+            imports_.erase(found);
+        }
+        (void)aclrtIpcMemClose(key.c_str());
+    }
+
+    Expected<std::vector<uint8_t>> CreateBootstrapKey() override
+    {
+        std::vector<uint8_t> key(kBootstrapKeyBytes);
+        std::random_device random;
+        for (auto& byte : key) { byte = static_cast<uint8_t>(random()); }
+        return key;
+    }
+
+    size_t BootstrapKeySize() const override { return kBootstrapKeyBytes; }
 
     Status LaunchSegmentedCopy(StreamHandle stream, void* descriptors, void* coreOffsets,
                                uint32_t usedWorkers) override
@@ -282,24 +286,20 @@ public:
         return Status::OK();
     }
 
-    Status LaunchRemoteScatter(StreamHandle, void*, void*, void*, void*, uint32_t, uint32_t,
-                               uint32_t, uint64_t, uint32_t) override
+    Status LaunchRemoteScatter(StreamHandle stream, void* peerBuffers, void* destinationAddresses,
+                               void* routes, void* chunks, uint32_t rowCount,
+                               uint32_t chunksPerBlock, uint32_t tensorCount, uint64_t shardSize,
+                               uint32_t usedWorkers) override
     {
-        return Status::Error("remote scatter is unavailable on Ascend");
-    }
-
-    Status LaunchFramedScatter(StreamHandle stream, void* receiveBuffer, void* destinationAddresses,
-                               void* chunks, void* taskError, uint32_t rowCount, uint32_t worldSize,
-                               uint32_t windowBlocks, uint32_t chunksPerBlock, uint32_t tensorCount,
-                               uint64_t frameStride, uint64_t metadataBytes, uint64_t shardSize,
-                               uint64_t sequence, uint32_t round, uint32_t usedWorkers) override
-    {
-        ucm_compact_scatter::LaunchFramed(stream, receiveBuffer, destinationAddresses, chunks,
-                                          taskError, rowCount, worldSize, windowBlocks,
-                                          chunksPerBlock, tensorCount, frameStride, metadataBytes,
-                                          shardSize, sequence, round, usedWorkers);
+        ucm_compact_scatter::LaunchRemote(stream, peerBuffers, destinationAddresses, routes, chunks,
+                                          rowCount, chunksPerBlock, tensorCount, shardSize,
+                                          usedWorkers);
         return Status::OK();
     }
+
+private:
+    std::mutex importsMutex_;
+    std::unordered_map<void*, std::string> imports_;
 };
 
 }  // namespace

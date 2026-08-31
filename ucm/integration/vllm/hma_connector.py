@@ -24,11 +24,7 @@ from ucm.integration.vllm.ucm_connector import (
 from ucm.logger import init_logger
 from ucm.shared.metrics import ucmmetrics
 from ucm.sparse.utils import round_up
-from ucm.store.allgather.memory_plan import (
-    COLLECTIVE_GROUPS_PER_STAGE,
-    DEFAULT_FA_LOAD_SLOTS,
-    DEFAULT_WA_LOAD_SLOTS,
-)
+from ucm.store.allgather.memory_plan import DEFAULT_FA_LOAD_SLOTS, DEFAULT_WA_LOAD_SLOTS
 from ucm.store.factory_v1 import UcmConnectorFactoryV1
 from ucm.store.pipeline.errors import StoreUnhealthyError
 from ucm.store.ucmstore_v1 import Task, UcmKVStoreBaseV1
@@ -720,7 +716,6 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         for setting in (
             "allgather_window_blocks_per_rank",
             "allgather_load_slots",
-            "allgather_load_groups",
             "allgather_dump_slots",
         ):
             stage_key = f"{setting}_{suffix}"
@@ -744,16 +739,6 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             fa_load_slots = int(config.get("allgather_load_slots_fa", fa_default_slots))
             wa_load_slots = int(config.get("allgather_load_slots_wa", wa_default_slots))
             config["allgather_runtime_slot_streams"] = max(fa_load_slots, wa_load_slots)
-            requested_groups = int(
-                config.get("allgather_load_groups", COLLECTIVE_GROUPS_PER_STAGE)
-            )
-            if requested_groups != COLLECTIVE_GROUPS_PER_STAGE:
-                logger.warning(
-                    f"Ignoring allgather_load_groups={requested_groups} for {label}: "
-                    f"the stage uses one ordered data path. Raise "
-                    f"allgather_load_slots_{suffix} to pipeline instead."
-                )
-            config["allgather_load_groups"] = COLLECTIVE_GROUPS_PER_STAGE
         if self._role == KVConnectorRole.WORKER:
             if tensor_size_list is None:
                 raise RuntimeError(f"Worker FAWA {label} store needs tensor sizes.")

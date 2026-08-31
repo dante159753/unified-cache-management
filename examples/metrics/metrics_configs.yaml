@@ -523,14 +523,20 @@ histogram:
   - name: "allgather_load_inner_wait_ms"
     documentation: "Total time one AllGather task waits for inner Cache or Posix loads (ms)"
     buckets: [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
-  - name: "allgather_load_collective_submit_ms"
-    documentation: "Total CPU time in all_gather_into_tensor calls for one load task (ms)"
+  - name: "allgather_load_prefetch_ms"
+    documentation: "Time spent submitting owner-filtered backend prefetch for one load task (ms)"
+    buckets: [0, 0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100]
+  - name: "allgather_load_metadata_ms"
+    documentation: "Total host time preparing and submitting remote-scatter metadata for one load task (ms)"
+    buckets: [0, 0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100]
+  - name: "allgather_load_remote_ready_submit_ms"
+    documentation: "Total CPU time publishing and waiting for remote-scatter readiness (ms)"
     buckets: [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100]
   - name: "allgather_load_scatter_submit_ms"
     documentation: "Total CPU time submitting compact scatter kernels for one load task (ms)"
     buckets: [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100]
   - name: "allgather_load_sync_ms"
-    documentation: "Final current-stream synchronization time after AllGather and compact scatter (ms)"
+    documentation: "Final completion-stream synchronization time after remote scatter (ms)"
     buckets: [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200]
   - name: "allgather_load_slot_reclaim_wait_ms"
     documentation: "Time blocked reclaiming a fused load slot whose completion event has not fired (ms)"
@@ -544,8 +550,8 @@ histogram:
   - name: "allgather_load_backend_submit_ms"
     documentation: "Total backend load submission time for one AllGather load task (ms)"
     buckets: [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50]
-  - name: "allgather_load_collective_device_ms"
-    documentation: "Sampled device execution time for AllGather collectives in one load task (ms)"
+  - name: "allgather_load_remote_ready_device_ms"
+    documentation: "Sampled device wait time for remote-scatter readiness in one load task (ms)"
     buckets: [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100]
   - name: "allgather_load_scatter_device_ms"
     documentation: "Sampled device execution time for compact scatter in one load task (ms)"

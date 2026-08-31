@@ -1,7 +1,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -18,7 +17,6 @@
 #include <utility>
 #include <vector>
 #include "allgather_runtime.h"
-#include "frame_protocol.h"
 #include "logger/logger.h"
 #include "memory_plan.h"
 #include "metrics_api.h"
@@ -29,35 +27,26 @@
 namespace UC::AllGatherStore {
 namespace {
 
-constexpr uint32_t kDefaultCollectiveBufferMb = 8;
 constexpr size_t kDefaultLoadSlots = 2;
 constexpr size_t kDefaultDumpSlots = 2;
-constexpr size_t kDefaultReceiveSlots = 2;
 using Clock = std::chrono::steady_clock;
 
-Status ParseCollectiveMode(const std::string& value, uint32_t* mode, std::string* canonical)
+enum class RemoteScatterMode { Kernel, BatchedRemoteScatter, BatchCopy, CopyThenScatter };
+
+bool UsesRemoteScatterKernel(RemoteScatterMode mode)
 {
-    std::string normalized = value;
-    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
-                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-    if (normalized == "auto" || normalized == "default") {
-        *mode = 0;
-        *canonical = "auto";
-    } else if (normalized == "host" || normalized == "host_ts") {
-        *mode = 1;
-        *canonical = "host";
-    } else if (normalized == "aicpu" || normalized == "ai_cpu" || normalized == "aicpu_ts" ||
-               normalized == "ai_cpu_ts") {
-        *mode = 2;
-        *canonical = "aicpu_ts";
-    } else if (normalized == "aiv") {
-        *mode = 3;
-        *canonical = "aiv";
-    } else {
-        return Status::InvalidParam(
-            "invalid allgather collective mode({}); expected auto, host, aicpu_ts, or aiv", value);
+    return mode == RemoteScatterMode::Kernel || mode == RemoteScatterMode::BatchedRemoteScatter;
+}
+
+const char* RemoteScatterModeName(RemoteScatterMode mode)
+{
+    switch (mode) {
+        case RemoteScatterMode::Kernel: return "kernel";
+        case RemoteScatterMode::BatchedRemoteScatter: return "batched_remote_scatter";
+        case RemoteScatterMode::BatchCopy: return "batch_copy";
+        case RemoteScatterMode::CopyThenScatter: return "copy_then_scatter";
     }
-    return Status::OK();
+    return "unknown";
 }
 
 double Milliseconds(Clock::duration duration)
@@ -138,7 +127,7 @@ struct HostBuffer {
 };
 
 /**
- * @brief One staged window on its way from the backend into the collective.
+ * @brief One staged window on its way from the backend into remote scatter.
  *
  * Send slots size the reordering freedom: the more of them there are, the more
  * candidate windows the progress thread can choose from when networked storage
@@ -147,51 +136,22 @@ struct HostBuffer {
 struct LoadSlot {
     std::shared_ptr<PlatformRuntime> platform;
     DeviceBuffer send;
+    DeviceBuffer receive;
     /* Local-coalesced mode only: the scatter reads the send buffer directly. */
     DeviceBuffer destinations;
     DeviceBuffer routes;
     HostBuffer<uint64_t> hostDestinations;
     HostBuffer<uint32_t> hostRoutes;
-    HostBuffer<uint8_t> hostFrame;
     /* The send buffer has been consumed, so the backend may refill it. */
     EventHandle sendFree{nullptr};
-    EventHandle ready{nullptr};
     DeviceBuffer peerBuffers;
     uint64_t generation{0};
     bool inFlight{false};
+    bool consumedPublished{false};
 
     ~LoadSlot()
     {
         if (sendFree != nullptr && platform != nullptr) { platform->DestroyEvent(sendFree); }
-        if (ready != nullptr && platform != nullptr) { platform->DestroyEvent(ready); }
-    }
-};
-
-/**
- * @brief Landing area for one collective, plus the stream that drains it.
- *
- * Receive buffers are world_size times larger than send buffers but only need to
- * cover the collective-to-scatter handoff. Collectives are serialized on one
- * stream, so two or three of these saturate that handoff no matter how many send
- * slots exist. Sizing them together with send slots is what used to make the
- * receive area the dominant allocation.
- */
-struct ReceiveSlot {
-    std::shared_ptr<PlatformRuntime> platform;
-    DeviceBuffer receive;
-    /* Metadata for this round is on the stream. The previous round that used
-     * this slot scattered on the same stream, so waiting for `prepared` also
-     * proves the receive buffer is free. */
-    EventHandle prepared{nullptr};
-    EventHandle scattered{nullptr};
-    bool inFlight{false};
-
-    ~ReceiveSlot()
-    {
-        if (platform == nullptr) { return; }
-        for (const auto event : {prepared, scattered}) {
-            if (event != nullptr) { platform->DestroyEvent(event); }
-        }
     }
 };
 
@@ -215,10 +175,8 @@ struct WindowPlan {
     std::vector<uint32_t> owners;
     std::vector<uint32_t> ownerSlots;
     std::vector<size_t> ownerCounts;
-    std::vector<uint64_t> frameCounts;
-    std::vector<uint64_t> frameDisplacements;
-    /* Only the local-coalesced path uses this, as the scatter rank stride. */
-    size_t collectiveBlocks{};
+    std::vector<size_t> ownerOffsets;
+    size_t rankStrideBlocks{};
 };
 
 struct PendingBackend {
@@ -235,13 +193,14 @@ struct PendingBackend {
 
 struct LoadMetrics {
     double queueWaitMs{};
-    double placementMs{};
+    double prefetchMs{};
+    double metadataMs{};
     double slotWaitMs{};
     double backendSubmitMs{};
     double backendWaitMs{};
-    double collectiveSubmitMs{};
+    double remoteReadySubmitMs{};
     double scatterSubmitMs{};
-    double collectiveDeviceMs{};
+    double remoteReadyDeviceMs{};
     double scatterDeviceMs{};
     double syncMs{};
     double totalMs{};
@@ -262,20 +221,20 @@ struct StageTraceRecord {
     size_t slot{};
     size_t rows{};
     size_t ownedRows{};
-    uint64_t collectiveBytes{};
+    uint64_t remoteScatterBytes{};
     Clock::time_point slotReadyAt;
     Clock::time_point backendSubmitStartedAt;
     Clock::time_point backendSubmittedAt;
     Clock::time_point backendWaitStartedAt;
     Clock::time_point backendReadyAt;
-    Clock::time_point collectiveStartedAt;
-    Clock::time_point collectiveSubmittedAt;
+    Clock::time_point remoteReadyStartedAt;
+    Clock::time_point remoteReadySubmittedAt;
 };
 
 struct TimingWindow {
     PlatformRuntime* platform{nullptr};
     EventHandle start{nullptr};
-    EventHandle collectiveDone{nullptr};
+    EventHandle remoteReady{nullptr};
     EventHandle scatterDone{nullptr};
     bool complete{false};
 
@@ -285,13 +244,13 @@ struct TimingWindow {
     TimingWindow(TimingWindow&& other) noexcept
         : platform(other.platform),
           start(other.start),
-          collectiveDone(other.collectiveDone),
+          remoteReady(other.remoteReady),
           scatterDone(other.scatterDone),
           complete(other.complete)
     {
         other.platform = nullptr;
         other.start = nullptr;
-        other.collectiveDone = nullptr;
+        other.remoteReady = nullptr;
         other.scatterDone = nullptr;
         other.complete = false;
     }
@@ -299,7 +258,7 @@ struct TimingWindow {
     {
         if (platform == nullptr) { return; }
         platform->DestroyEvent(start);
-        platform->DestroyEvent(collectiveDone);
+        platform->DestroyEvent(remoteReady);
         platform->DestroyEvent(scatterDone);
     }
 
@@ -307,7 +266,7 @@ struct TimingWindow {
     {
         platform = &value;
         if (platform->CreateEvent(&start, true).Failure() ||
-            platform->CreateEvent(&collectiveDone, true).Failure() ||
+            platform->CreateEvent(&remoteReady, true).Failure() ||
             platform->CreateEvent(&scatterDone, true).Failure()) {
             return false;
         }
@@ -316,7 +275,7 @@ struct TimingWindow {
 
     bool Valid() const
     {
-        return complete && start != nullptr && collectiveDone != nullptr && scatterDone != nullptr;
+        return complete && start != nullptr && remoteReady != nullptr && scatterDone != nullptr;
     }
 };
 
@@ -333,13 +292,6 @@ struct TaskState {
           platform(std::move(platform))
     {
     }
-    ~TaskState()
-    {
-        if (metadataReady != nullptr && platform != nullptr) {
-            platform->DestroyEvent(metadataReady);
-        }
-    }
-
     Operation operation;
     Detail::TaskDesc input;
     std::vector<WindowPlan> windows;
@@ -347,16 +299,6 @@ struct TaskState {
     std::condition_variable condition;
     Status status{Status::OK()};
     bool done{false};
-    DeviceBuffer deviceError;
-    HostBuffer<uint32_t> hostError;
-    DeviceBuffer destinations;
-    HostBuffer<uint64_t> hostDestinations;
-    DeviceBuffer locationSend;
-    DeviceBuffer locationReceive;
-    HostBuffer<uint8_t> hostLocationSend;
-    HostBuffer<uint8_t> hostLocationReceive;
-    bool placementRequired{false};
-    EventHandle metadataReady{nullptr};
     Clock::time_point queuedAt;
     Clock::time_point enqueuedAt;
     bool profile{false};
@@ -425,24 +367,19 @@ public:
         config.Get("allgather_replicated_data", replicated_);
         config.Get("allgather_scatter_only", scatterOnly_);
         config.GetNumber("allgather_load_slots", loadSlotCount_);
-        config.GetNumber("allgather_load_groups", requestedLoadGroups_);
         config.GetNumber("allgather_dump_slots", dumpSlotCount_);
-        config.GetNumber("allgather_receive_slots", receiveSlotCount_);
         config.GetNumber("allgather_runtime_slot_streams", runtimeSlotStreamCount_);
-        config.GetNumber("allgather_hccl_buffer_mb", collectiveBufferMb_);
-        config.GetNumber("allgather_collective_buffer_mb", collectiveBufferMb_);
-        config.Get("allgather_collective_mode", collectiveModeName_);
-        config.Get("allgather_collective_variable_counts", variableCollectiveRequested_);
         config.GetNumber("allgather_scatter_aiv_cores", scatterAivCores_);
         config.GetNumber("allgather_profile_sample_every", profileSampleEvery_);
         config.GetNumber("allgather_stage_trace_sample_every", stageTraceSampleEvery_);
         config.Get("allgather_separate_dump_queue", separateDumpQueue_);
-        config.Get("allgather_load_skip_collective", skipLoadCollective_);
+        config.Get("allgather_load_skip_remote_scatter", skipRemoteScatter_);
         config.Get("allgather_load_skip_scatter", skipLoadScatter_);
         config.Get("allgather_load_backend_only", loadBackendOnly_);
+        std::string remoteScatterMode = "batch_copy";
+        config.Get("allgather_remote_scatter_mode", remoteScatterMode);
         config.Get("allgather_runtime_key", runtimeKey_);
-        config.GetNumbers("allgather_hccl_root_info", rootInfo_);
-        config.GetNumbers("allgather_collective_root_info", rootInfo_);
+        config.GetNumbers("allgather_remote_scatter_key", bootstrapKey_);
 
         if (backend_ == nullptr) { return Status::InvalidParam("invalid store backend"); }
         if (deviceId_ < 0) { return Status::OK(); }
@@ -464,34 +401,37 @@ public:
         auto status = platform_->SetDevice(deviceId_);
         if (status.Failure()) { return status; }
         distributedLoadEnabled_ = replicated_ && !scatterOnly_ && worldSize_ > 1;
-        remoteScatterEnabled_ = distributedLoadEnabled_ && platform_->SupportsRemoteScatter();
-        collectiveEnabled_ = distributedLoadEnabled_ && !remoteScatterEnabled_;
-        status = ParseCollectiveMode(collectiveModeName_, &collectiveMode_, &collectiveModeName_);
-        if (status.Failure()) { return status; }
+        if (remoteScatterMode == "kernel") {
+            remoteScatterMode_ = RemoteScatterMode::Kernel;
+        } else if (remoteScatterMode == "batched_remote_scatter") {
+            remoteScatterMode_ = RemoteScatterMode::BatchedRemoteScatter;
+        } else if (remoteScatterMode == "batch_copy") {
+            remoteScatterMode_ = RemoteScatterMode::BatchCopy;
+        } else if (remoteScatterMode == "copy_then_scatter") {
+            remoteScatterMode_ = RemoteScatterMode::CopyThenScatter;
+        } else {
+            return Status::InvalidParam("unsupported remote scatter mode({})", remoteScatterMode);
+        }
+        if (distributedLoadEnabled_ && !platform_->SupportsRemoteScatter()) {
+            return Status::Error(
+                fmt::format("remote scatter is unavailable on {}", platform_->Name()));
+        }
+        if (distributedLoadEnabled_ && bootstrapKey_.empty()) {
+            return Status::InvalidParam("empty remote scatter bootstrap key");
+        }
         if (loadSlotCount_ == 0) {
             return Status::InvalidParam("allgather load slot count must be positive");
-        }
-        if (!remoteScatterEnabled_ && receiveSlotCount_ == 0) {
-            return Status::InvalidParam("allgather receive slot count must be positive");
         }
         if (scatterAivCores_ == 0 || scatterAivCores_ > kMaxCopyWorkers) {
             return Status::InvalidParam("allgather scatter AIV cores must be in [1, {}]",
                                         kMaxCopyWorkers);
         }
-        receiveSlotCount_ = remoteScatterEnabled_ ? 0 : std::min(receiveSlotCount_, loadSlotCount_);
-        const size_t requiredSlotStreams =
-            remoteScatterEnabled_ ? loadSlotCount_ : receiveSlotCount_;
+        const size_t requiredSlotStreams = loadSlotCount_;
         if (runtimeSlotStreamCount_ == 0) { runtimeSlotStreamCount_ = requiredSlotStreams; }
         if (runtimeSlotStreamCount_ < requiredSlotStreams) {
             return Status::InvalidParam(
                 "allgather runtime slot streams({}) are fewer than required streams({})",
                 runtimeSlotStreamCount_, requiredSlotStreams);
-        }
-        if (requestedLoadGroups_ > 1) {
-            UC_WARN(
-                "allgather_load_groups={} is no longer supported; the stage uses one "
-                "ordered data path. Raise allgather_load_slots for pipelining instead.",
-                requestedLoadGroups_);
         }
         loadStorageWorldSize_ = distributedLoadEnabled_ ? worldSize_ : 1;
         loadStorageRank_ = distributedLoadEnabled_ ? rank_ : 0;
@@ -500,47 +440,32 @@ public:
         try {
             plan_ = CalculateStageMemoryPlan(
                 tensorSizes_, shardSize_, worldSize_, distributedLoadEnabled_, loadSlotCount_,
-                dumpSlotCount_, windowBlocks_, std::max<size_t>(receiveSlotCount_, 1),
-                remoteScatterEnabled_);
+                dumpSlotCount_, windowBlocks_,
+                remoteScatterMode_ == RemoteScatterMode::CopyThenScatter);
         } catch (const std::exception& error) {
             return Status::InvalidParam("invalid allgather memory plan: {}", error.what());
         }
 
-        variableCollectiveEnabled_ =
-            collectiveEnabled_ && variableCollectiveRequested_ && platform_->SupportsAllGatherV();
-        if (collectiveEnabled_ && variableCollectiveRequested_ && !variableCollectiveEnabled_) {
-            UC_WARN(
-                "allgather_collective_variable_counts is unavailable on {}; using fixed "
-                "AllGather",
-                platform_->Name());
-        }
         status = AllocateBuffers();
         if (status.Failure()) { return status; }
-        if (remoteScatterEnabled_) {
+        if (distributedLoadEnabled_) {
             status = SetupRemoteScatter();
             if (status.Failure()) { return status; }
         }
         auto runtime = AllGatherRuntime::Acquire(runtimeKey_, deviceId_, rank_, worldSize_,
-                                                 collectiveBufferMb_, collectiveMode_, rootInfo_,
-                                                 collectiveEnabled_, runtimeSlotStreamCount_);
+                                                 runtimeSlotStreamCount_);
         if (!runtime) { return runtime.Error(); }
         runtime_ = runtime.Value();
         UC_INFO(
             "AllGatherStore: shard={}, world={}, window_blocks={}, load_slots={}, "
-            "receive_slots={}, runtime_slot_streams={}, dump_slots={}, frame_bytes={}, "
-            "collective_message_bytes={}, "
-            "payload_bytes={}, "
-            "metadata_bytes={}, collective_buffer_bytes={}, scatter_only={}, "
-            "skip_load_collective={}, skip_load_scatter={}, load_backend_only={}, "
-            "collective_mode={}, variable_counts={}, remote_scatter={}, scatter_aiv_cores={}, "
+            "runtime_slot_streams={}, dump_slots={}, payload_bytes={}, metadata_bytes={}, "
+            "scatter_only={}, skip_remote_scatter={}, skip_load_scatter={}, load_backend_only={}, "
+            "remote_scatter={}, remote_scatter_mode={}, scatter_aiv_cores={}, "
             "platform={}.",
-            shardSize_, worldSize_, windowBlocks_, loadSlotCount_, receiveSlotCount_,
-            runtimeSlotStreamCount_, dumpSlotCount_, frameBytes_,
-            collectiveEnabled_ ? worldSize_ * frameBytes_ : 0, plan_.PayloadBytes(),
-            plan_.MetadataBytes(),
-            CalculateCollectiveBytes(collectiveBufferMb_, collectiveEnabled_, 1), scatterOnly_,
-            skipLoadCollective_, skipLoadScatter_, loadBackendOnly_, collectiveModeName_,
-            variableCollectiveEnabled_, remoteScatterEnabled_, scatterAivCores_, platform_->Name());
+            shardSize_, worldSize_, windowBlocks_, loadSlotCount_, runtimeSlotStreamCount_,
+            dumpSlotCount_, plan_.PayloadBytes(), plan_.MetadataBytes(), scatterOnly_,
+            skipRemoteScatter_, skipLoadScatter_, loadBackendOnly_, distributedLoadEnabled_,
+            RemoteScatterModeName(remoteScatterMode_), scatterAivCores_, platform_->Name());
         return Status::OK();
     }
 
@@ -554,6 +479,11 @@ public:
     Expected<ssize_t> LookupOnPrefix(const Detail::BlockId* blocks, size_t num) override
     {
         return backend_->LookupOnPrefix(blocks, num);
+    }
+
+    Expected<ssize_t> LookupOnReverse(const Detail::BlockId* blocks, size_t num) override
+    {
+        return backend_->LookupOnReverse(blocks, num);
     }
 
     void Prefetch(const Detail::BlockId* blocks, size_t num) override
@@ -607,7 +537,7 @@ public:
         auto task = FindTask(handle);
         if (!task) { return Status::InvalidParam("invalid allgather task({})", handle); }
         std::lock_guard<std::mutex> lock(task->mutex);
-        return task->done;
+        return bool(task->done);
     }
 
     Status Wait(Detail::TaskHandle handle) override
@@ -619,10 +549,6 @@ public:
         task->condition.wait(lock, [&task] { return task->done; });
         auto status = task->status;
         lock.unlock();
-        if (status.Success() && !skipLoadCollective_ && task->hostError.data != nullptr &&
-            task->hostError.data[0] != 0) {
-            status = Status::Error("allgather owner backend load failed");
-        }
         EraseTask(handle, task);
         return status;
     }
@@ -631,53 +557,34 @@ private:
     Status AllocateBuffers()
     {
         const size_t windowBytes = windowBlocks_ * shardSize_;
-        frameMetadataBytes_ = collectiveEnabled_ ? CalculateFrameMetadataBytes(windowBlocks_) : 0;
-        frameBytes_ = windowBytes + frameMetadataBytes_;
         const size_t maxRows = windowBlocks_ * (distributedLoadEnabled_ ? worldSize_ : 1);
         loadSlots_.reserve(loadSlotCount_);
         for (size_t i = 0; i < loadSlotCount_; ++i) {
             auto slot = std::make_unique<LoadSlot>();
             slot->platform = platform_;
-            auto status = slot->send.Allocate(platform_, frameBytes_);
+            auto status = slot->send.Allocate(platform_, windowBytes);
             if (status.Failure()) { return status; }
-            if (collectiveEnabled_) {
-                // Row addresses live on the task in framed mode, not on the slot.
-                status = slot->hostFrame.Allocate(platform_, frameMetadataBytes_);
-                if (status.Failure()) { return status; }
-            } else {
-                status = slot->destinations.Allocate(
-                    platform_, maxRows * tensorSizes_.size() * sizeof(uint64_t));
-                if (status.Failure()) { return status; }
-                status = slot->routes.Allocate(platform_, maxRows * 2 * sizeof(uint32_t));
-                if (status.Failure()) { return status; }
-                status = slot->hostDestinations.Allocate(platform_, maxRows * tensorSizes_.size());
-                if (status.Failure()) { return status; }
-                status = slot->hostRoutes.Allocate(platform_, maxRows * 2);
+            if (distributedLoadEnabled_ &&
+                remoteScatterMode_ == RemoteScatterMode::CopyThenScatter) {
+                status = slot->receive.Allocate(platform_, worldSize_ * windowBytes);
                 if (status.Failure()) { return status; }
             }
+            status = slot->destinations.Allocate(platform_,
+                                                 maxRows * tensorSizes_.size() * sizeof(uint64_t));
+            if (status.Failure()) { return status; }
+            status = slot->routes.Allocate(platform_, maxRows * 2 * sizeof(uint32_t));
+            if (status.Failure()) { return status; }
+            status = slot->hostDestinations.Allocate(platform_, maxRows * tensorSizes_.size());
+            if (status.Failure()) { return status; }
+            status = slot->hostRoutes.Allocate(platform_, maxRows * 2);
+            if (status.Failure()) { return status; }
             status = platform_->CreateEvent(&slot->sendFree);
             if (status.Failure()) { return status; }
-            if (remoteScatterEnabled_) {
-                status = platform_->CreateInterprocessEvent(&slot->ready);
-                if (status.Failure()) { return status; }
+            if (distributedLoadEnabled_ && UsesRemoteScatterKernel(remoteScatterMode_)) {
                 status = slot->peerBuffers.Allocate(platform_, worldSize_ * sizeof(void*));
                 if (status.Failure()) { return status; }
             }
             loadSlots_.push_back(std::move(slot));
-        }
-        receiveSlots_.reserve(receiveSlotCount_);
-        for (size_t i = 0; i < receiveSlotCount_; ++i) {
-            auto slot = std::make_unique<ReceiveSlot>();
-            slot->platform = platform_;
-            if (collectiveEnabled_) {
-                auto status = slot->receive.Allocate(platform_, worldSize_ * frameBytes_);
-                if (status.Failure()) { return status; }
-            }
-            for (auto* event : {&slot->prepared, &slot->scattered}) {
-                auto status = platform_->CreateEvent(event);
-                if (status.Failure()) { return status; }
-            }
-            receiveSlots_.push_back(std::move(slot));
         }
         dumpSlots_.reserve(dumpSlotCount_);
         for (size_t i = 0; i < dumpSlotCount_; ++i) {
@@ -704,6 +611,7 @@ private:
         std::vector<uint64_t> chunks;
         size_t sourceOffset = 0;
         for (size_t tensor = 0; tensor < tensorSizes_.size(); ++tensor) {
+            tensorOffsets_.push_back(sourceOffset);
             for (size_t offset = 0; offset < tensorSizes_[tensor]; offset += kCopyChunkBytes) {
                 chunks.push_back(tensor);
                 chunks.push_back(sourceOffset + offset);
@@ -719,27 +627,26 @@ private:
     Status SetupRemoteScatter()
     {
         std::vector<void*> buffers;
-        std::vector<EventHandle> events;
         buffers.reserve(loadSlots_.size());
-        events.reserve(loadSlots_.size());
-        for (const auto& slot : loadSlots_) {
-            buffers.push_back(slot->send.data);
-            events.push_back(slot->ready);
-        }
+        for (const auto& slot : loadSlots_) { buffers.push_back(slot->send.data); }
         std::ostringstream signature;
         signature << "shard=" << shardSize_ << ":window=" << windowBlocks_
                   << ":slots=" << loadSlotCount_ << ":tensors=";
         for (const auto size : tensorSizes_) { signature << size << ','; }
-        auto transport = RemoteScatterTransport::Create(platform_, rootInfo_, signature.str(),
-                                                        rank_, worldSize_, buffers, events);
+        signature << ":mode=" << RemoteScatterModeName(remoteScatterMode_);
+        auto transport =
+            RemoteScatterTransport::Create(platform_, bootstrapKey_, signature.str(), rank_,
+                                           worldSize_, buffers, windowBlocks_ * shardSize_);
         if (!transport) { return transport.Error(); }
         remoteTransport_ = std::move(transport.Value());
-        for (size_t slot = 0; slot < loadSlots_.size(); ++slot) {
-            const auto& peers = remoteTransport_->PeerBuffers(slot);
-            auto status = platform_->CopyHostToDevice(
-                loadSlots_[slot]->peerBuffers.data, loadSlots_[slot]->peerBuffers.size,
-                peers.data(), peers.size() * sizeof(void*), nullptr);
-            if (status.Failure()) { return status; }
+        if (UsesRemoteScatterKernel(remoteScatterMode_)) {
+            for (size_t slot = 0; slot < loadSlots_.size(); ++slot) {
+                const auto& peers = remoteTransport_->PeerBuffers(slot);
+                auto status = platform_->CopyHostToDevice(
+                    loadSlots_[slot]->peerBuffers.data, loadSlots_[slot]->peerBuffers.size,
+                    peers.data(), peers.size() * sizeof(void*), nullptr);
+                if (status.Failure()) { return status; }
+            }
         }
         return Status::OK();
     }
@@ -764,44 +671,6 @@ private:
         auto task = std::make_shared<TaskState>(operation, std::move(input), sequence, profile,
                                                 stageTrace, platform_);
         task->windows = BuildWindows(task->input, operation);
-        task->placementRequired = operation == TaskState::Operation::Load && collectiveEnabled_ &&
-                                  !skipLoadCollective_ && !loadBackendOnly_ &&
-                                  task->windows.size() > 1;
-        if (operation == TaskState::Operation::Load && collectiveEnabled_ && !loadBackendOnly_) {
-            auto status = task->deviceError.Allocate(platform_, sizeof(uint32_t), true);
-            if (status.Failure()) { return status; }
-            status = task->hostError.Allocate(platform_, 1);
-            if (status.Failure()) { return status; }
-            task->hostError.data[0] = 0;
-            {
-                const auto destinationCount = task->input.size() * tensorSizes_.size();
-                status =
-                    task->destinations.Allocate(platform_, destinationCount * sizeof(uint64_t));
-                if (status.Failure()) { return status; }
-                status = task->hostDestinations.Allocate(platform_, destinationCount);
-                if (status.Failure()) { return status; }
-                size_t offset = 0;
-                for (const auto& shard : task->input) {
-                    for (const auto address : shard.addrs) {
-                        task->hostDestinations.data[offset++] = reinterpret_cast<uint64_t>(address);
-                    }
-                }
-                status = platform_->CreateEvent(&task->metadataReady);
-                if (status.Failure()) { return status; }
-                if (task->placementRequired) {
-                    status = task->locationSend.Allocate(platform_, task->input.size());
-                    if (status.Failure()) { return status; }
-                    status =
-                        task->locationReceive.Allocate(platform_, task->input.size() * worldSize_);
-                    if (status.Failure()) { return status; }
-                    status = task->hostLocationSend.Allocate(platform_, task->input.size());
-                    if (status.Failure()) { return status; }
-                    status = task->hostLocationReceive.Allocate(platform_,
-                                                                task->input.size() * worldSize_);
-                    if (status.Failure()) { return status; }
-                }
-            }
-        }
         const auto handle = nextHandle_.fetch_add(1);
         size_t queueDepth = 0;
         {
@@ -812,17 +681,14 @@ private:
         }
         UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_task_queue_depth"),
                                  static_cast<double>(queueDepth));
-        auto work = [this, task](PlatformRuntime& platform, StreamHandle stream,
-                                 CollectiveHandle collective, Status fatal) {
+        auto work = [this, task](PlatformRuntime& platform, StreamHandle stream, Status fatal) {
             if (fatal.Failure()) {
-                // The collective domain already diverged from its peers. Running
-                // this task would only add another mismatched round.
                 Finish(task, fatal);
                 return;
             }
             try {
                 if (task->operation == TaskState::Operation::Load) {
-                    ProcessLoad(task, platform, stream, collective);
+                    ProcessLoad(task, platform);
                 } else {
                     ProcessDump(task, platform, stream);
                 }
@@ -846,8 +712,7 @@ private:
     }
 
     std::vector<WindowPlan> BuildWindows(const Detail::TaskDesc& input,
-                                         TaskState::Operation operation,
-                                         const std::vector<DataLocation>* locations = nullptr) const
+                                         TaskState::Operation operation) const
     {
         const auto storageWorldSize =
             operation == TaskState::Operation::Load ? loadStorageWorldSize_ : dumpStorageWorldSize_;
@@ -856,12 +721,6 @@ private:
         std::vector<size_t> ownerSlots(input.size());
         std::vector<size_t> order(input.size());
         std::iota(order.begin(), order.end(), 0);
-        if (locations != nullptr) {
-            std::stable_sort(order.begin(), order.end(), [locations](size_t lhs, size_t rhs) {
-                return static_cast<uint8_t>((*locations)[lhs]) >
-                       static_cast<uint8_t>((*locations)[rhs]);
-            });
-        }
         size_t windowCount = 0;
         for (const auto row : order) {
             owners[row] = Owner(input[row].owner, storageWorldSize);
@@ -869,7 +728,10 @@ private:
             windowCount = std::max(windowCount, ownerSlots[row] / windowBlocks_ + 1);
         }
         std::vector<WindowPlan> windows(windowCount);
-        for (auto& window : windows) { window.ownerCounts.assign(storageWorldSize, 0); }
+        for (auto& window : windows) {
+            window.ownerCounts.assign(storageWorldSize, 0);
+            window.ownerOffsets.assign(storageWorldSize, 0);
+        }
         for (const auto row : order) {
             const size_t window = ownerSlots[row] / windowBlocks_;
             windows[window].rows.push_back(row);
@@ -877,99 +739,25 @@ private:
             windows[window].ownerSlots.push_back(ownerSlots[row] % windowBlocks_);
             ++windows[window].ownerCounts[owners[row]];
         }
-        for (auto& window : windows) { window.collectiveBlocks = windowBlocks_; }
-        if (operation == TaskState::Operation::Load && collectiveEnabled_ &&
-            variableCollectiveEnabled_ && windows.size() == 1) {
-            auto& window = windows.front();
-            window.frameCounts.resize(worldSize_);
-            window.frameDisplacements.resize(worldSize_);
-            for (size_t owner = 0; owner < worldSize_; ++owner) {
-                window.frameCounts[owner] =
-                    frameMetadataBytes_ + window.ownerCounts[owner] * shardSize_;
-                window.frameDisplacements[owner] = owner * frameBytes_;
+        for (auto& window : windows) {
+            auto rows = std::move(window.rows);
+            auto rowOwners = std::move(window.owners);
+            auto rowOwnerSlots = std::move(window.ownerSlots);
+            window.rows.reserve(rows.size());
+            window.owners.reserve(rows.size());
+            window.ownerSlots.reserve(rows.size());
+            for (size_t owner = 0; owner < storageWorldSize; ++owner) {
+                window.ownerOffsets[owner] = window.rows.size();
+                for (size_t i = 0; i < rows.size(); ++i) {
+                    if (rowOwners[i] != owner) { continue; }
+                    window.rows.push_back(rows[i]);
+                    window.owners.push_back(rowOwners[i]);
+                    window.ownerSlots.push_back(rowOwnerSlots[i]);
+                }
             }
+            window.rankStrideBlocks = windowBlocks_;
         }
         return windows;
-    }
-
-    Status PrepareLoadPlan(const std::shared_ptr<TaskState>& task, PlatformRuntime& platform,
-                           CollectiveHandle collective, LoadMetrics& metrics)
-    {
-        const auto started = Clock::now();
-        if (!task->placementRequired) {
-            metrics.windows = task->windows.size();
-            return Status::OK();
-        }
-        std::vector<DataLocation> locations(task->input.size(), DataLocation::MISSING);
-        std::vector<Detail::Shard> localShards;
-        std::vector<size_t> localRows;
-        localShards.reserve(task->input.size());
-        localRows.reserve(task->input.size());
-        for (size_t row = 0; row < task->input.size(); ++row) {
-            if (Owner(task->input[row].owner, loadStorageWorldSize_) != loadStorageRank_) {
-                continue;
-            }
-            localShards.push_back({task->input[row].owner, task->input[row].index, {}});
-            localRows.push_back(row);
-        }
-
-        Status lookupStatus = Status::OK();
-        if (!localShards.empty()) {
-            auto result = backend_->LookupDataLocation(localShards.data(), localShards.size());
-            if (!result) {
-                lookupStatus = result.Error();
-            } else if (result.Value().size() != localRows.size()) {
-                lookupStatus = Status::Error("location lookup returned unexpected result size");
-            } else {
-                std::vector<Detail::Shard> prefetch;
-                for (size_t i = 0; i < localRows.size(); ++i) {
-                    locations[localRows[i]] = result.Value()[i];
-                    if (result.Value()[i] == DataLocation::BACKEND) {
-                        prefetch.push_back(localShards[i]);
-                    }
-                }
-                if (!prefetch.empty()) { backend_->Prefetch(prefetch.data(), prefetch.size()); }
-            }
-        }
-
-        if (collectiveEnabled_) {
-            std::memset(task->hostLocationSend.data, 0, task->hostLocationSend.count);
-            for (const auto row : localRows) {
-                task->hostLocationSend.data[row] = static_cast<uint8_t>(locations[row]);
-            }
-            const auto stream = runtime_->CollectiveStream();
-            auto status = platform.CopyHostToDevice(
-                task->locationSend.data, task->locationSend.size, task->hostLocationSend.data,
-                task->hostLocationSend.count, stream);
-            if (status.Success()) {
-                status = platform.AllGather(task->locationSend.data, task->locationReceive.data,
-                                            task->input.size(), collective, stream);
-            }
-            if (status.Success()) {
-                status = platform.CopyDeviceToHost(
-                    task->hostLocationReceive.data, task->hostLocationReceive.count,
-                    task->locationReceive.data, task->locationReceive.size, stream);
-            }
-            if (status.Success()) { status = platform.SynchronizeStream(stream); }
-            if (status.Failure()) {
-                return Status::StoreUnhealthy(
-                    fmt::format("allgather placement exchange failed: {}", status));
-            }
-            for (size_t row = 0; row < task->input.size(); ++row) {
-                const auto owner = Owner(task->input[row].owner, worldSize_);
-                const auto encoded =
-                    task->hostLocationReceive.data[owner * task->input.size() + row];
-                if (encoded <= static_cast<uint8_t>(DataLocation::CACHE_READY)) {
-                    locations[row] = static_cast<DataLocation>(encoded);
-                } else {
-                    locations[row] = DataLocation::MISSING;
-                }
-            }
-        }
-        task->windows = BuildWindows(task->input, TaskState::Operation::Load, &locations);
-        metrics.windows = task->windows.size();
-        metrics.placementMs = Milliseconds(Clock::now() - started);
-        return lookupStatus;
     }
 
     PendingBackend SubmitLoadWindow(const std::shared_ptr<TaskState>& task, size_t windowIndex,
@@ -986,7 +774,7 @@ private:
             for (size_t i = 0; i < window.rows.size(); ++i) {
                 if (window.owners[i] != loadStorageRank_) { continue; }
                 auto shard = task->input[window.rows[i]];
-                shard.addrs = {static_cast<uint8_t*>(slot.send.data) + frameMetadataBytes_ +
+                shard.addrs = {static_cast<uint8_t*>(slot.send.data) +
                                window.ownerSlots[i] * shardSize_};
                 backendTask.push_back(std::move(shard));
             }
@@ -1013,43 +801,24 @@ private:
         return pending;
     }
 
-    Status PrepareLoadMetadata(const std::shared_ptr<TaskState>& task, size_t windowIndex,
-                               const WindowPlan& window, LoadSlot& slot, bool backendFailed,
-                               PlatformRuntime& platform, StreamHandle stream) const
+    Status PrepareLoadMetadata(const std::shared_ptr<TaskState>& task, const WindowPlan& window,
+                               LoadSlot& slot, PlatformRuntime& platform, StreamHandle stream) const
     {
-        if (!collectiveEnabled_) {
-            auto& destinations = slot.hostDestinations;
-            size_t destinationOffset = 0;
-            for (size_t i = 0; i < window.rows.size(); ++i) {
-                const auto& shard = task->input[window.rows[i]];
-                for (const auto address : shard.addrs) {
-                    destinations.data[destinationOffset++] = reinterpret_cast<uint64_t>(address);
-                }
+        auto& destinations = slot.hostDestinations;
+        size_t destinationOffset = 0;
+        for (size_t i = 0; i < window.rows.size(); ++i) {
+            const auto& shard = task->input[window.rows[i]];
+            for (const auto address : shard.addrs) {
+                destinations.data[destinationOffset++] = reinterpret_cast<uint64_t>(address);
             }
-            auto status = platform.CopyHostToDevice(slot.destinations.data, slot.destinations.size,
-                                                    destinations.data,
-                                                    destinationOffset * sizeof(uint64_t), stream);
-            if (status.Failure()) { return status; }
-        } else {
-            std::memset(slot.hostFrame.data, 0, frameMetadataBytes_);
-            auto* header = reinterpret_cast<FrameHeader*>(slot.hostFrame.data);
-            header->magic = kFrameMagic;
-            header->version = kFrameVersion;
-            header->sequenceLow = static_cast<uint32_t>(task->sequence);
-            header->sequenceHigh = static_cast<uint32_t>(task->sequence >> 32);
-            header->round = static_cast<uint32_t>(windowIndex);
-            auto* records =
-                reinterpret_cast<FrameRecord*>(slot.hostFrame.data + sizeof(FrameHeader));
-            for (size_t i = 0; i < window.rows.size(); ++i) {
-                if (window.owners[i] != loadStorageRank_) { continue; }
-                auto& record = records[header->validCount++];
-                record.row = static_cast<uint32_t>(window.rows[i]);
-                record.status = backendFailed ? kFrameStatusBackendFailed : kFrameStatusReady;
-                record.payloadSlot = window.ownerSlots[i];
-            }
-            return platform.CopyHostToDevice(slot.send.data, slot.send.size, slot.hostFrame.data,
-                                             frameMetadataBytes_, stream);
         }
+        if (distributedLoadEnabled_ && remoteScatterMode_ == RemoteScatterMode::BatchCopy) {
+            return Status::OK();
+        }
+        auto status = platform.CopyHostToDevice(slot.destinations.data, slot.destinations.size,
+                                                destinations.data,
+                                                destinationOffset * sizeof(uint64_t), stream);
+        if (status.Failure()) { return status; }
 
         auto& routes = slot.hostRoutes;
         size_t routeOffset = 0;
@@ -1061,38 +830,135 @@ private:
                                          routeOffset * sizeof(uint32_t), stream);
     }
 
-    Status ScatterWindow(const std::shared_ptr<TaskState>& task, const WindowPlan& window,
-                         LoadSlot& slot, ReceiveSlot* receiveSlot, PlatformRuntime& platform,
+    Status ScatterWindow(const WindowPlan& window, LoadSlot& slot, PlatformRuntime& platform,
                          StreamHandle stream)
     {
-        const auto taskCount =
-            (collectiveEnabled_ ? worldSize_ * windowBlocks_ : window.rows.size()) *
-            plan_.chunkCount;
+        const auto taskCount = window.rows.size() * plan_.chunkCount;
         const auto usedWorkers = static_cast<uint32_t>(std::min(scatterAivCores_, taskCount));
         if (usedWorkers == 0) { return Status::OK(); }
-        if (remoteScatterEnabled_) {
-            return platform.LaunchRemoteScatter(
-                stream, slot.peerBuffers.data, slot.destinations.data, slot.routes.data,
-                chunkLayout_.data, window.rows.size(), plan_.chunkCount, tensorSizes_.size(),
-                shardSize_, usedWorkers);
-        }
-        void* receive =
-            collectiveEnabled_ && !skipLoadCollective_ ? receiveSlot->receive.data : slot.send.data;
-        if (collectiveEnabled_) {
-            // Repeating the valid local frame preserves scatter work in the
-            // collective ablation without reading uninitialized receive frames.
-            const auto frameStride = skipLoadCollective_ ? 0 : frameBytes_;
-            return platform.LaunchFramedScatter(
-                stream, receive, task->destinations.data, chunkLayout_.data, task->deviceError.data,
-                static_cast<uint32_t>(task->input.size()), worldSize_,
-                static_cast<uint32_t>(windowBlocks_), static_cast<uint32_t>(plan_.chunkCount),
-                static_cast<uint32_t>(tensorSizes_.size()), frameStride, frameMetadataBytes_,
-                shardSize_, task->sequence, kAnyFrameRound, usedWorkers);
-        }
         return platform.LaunchCompactScatter(
-            stream, receive, slot.destinations.data, slot.routes.data, chunkLayout_.data,
+            stream, slot.send.data, slot.destinations.data, slot.routes.data, chunkLayout_.data,
             window.rows.size(), plan_.chunkCount, tensorSizes_.size(),
-            window.collectiveBlocks * shardSize_, shardSize_, usedWorkers);
+            window.rankStrideBlocks * shardSize_, shardSize_, usedWorkers);
+    }
+
+    Status BatchCopyReadyRanks(const WindowPlan& window, size_t slotIndex, LoadSlot& slot,
+                               PlatformRuntime& platform, StreamHandle stream, uint64_t readyMask)
+    {
+        const auto& peers = remoteTransport_->PeerBuffers(slotIndex);
+        std::vector<DeviceCopy> copies;
+        copies.reserve(window.rows.size() * tensorSizes_.size());
+        for (uint32_t owner = 0; owner < worldSize_; ++owner) {
+            if ((readyMask & (uint64_t{1} << owner)) == 0) { continue; }
+            const size_t firstRow = window.ownerOffsets[owner];
+            const size_t lastRow = firstRow + window.ownerCounts[owner];
+            const auto* peer = static_cast<const uint8_t*>(peers[owner]);
+            for (size_t row = firstRow; row < lastRow; ++row) {
+                const auto* source = peer + window.ownerSlots[row] * shardSize_;
+                for (size_t tensor = 0; tensor < tensorSizes_.size(); ++tensor) {
+                    auto* destination = reinterpret_cast<void*>(
+                        slot.hostDestinations.data[row * tensorSizes_.size() + tensor]);
+                    if (destination == nullptr || tensorSizes_[tensor] == 0) { continue; }
+                    copies.push_back(
+                        {destination, source + tensorOffsets_[tensor], tensorSizes_[tensor]});
+                }
+            }
+        }
+        return platform.CopyDeviceBatchAsync(stream, copies.data(), copies.size());
+    }
+
+    Status ScatterBufferedReadyRanks(const WindowPlan& window, LoadSlot& slot,
+                                     PlatformRuntime& platform, StreamHandle stream,
+                                     uint64_t readyMask)
+    {
+        for (uint32_t first = 0; first < worldSize_;) {
+            if ((readyMask & (uint64_t{1} << first)) == 0) {
+                ++first;
+                continue;
+            }
+            uint32_t last = first + 1;
+            while (last < worldSize_ && (readyMask & (uint64_t{1} << last)) != 0) { ++last; }
+            const size_t rowOffset = window.ownerOffsets[first];
+            size_t rowCount = 0;
+            for (uint32_t owner = first; owner < last; ++owner) {
+                rowCount += window.ownerCounts[owner];
+            }
+            if (rowCount != 0) {
+                const auto taskCount = rowCount * plan_.chunkCount;
+                const auto usedWorkers =
+                    static_cast<uint32_t>(std::min(scatterAivCores_, taskCount));
+                auto* destinations = static_cast<uint8_t*>(slot.destinations.data) +
+                                     rowOffset * tensorSizes_.size() * sizeof(uint64_t);
+                auto* routes =
+                    static_cast<uint8_t*>(slot.routes.data) + rowOffset * 2 * sizeof(uint32_t);
+                auto status = platform.LaunchCompactScatter(
+                    stream, slot.receive.data, destinations, routes, chunkLayout_.data, rowCount,
+                    plan_.chunkCount, tensorSizes_.size(), windowBlocks_ * shardSize_, shardSize_,
+                    usedWorkers);
+                if (status.Failure()) { return status; }
+            }
+            first = last;
+        }
+        return Status::OK();
+    }
+
+    Status CopyThenScatterReadyRanks(const WindowPlan& window, size_t slotIndex, LoadSlot& slot,
+                                     PlatformRuntime& platform, StreamHandle stream,
+                                     uint64_t readyMask)
+    {
+        const auto& peers = remoteTransport_->PeerBuffers(slotIndex);
+        std::vector<DeviceCopy> copies;
+        copies.reserve(worldSize_);
+        const size_t rankStride = windowBlocks_ * shardSize_;
+        for (uint32_t owner = 0; owner < worldSize_; ++owner) {
+            if ((readyMask & (uint64_t{1} << owner)) == 0 || window.ownerCounts[owner] == 0) {
+                continue;
+            }
+            copies.push_back({static_cast<uint8_t*>(slot.receive.data) + owner * rankStride,
+                              peers[owner], window.ownerCounts[owner] * shardSize_});
+        }
+        auto status = platform.CopyDeviceBatchAsync(stream, copies.data(), copies.size());
+        if (status.Failure()) { return status; }
+        return ScatterBufferedReadyRanks(window, slot, platform, stream, readyMask);
+    }
+
+    Status ScatterReadyRanks(const WindowPlan& window, size_t slotIndex, LoadSlot& slot,
+                             PlatformRuntime& platform, StreamHandle stream, uint64_t readyMask)
+    {
+        if (remoteScatterMode_ == RemoteScatterMode::BatchCopy) {
+            return BatchCopyReadyRanks(window, slotIndex, slot, platform, stream, readyMask);
+        }
+        if (remoteScatterMode_ == RemoteScatterMode::CopyThenScatter) {
+            return CopyThenScatterReadyRanks(window, slotIndex, slot, platform, stream, readyMask);
+        }
+        for (uint32_t first = 0; first < worldSize_;) {
+            if ((readyMask & (uint64_t{1} << first)) == 0) {
+                ++first;
+                continue;
+            }
+            uint32_t last = first + 1;
+            while (last < worldSize_ && (readyMask & (uint64_t{1} << last)) != 0) { ++last; }
+            const size_t rowOffset = window.ownerOffsets[first];
+            size_t rowCount = 0;
+            for (uint32_t owner = first; owner < last; ++owner) {
+                rowCount += window.ownerCounts[owner];
+            }
+            if (rowCount != 0) {
+                const auto taskCount = rowCount * plan_.chunkCount;
+                const auto usedWorkers =
+                    static_cast<uint32_t>(std::min(scatterAivCores_, taskCount));
+                auto* destinations = static_cast<uint8_t*>(slot.destinations.data) +
+                                     rowOffset * tensorSizes_.size() * sizeof(uint64_t);
+                auto* routes =
+                    static_cast<uint8_t*>(slot.routes.data) + rowOffset * 2 * sizeof(uint32_t);
+                auto status = platform.LaunchRemoteScatter(
+                    stream, slot.peerBuffers.data, destinations, routes, chunkLayout_.data,
+                    rowCount, plan_.chunkCount, tensorSizes_.size(), shardSize_, usedWorkers);
+                if (status.Failure()) { return status; }
+            }
+            first = last;
+        }
+        return Status::OK();
     }
 
     void ProcessLoadBackendOnly(const std::shared_ptr<TaskState>& task)
@@ -1106,7 +972,9 @@ private:
         std::deque<PendingBackend> active;
         for (size_t i = 0; i < loadSlots_.size(); ++i) { freeSlots.push_back(i); }
         size_t nextWindow = 0;
+        const auto prefetchStarted = Clock::now();
         Prefetch(task->input.data(), task->input.size());
+        metrics.prefetchMs = Milliseconds(Clock::now() - prefetchStarted);
         auto submitReadyWindows = [&] {
             while (nextWindow < task->windows.size() && !freeSlots.empty()) {
                 const auto slot = freeSlots.front();
@@ -1133,8 +1001,12 @@ private:
         Finish(task, firstError);
     }
 
-    void ProcessRemoteLoad(const std::shared_ptr<TaskState>& task, PlatformRuntime& platform)
+    void ProcessLoad(const std::shared_ptr<TaskState>& task, PlatformRuntime& platform)
     {
+        if (loadBackendOnly_) {
+            ProcessLoadBackendOnly(task);
+            return;
+        }
         const auto taskStarted = Clock::now();
         LoadMetrics metrics;
         metrics.queueWaitMs = Milliseconds(taskStarted - task->queuedAt);
@@ -1148,14 +1020,22 @@ private:
         std::vector<StageTraceRecord> stageTraceRecords;
         if (task->stageTrace) { stageTraceRecords.reserve(task->windows.size()); }
 
+        const auto prefetchStarted = Clock::now();
         Prefetch(task->input.data(), task->input.size());
+        metrics.prefetchMs = Milliseconds(Clock::now() - prefetchStarted);
         auto reclaim = [&](size_t slotIndex) {
             auto& slot = *loadSlots_[slotIndex];
             if (!slot.inFlight) { return Status::OK(); }
             const auto started = Clock::now();
-            auto status = platform.SynchronizeEvent(slot.sendFree);
-            if (status.Success()) {
-                remoteTransport_->PublishConsumed(slotIndex, slot.generation);
+            auto status = Status::OK();
+            if (!slot.consumedPublished) {
+                status = platform.SynchronizeEvent(slot.sendFree);
+                if (status.Success() && distributedLoadEnabled_ && !skipRemoteScatter_) {
+                    remoteTransport_->PublishConsumed(slotIndex, slot.generation);
+                    slot.consumedPublished = true;
+                }
+            }
+            if (status.Success() && distributedLoadEnabled_ && !skipRemoteScatter_) {
                 status = remoteTransport_->WaitConsumed(slotIndex, slot.generation);
             }
             metrics.slotWaitMs += Milliseconds(Clock::now() - started);
@@ -1166,19 +1046,23 @@ private:
             pending[slotIndex] = SubmitLoadWindow(task, windowIndex, slotIndex, metrics);
             submitted[slotIndex] = true;
         };
+        const size_t firstSlot = nextLoadSlot_;
+        nextLoadSlot_ =
+            (nextLoadSlot_ + task->windows.size() % loadSlots_.size()) % loadSlots_.size();
         for (size_t window = 0; window < std::min(task->windows.size(), loadSlots_.size());
              ++window) {
-            auto status = reclaim(window);
+            const size_t slotIndex = (firstSlot + window) % loadSlots_.size();
+            auto status = reclaim(slotIndex);
             if (status.Failure()) {
                 firstError = status;
                 if (IsFatalCommunication(status)) { runtime_->Poison(status); }
                 break;
             }
-            submit(window, window);
+            submit(window, slotIndex);
         }
 
         for (size_t windowIndex = 0; windowIndex < task->windows.size(); ++windowIndex) {
-            const size_t slotIndex = windowIndex % loadSlots_.size();
+            const size_t slotIndex = (firstSlot + windowIndex) % loadSlots_.size();
             if (!submitted[slotIndex]) {
                 auto status = reclaim(slotIndex);
                 if (status.Failure()) {
@@ -1199,8 +1083,9 @@ private:
             auto& slot = *loadSlots_[slotIndex];
             const auto stream = runtime_->SlotStream(slotIndex);
             const auto& window = task->windows[windowIndex];
-            auto roundStatus = PrepareLoadMetadata(task, windowIndex, window, slot,
-                                                   current.status.Failure(), platform, stream);
+            const auto metadataStarted = Clock::now();
+            auto roundStatus = PrepareLoadMetadata(task, window, slot, platform, stream);
+            metrics.metadataMs += Milliseconds(Clock::now() - metadataStarted);
             if (roundStatus.Failure() && firstError.Success()) { firstError = roundStatus; }
             if (current.status.Failure() && firstError.Success()) { firstError = current.status; }
 
@@ -1213,40 +1098,86 @@ private:
                 }
             }
             const auto readyStartedAt = Clock::now();
-            auto readyStatus = platform.RecordEvent(slot.ready, stream);
-            const uint64_t generation = slot.generation + 1;
-            const uint64_t windowTag = WindowTag(*task, window);
-            const bool localFailed =
-                current.status.Failure() || roundStatus.Failure() || readyStatus.Failure();
-            auto status =
-                remoteTransport_->PublishReady(slotIndex, generation, windowTag, localFailed);
-            if (readyStatus.Failure() && firstError.Success()) { firstError = readyStatus; }
-            auto peerFailed = [&]() -> Expected<bool> {
-                if (status.Failure()) { return status; }
-                return remoteTransport_->WaitReady(slotIndex, generation, windowTag, stream);
-            }();
-            const auto readySubmittedAt = Clock::now();
-            metrics.collectiveSubmitMs += Milliseconds(readySubmittedAt - readyStartedAt);
-            if (!peerFailed) {
-                if (firstError.Success()) { firstError = peerFailed.Error(); }
-                if (IsFatalCommunication(peerFailed.Error())) {
-                    runtime_->Poison(peerFailed.Error());
+            const bool localFailed = current.status.Failure() || roundStatus.Failure();
+            bool peerFailed = localFailed;
+            auto status = Status::OK();
+            if (distributedLoadEnabled_ && !skipRemoteScatter_) {
+                const bool batchedRemoteScatter =
+                    remoteScatterMode_ == RemoteScatterMode::BatchedRemoteScatter;
+                const uint64_t generation = slot.generation + 1;
+                const uint64_t windowTag = WindowTag(*task, window);
+                status =
+                    remoteTransport_->PublishReady(slotIndex, generation, windowTag, localFailed);
+                metrics.remoteReadySubmitMs += Milliseconds(Clock::now() - readyStartedAt);
+                uint64_t pendingMask =
+                    worldSize_ == 64 ? ~uint64_t{0} : (uint64_t{1} << worldSize_) - 1;
+                bool scatterTimingStarted = false;
+                while (status.Success() && pendingMask != 0) {
+                    const auto waitStarted = Clock::now();
+                    auto ready =
+                        remoteTransport_->WaitReady(slotIndex, generation, windowTag, pendingMask);
+                    metrics.remoteReadySubmitMs += Milliseconds(Clock::now() - waitStarted);
+                    if (!ready) {
+                        status = ready.Error();
+                        break;
+                    }
+                    pendingMask &= ~ready.Value().readyMask;
+                    peerFailed = peerFailed || ready.Value().failedMask != 0;
+                    if (peerFailed || skipLoadScatter_ || batchedRemoteScatter) { continue; }
+                    if (timing != nullptr && !scatterTimingStarted) {
+                        if (platform.RecordEvent(timing->remoteReady, stream).Success()) {
+                            scatterTimingStarted = true;
+                        } else {
+                            timing = nullptr;
+                        }
+                    }
+                    const auto started = Clock::now();
+                    auto scatterStatus = ScatterReadyRanks(window, slotIndex, slot, platform,
+                                                           stream, ready.Value().readyMask);
+                    metrics.scatterSubmitMs += Milliseconds(Clock::now() - started);
+                    if (scatterStatus.Failure() && firstError.Success()) {
+                        firstError = scatterStatus;
+                    }
+                    if (scatterStatus.Failure()) { peerFailed = true; }
                 }
-                break;
-            }
-            slot.generation = generation;
-            if (peerFailed.Value() && firstError.Success()) {
-                firstError = Status::Error("remote scatter owner backend load failed");
-            }
-            if (timing != nullptr &&
-                platform.RecordEvent(timing->collectiveDone, stream).Failure()) {
-                timing = nullptr;
-            }
-            if (!peerFailed.Value() && !skipLoadScatter_) {
+                if (status.Success() && !peerFailed && !skipLoadScatter_ && batchedRemoteScatter) {
+                    if (timing != nullptr && !scatterTimingStarted) {
+                        if (platform.RecordEvent(timing->remoteReady, stream).Success()) {
+                            scatterTimingStarted = true;
+                        } else {
+                            timing = nullptr;
+                        }
+                    }
+                    const auto started = Clock::now();
+                    const uint64_t allRanks =
+                        worldSize_ == 64 ? ~uint64_t{0} : (uint64_t{1} << worldSize_) - 1;
+                    auto scatterStatus =
+                        ScatterReadyRanks(window, slotIndex, slot, platform, stream, allRanks);
+                    metrics.scatterSubmitMs += Milliseconds(Clock::now() - started);
+                    if (scatterStatus.Failure() && firstError.Success()) {
+                        firstError = scatterStatus;
+                    }
+                    if (scatterStatus.Failure()) { peerFailed = true; }
+                }
+                slot.generation = generation;
+                if (peerFailed && firstError.Success()) {
+                    firstError = Status::Error("remote scatter owner backend load failed");
+                }
+            } else if (!distributedLoadEnabled_ && !localFailed && !skipLoadScatter_) {
+                if (timing != nullptr &&
+                    platform.RecordEvent(timing->remoteReady, stream).Failure()) {
+                    timing = nullptr;
+                }
                 const auto started = Clock::now();
-                auto scatterStatus = ScatterWindow(task, window, slot, nullptr, platform, stream);
+                auto scatterStatus = ScatterWindow(window, slot, platform, stream);
                 metrics.scatterSubmitMs += Milliseconds(Clock::now() - started);
                 if (scatterStatus.Failure() && firstError.Success()) { firstError = scatterStatus; }
+            }
+            const auto readySubmittedAt = Clock::now();
+            if (status.Failure()) {
+                if (firstError.Success()) { firstError = status; }
+                if (IsFatalCommunication(status)) { runtime_->Poison(status); }
+                break;
             }
             if (timing != nullptr) {
                 if (platform.RecordEvent(timing->scatterDone, stream).Success()) {
@@ -1264,12 +1195,13 @@ private:
                 break;
             }
             slot.inFlight = true;
+            slot.consumedPublished = false;
             taskSlots[slotIndex] = true;
             if (task->stageTrace) {
                 stageTraceRecords.push_back(StageTraceRecord{
                     windowIndex, slotIndex, window.rows.size(), current.ownedRows,
-                    window.rows.size() * shardSize_ * worldSize_, current.slotReadyAt,
-                    current.backendSubmitStartedAt, current.backendSubmittedAt,
+                    window.rows.size() * shardSize_ * (distributedLoadEnabled_ ? worldSize_ : 1),
+                    current.slotReadyAt, current.backendSubmitStartedAt, current.backendSubmittedAt,
                     backendWaitStartedAt, backendReadyAt, readyStartedAt, readySubmittedAt});
             }
         }
@@ -1284,15 +1216,23 @@ private:
         auto completionStatus = platform.SynchronizeStream(completionStream);
         metrics.syncMs = Milliseconds(Clock::now() - started);
         if (completionStatus.Failure() && firstError.Success()) { firstError = completionStatus; }
+        if (completionStatus.Success() && distributedLoadEnabled_ && !skipRemoteScatter_) {
+            for (size_t slotIndex = 0; slotIndex < taskSlots.size(); ++slotIndex) {
+                auto& slot = *loadSlots_[slotIndex];
+                if (!taskSlots[slotIndex] || !slot.inFlight || slot.consumedPublished) { continue; }
+                remoteTransport_->PublishConsumed(slotIndex, slot.generation);
+                slot.consumedPublished = true;
+            }
+        }
         if (task->profile && completionStatus.Success()) {
             for (auto& timing : timingWindows) {
                 if (!timing.Valid()) { continue; }
                 float elapsed = 0.0F;
-                if (platform.EventElapsedTime(&elapsed, timing.start, timing.collectiveDone)
+                if (platform.EventElapsedTime(&elapsed, timing.start, timing.remoteReady)
                         .Success()) {
-                    metrics.collectiveDeviceMs += elapsed;
+                    metrics.remoteReadyDeviceMs += elapsed;
                 }
-                if (platform.EventElapsedTime(&elapsed, timing.collectiveDone, timing.scatterDone)
+                if (platform.EventElapsedTime(&elapsed, timing.remoteReady, timing.scatterDone)
                         .Success()) {
                     metrics.scatterDeviceMs += elapsed;
                 }
@@ -1300,333 +1240,6 @@ private:
         }
         metrics.totalMs = Milliseconds(Clock::now() - taskStarted);
         RecordLoadMetrics(metrics, task->profile);
-        RecordStageTrace(*task, taskStarted, stageTraceRecords);
-        Finish(task, firstError);
-    }
-
-    void ProcessLoad(const std::shared_ptr<TaskState>& task, PlatformRuntime& platform,
-                     StreamHandle stream, CollectiveHandle collective)
-    {
-        if (loadBackendOnly_) {
-            ProcessLoadBackendOnly(task);
-            return;
-        }
-        if (remoteScatterEnabled_) {
-            ProcessRemoteLoad(task, platform);
-            return;
-        }
-        (void)stream;
-        const auto taskStarted = Clock::now();
-        LoadMetrics metrics;
-        metrics.queueWaitMs = Milliseconds(taskStarted - task->queuedAt);
-        Status firstError = Status::OK();
-        Status localBackendError = Status::OK();
-        bool collectiveFailed = false;
-        std::deque<PendingBackend> active;
-        auto planStatus = PrepareLoadPlan(task, platform, collective, metrics);
-        if (IsFatalCommunication(planStatus)) {
-            runtime_->Poison(planStatus);
-            metrics.totalMs = Milliseconds(Clock::now() - taskStarted);
-            RecordLoadMetrics(metrics, task->profile);
-            Finish(task, planStatus);
-            return;
-        }
-        if (planStatus.Failure()) { firstError = planStatus; }
-        std::vector<TimingWindow> timingWindows;
-        std::vector<StageTraceRecord> stageTraceRecords;
-        if (task->stageTrace) { stageTraceRecords.reserve(task->windows.size()); }
-        bool profiling = task->profile;
-        if (profiling) {
-            try {
-                timingWindows.reserve(task->windows.size());
-            } catch (...) {
-                profiling = false;
-            }
-        }
-        size_t nextWindow = 0;
-        std::deque<size_t> freeSlots;
-        std::deque<size_t> recyclingSlots;
-        for (size_t i = 0; i < loadSlots_.size(); ++i) {
-            (loadSlots_[i]->inFlight ? recyclingSlots : freeSlots).push_back(i);
-        }
-        std::deque<size_t> freeReceiveSlots;
-        std::deque<size_t> recyclingReceiveSlots;
-        std::vector<bool> taskReceiveSlots(receiveSlots_.size(), false);
-        for (size_t i = 0; i < receiveSlots_.size(); ++i) {
-            (receiveSlots_[i]->inFlight ? recyclingReceiveSlots : freeReceiveSlots).push_back(i);
-        }
-        if (collectiveEnabled_) {
-            const auto metadataStream = runtime_->SlotStream(0);
-            auto status = platform.CopyHostToDevice(
-                task->destinations.data, task->destinations.size, task->hostDestinations.data,
-                task->hostDestinations.count * sizeof(uint64_t), metadataStream);
-            if (status.Success()) {
-                status = platform.RecordEvent(task->metadataReady, metadataStream);
-            }
-            if (status.Failure()) {
-                firstError = status;
-            } else {
-                // Every slot stream scatters through task->destinations, so all of
-                // them must observe the copy, not only the stream that issued it.
-                for (size_t i = 0; i < loadSlots_.size(); ++i) {
-                    status = platform.WaitEvent(runtime_->SlotStream(i), task->metadataReady);
-                    if (status.Failure() && firstError.Success()) { firstError = status; }
-                }
-            }
-        }
-        auto reclaimSlots = [&](bool blocking) {
-            for (auto slot = recyclingSlots.begin(); slot != recyclingSlots.end();) {
-                auto queried = platform.QueryEvent(loadSlots_[*slot]->sendFree);
-                if (queried && !queried.Value()) {
-                    ++slot;
-                    continue;
-                }
-                if (!queried && firstError.Success()) { firstError = queried.Error(); }
-                loadSlots_[*slot]->inFlight = false;
-                freeSlots.push_back(*slot);
-                slot = recyclingSlots.erase(slot);
-            }
-            if (!blocking || !freeSlots.empty() || recyclingSlots.empty()) { return; }
-            // Collectives run in submission order on one stream, so the oldest
-            // recycling send slot is always the next one to be released.
-            const auto slot = recyclingSlots.front();
-            recyclingSlots.pop_front();
-            const auto started = Clock::now();
-            auto status = platform.SynchronizeEvent(loadSlots_[slot]->sendFree);
-            metrics.slotWaitMs += Milliseconds(Clock::now() - started);
-            if (status.Failure() && firstError.Success()) { firstError = status; }
-            loadSlots_[slot]->inFlight = false;
-            freeSlots.push_back(slot);
-        };
-        auto submitReadyWindows = [&] {
-            while (nextWindow < task->windows.size() && !freeSlots.empty()) {
-                const auto slot = freeSlots.front();
-                freeSlots.pop_front();
-                active.push_back(SubmitLoadWindow(task, nextWindow, slot, metrics));
-                ++nextWindow;
-            }
-        };
-        auto reclaimReceiveSlots = [&](bool blocking) {
-            for (auto slot = recyclingReceiveSlots.begin(); slot != recyclingReceiveSlots.end();) {
-                auto queried = platform.QueryEvent(receiveSlots_[*slot]->scattered);
-                if (queried && !queried.Value()) {
-                    ++slot;
-                    continue;
-                }
-                if (!queried && firstError.Success()) { firstError = queried.Error(); }
-                receiveSlots_[*slot]->inFlight = false;
-                freeReceiveSlots.push_back(*slot);
-                slot = recyclingReceiveSlots.erase(slot);
-            }
-            if (!blocking || !freeReceiveSlots.empty() || recyclingReceiveSlots.empty()) { return; }
-            const auto slot = recyclingReceiveSlots.front();
-            recyclingReceiveSlots.pop_front();
-            const auto started = Clock::now();
-            auto status = platform.SynchronizeEvent(receiveSlots_[slot]->scattered);
-            metrics.slotWaitMs += Milliseconds(Clock::now() - started);
-            if (status.Failure() && firstError.Success()) { firstError = status; }
-            receiveSlots_[slot]->inFlight = false;
-            freeReceiveSlots.push_back(slot);
-        };
-        reclaimSlots(true);
-        submitReadyWindows();
-        while (!active.empty()) {
-            const auto waitStarted = Clock::now();
-            const auto backendWaitStartedAt = waitStarted;
-            auto pending = std::move(active.front());
-            active.pop_front();
-            if (pending.status.Success() && pending.submitted) {
-                pending.status = backend_->Wait(pending.handle);
-            }
-            const auto backendReadyAt = Clock::now();
-            metrics.backendWaitMs += Milliseconds(backendReadyAt - waitStarted);
-            auto& slot = *loadSlots_[pending.slot];
-            // Receive slots rotate with the collective order, which is the same on
-            // every rank. Metadata copies and the scatter run on that slot's
-            // stream; the collective always runs on the one collective stream.
-            reclaimReceiveSlots(false);
-            if (freeReceiveSlots.empty()) { reclaimReceiveSlots(true); }
-            if (freeReceiveSlots.empty()) {
-                if (firstError.Success()) {
-                    firstError = Status::Error("allgather receive slot reclamation failed");
-                }
-                break;
-            }
-            const auto receiveIndex = freeReceiveSlots.front();
-            freeReceiveSlots.pop_front();
-            auto& receiveSlot = *receiveSlots_[receiveIndex];
-            const auto slotStream = runtime_->SlotStream(receiveIndex);
-            const auto collectiveStream = runtime_->CollectiveStream();
-            const auto loadCollective = runtime_->Collective();
-            bool backendFailed = pending.status.Failure();
-            if (backendFailed && localBackendError.Success()) {
-                localBackendError = pending.status;
-            }
-            TimingWindow* timing = nullptr;
-            if (profiling) {
-                try {
-                    timingWindows.emplace_back();
-                    if (timingWindows.back().Setup(platform)) {
-                        timing = &timingWindows.back();
-                        if (platform.RecordEvent(timing->start, collectiveStream).Failure()) {
-                            timing = nullptr;
-                        }
-                    }
-                } catch (...) {
-                    profiling = false;
-                    timing = nullptr;
-                }
-            }
-            const auto& window = task->windows[pending.window];
-            auto roundStatus = PrepareLoadMetadata(task, pending.window, window, slot,
-                                                   backendFailed, platform, slotStream);
-            if (roundStatus.Failure() && firstError.Success()) { firstError = roundStatus; }
-            Clock::time_point collectiveStartedAt;
-            auto collectiveSubmittedAt = backendReadyAt;
-            if (collectiveEnabled_ && !skipLoadCollective_) {
-                collectiveStartedAt = Clock::now();
-                // Waiting for `prepared` also covers the previous round's scatter:
-                // both are queued on this slot's stream, in that order.
-                auto status = platform.RecordEvent(receiveSlot.prepared, slotStream);
-                if (status.Success()) {
-                    status = platform.WaitEvent(collectiveStream, receiveSlot.prepared);
-                }
-                if (status.Success()) {
-                    if (!window.frameCounts.empty()) {
-                        status = platform.AllGatherV(
-                            slot.send.data, window.frameCounts[rank_], receiveSlot.receive.data,
-                            window.frameCounts.data(), window.frameDisplacements.data(),
-                            loadCollective, collectiveStream);
-                    } else {
-                        status = platform.AllGather(slot.send.data, receiveSlot.receive.data,
-                                                    frameBytes_, loadCollective, collectiveStream);
-                    }
-                }
-                collectiveSubmittedAt = Clock::now();
-                metrics.collectiveSubmitMs +=
-                    Milliseconds(collectiveSubmittedAt - collectiveStartedAt);
-                if (status.Failure()) {
-                    // A collective that failed to enqueue never reached the wire,
-                    // so this rank has already fallen out of step with its peers.
-                    // Issuing the remaining rounds would only widen the gap.
-                    roundStatus = status;
-                    collectiveFailed = true;
-                    status = Status::StoreUnhealthy(fmt::format(
-                        "allgather collective failed, communicator is unusable: {}", status));
-                    if (firstError.Success() || !IsFatalCommunication(firstError)) {
-                        firstError = status;
-                    }
-                    runtime_->Poison(status);
-                }
-            }
-            if (task->stageTrace) {
-                stageTraceRecords.push_back(StageTraceRecord{
-                    pending.window, pending.slot, window.rows.size(), pending.ownedRows,
-                    collectiveEnabled_
-                        ? (window.frameCounts.empty()
-                               ? worldSize_ * frameBytes_
-                               : std::accumulate(window.frameCounts.begin(),
-                                                 window.frameCounts.end(), uint64_t{0}))
-                        : window.collectiveBlocks * shardSize_,
-                    pending.slotReadyAt, pending.backendSubmitStartedAt, pending.backendSubmittedAt,
-                    backendWaitStartedAt, backendReadyAt, collectiveStartedAt,
-                    collectiveSubmittedAt});
-            }
-            if (collectiveEnabled_ && !skipLoadCollective_) {
-                // The scatter reads the receive buffer, so it has to trail the
-                // collective that fills it. This is a device-side dependency:
-                // the host never waits here.
-                auto status = platform.RecordEvent(slot.sendFree, collectiveStream);
-                if (status.Success()) { status = platform.WaitEvent(slotStream, slot.sendFree); }
-                if (status.Failure() && firstError.Success()) { firstError = status; }
-            }
-            if (timing != nullptr &&
-                platform.RecordEvent(timing->collectiveDone, collectiveStream).Failure()) {
-                timing = nullptr;
-            }
-            if (roundStatus.Success() && (!backendFailed || collectiveEnabled_) &&
-                !skipLoadScatter_) {
-                const auto started = Clock::now();
-                auto scatterStatus =
-                    ScatterWindow(task, window, slot, &receiveSlot, platform, slotStream);
-                metrics.scatterSubmitMs += Milliseconds(Clock::now() - started);
-                if (scatterStatus.Failure()) { firstError = scatterStatus; }
-            }
-            if (timing != nullptr) {
-                if (platform.RecordEvent(timing->scatterDone, slotStream).Failure()) {
-                    timing = nullptr;
-                } else {
-                    timing->complete = true;
-                }
-            }
-            auto scatteredStatus = platform.RecordEvent(receiveSlot.scattered, slotStream);
-            if (scatteredStatus.Failure() && firstError.Success()) { firstError = scatteredStatus; }
-            if (!collectiveEnabled_ || skipLoadCollective_) {
-                // No collective read the send buffer, so the scatter is what frees
-                // it. Record on the same stream, after the scatter.
-                auto status = platform.RecordEvent(slot.sendFree, slotStream);
-                if (status.Failure() && firstError.Success()) { firstError = status; }
-            }
-            receiveSlot.inFlight = true;
-            taskReceiveSlots[receiveIndex] = true;
-            recyclingReceiveSlots.push_back(receiveIndex);
-            slot.inFlight = true;
-            recyclingSlots.push_back(pending.slot);
-            if (collectiveFailed) { break; }
-            // Issue the next collective before paying for slot recycling: the
-            // host only blocks when every slot is genuinely still in flight.
-            reclaimSlots(false);
-            submitReadyWindows();
-            if (active.empty() && nextWindow < task->windows.size()) {
-                reclaimSlots(true);
-                submitReadyWindows();
-            }
-        }
-        for (const auto& entry : active) {
-            // The loop stopped early; these backend loads still own their slots.
-            if (entry.submitted) { (void)backend_->Wait(entry.handle); }
-            loadSlots_[entry.slot]->inFlight = false;
-        }
-        const auto completionStream = runtime_->CompletionStream();
-        for (size_t i = 0; i < receiveSlots_.size(); ++i) {
-            if (!taskReceiveSlots[i]) { continue; }
-            // Every scatter ran on a receive slot's stream, and those streams are
-            // FIFO, so the latest scatter per slot covers all of this task's work.
-            auto waitStatus = platform.WaitEvent(completionStream, receiveSlots_[i]->scattered);
-            if (waitStatus.Failure() && firstError.Success()) { firstError = waitStatus; }
-        }
-        auto status = Status::OK();
-        if (collectiveEnabled_ && !skipLoadCollective_) {
-            status = platform.CopyDeviceToHost(task->hostError.data, sizeof(uint32_t),
-                                               task->deviceError.data, sizeof(uint32_t),
-                                               completionStream);
-            if (status.Failure() && firstError.Success()) { firstError = status; }
-        }
-        const auto syncStarted = Clock::now();
-        status = platform.SynchronizeStream(completionStream);
-        metrics.syncMs = Milliseconds(Clock::now() - syncStarted);
-        if (status.Failure() && firstError.Success()) { firstError = status; }
-        if (profiling && status.Success()) {
-            for (auto& timing : timingWindows) {
-                if (!timing.Valid()) { continue; }
-                float elapsed = 0.0F;
-                if (platform.EventElapsedTime(&elapsed, timing.start, timing.collectiveDone)
-                        .Success()) {
-                    metrics.collectiveDeviceMs += elapsed;
-                }
-                if (platform.EventElapsedTime(&elapsed, timing.collectiveDone, timing.scatterDone)
-                        .Success()) {
-                    metrics.scatterDeviceMs += elapsed;
-                }
-            }
-        }
-        if (firstError.Success() && localBackendError.Failure()) { firstError = localBackendError; }
-        if (firstError.Success() && collectiveEnabled_ && !skipLoadCollective_ &&
-            task->hostError.data[0] != 0) {
-            firstError = Status::Error("allgather owner backend load failed");
-        }
-        metrics.totalMs = Milliseconds(Clock::now() - taskStarted);
-        RecordLoadMetrics(metrics, task->profile && profiling);
         RecordStageTrace(*task, taskStarted, stageTraceRecords);
         Finish(task, firstError);
     }
@@ -1640,14 +1253,15 @@ private:
                 "bytes={} received_us={} enqueued_us={} dequeued_us={} slot_ready_us={} "
                 "backend_submit_begin_us={} backend_submit_end_us={} "
                 "backend_wait_begin_us={} backend_ready_us={} "
-                "collective_begin_us={} collective_end_us={}.",
+                "remote_ready_begin_us={} remote_ready_end_us={}.",
                 deviceId_, rank_, shardSize_, task.sequence, record.window, record.slot,
-                record.rows, record.ownedRows, record.collectiveBytes, Microseconds(task.queuedAt),
-                Microseconds(task.enqueuedAt), Microseconds(dequeuedAt),
-                Microseconds(record.slotReadyAt), Microseconds(record.backendSubmitStartedAt),
+                record.rows, record.ownedRows, record.remoteScatterBytes,
+                Microseconds(task.queuedAt), Microseconds(task.enqueuedAt),
+                Microseconds(dequeuedAt), Microseconds(record.slotReadyAt),
+                Microseconds(record.backendSubmitStartedAt),
                 Microseconds(record.backendSubmittedAt), Microseconds(record.backendWaitStartedAt),
-                Microseconds(record.backendReadyAt), Microseconds(record.collectiveStartedAt),
-                Microseconds(record.collectiveSubmittedAt));
+                Microseconds(record.backendReadyAt), Microseconds(record.remoteReadyStartedAt),
+                Microseconds(record.remoteReadySubmittedAt));
         }
     }
 
@@ -1658,41 +1272,44 @@ private:
                                  static_cast<double>(metrics.windows));
         UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_task_queue_wait_ms"),
                                  metrics.queueWaitMs);
-        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_load_placement_ms"),
-                                 metrics.placementMs);
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_load_prefetch_ms"),
+                                 metrics.prefetchMs);
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_load_metadata_ms"),
+                                 metrics.metadataMs);
         UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_load_slot_reclaim_wait_ms"),
                                  metrics.slotWaitMs);
         UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_load_backend_submit_ms"),
                                  metrics.backendSubmitMs);
         UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_load_inner_wait_ms"),
                                  metrics.backendWaitMs);
-        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_load_collective_submit_ms"),
-                                 metrics.collectiveSubmitMs);
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_load_remote_ready_submit_ms"),
+                                 metrics.remoteReadySubmitMs);
         UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_load_scatter_submit_ms"),
                                  metrics.scatterSubmitMs);
         UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_load_sync_ms"), metrics.syncMs);
         UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_load_total_ms"), metrics.totalMs);
-        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_load_collective_device_ms"),
-                                 metrics.collectiveDeviceMs);
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_load_remote_ready_device_ms"),
+                                 metrics.remoteReadyDeviceMs);
         UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("allgather_load_scatter_device_ms"),
                                  metrics.scatterDeviceMs);
         UC_INFO(
-            "AllGather load profile: queue_ms={:.3f}, placement_ms={:.3f}, slot_ms={:.3f}, "
+            "AllGather load profile: queue_ms={:.3f}, prefetch_ms={:.3f}, metadata_ms={:.3f}, "
+            "slot_ms={:.3f}, "
             "backend_submit_ms={:.3f}, backend_wait_ms={:.3f}, "
-            "collective_submit_ms={:.3f}, collective_device_ms={:.3f}, "
+            "remote_ready_submit_ms={:.3f}, remote_ready_device_ms={:.3f}, "
             "scatter_submit_ms={:.3f}, scatter_device_ms={:.3f}, "
             "sync_ms={:.3f}, total_ms={:.3f}, windows={}.",
-            metrics.queueWaitMs, metrics.placementMs, metrics.slotWaitMs, metrics.backendSubmitMs,
-            metrics.backendWaitMs, metrics.collectiveSubmitMs, metrics.collectiveDeviceMs,
-            metrics.scatterSubmitMs, metrics.scatterDeviceMs, metrics.syncMs, metrics.totalMs,
-            metrics.windows);
+            metrics.queueWaitMs, metrics.prefetchMs, metrics.metadataMs, metrics.slotWaitMs,
+            metrics.backendSubmitMs, metrics.backendWaitMs, metrics.remoteReadySubmitMs,
+            metrics.remoteReadyDeviceMs, metrics.scatterSubmitMs, metrics.scatterDeviceMs,
+            metrics.syncMs, metrics.totalMs, metrics.windows);
     }
 
     static std::pair<std::vector<uint64_t>, std::vector<uint32_t>> BalanceDescriptors(
-        std::vector<std::array<uint64_t, 3>> descriptors)
+        std::vector<std::array<uint64_t, 3>> descriptors, size_t maxWorkers = kMaxCopyWorkers)
     {
         if (descriptors.empty()) { return {}; }
-        const size_t workers = std::min(kMaxCopyWorkers, descriptors.size());
+        const size_t workers = std::min({kMaxCopyWorkers, maxWorkers, descriptors.size()});
         std::vector<std::vector<std::array<uint64_t, 3>>> bins(workers);
         std::vector<size_t> loads(workers, 0);
         std::sort(descriptors.begin(), descriptors.end(),
@@ -1878,39 +1495,30 @@ private:
     bool replicated_{false};
     bool scatterOnly_{false};
     bool distributedLoadEnabled_{false};
-    bool remoteScatterEnabled_{false};
-    bool collectiveEnabled_{false};
     size_t windowBlocks_{kDefaultWindowBlocks};
-    size_t frameMetadataBytes_{0};
-    size_t frameBytes_{0};
     size_t loadSlotCount_{kDefaultLoadSlots};
-    size_t requestedLoadGroups_{1};
-    size_t receiveSlotCount_{kDefaultReceiveSlots};
     size_t runtimeSlotStreamCount_{0};
     size_t dumpSlotCount_{kDefaultDumpSlots};
-    uint32_t collectiveBufferMb_{kDefaultCollectiveBufferMb};
-    std::string collectiveModeName_{"host"};
-    uint32_t collectiveMode_{1};
-    bool variableCollectiveRequested_{true};
-    bool variableCollectiveEnabled_{false};
     size_t scatterAivCores_{1};
+    RemoteScatterMode remoteScatterMode_{RemoteScatterMode::BatchCopy};
     std::string runtimeKey_;
-    std::vector<uint8_t> rootInfo_;
+    std::vector<uint8_t> bootstrapKey_;
     std::shared_ptr<PlatformRuntime> platform_;
     StageMemoryPlan plan_;
     DeviceBuffer chunkLayout_;
     std::vector<std::unique_ptr<LoadSlot>> loadSlots_;
+    std::vector<size_t> tensorOffsets_;
     std::unique_ptr<RemoteScatterTransport> remoteTransport_;
-    std::vector<std::unique_ptr<ReceiveSlot>> receiveSlots_;
     std::vector<std::unique_ptr<DumpSlot>> dumpSlots_;
     std::shared_ptr<AllGatherRuntime> runtime_;
     std::atomic<Detail::TaskHandle> nextHandle_{1};
     std::atomic<uint64_t> taskSequence_{0};
     std::atomic<uint64_t> loadTaskSequence_{0};
+    size_t nextLoadSlot_{0};
     size_t profileSampleEvery_{0};
     size_t stageTraceSampleEvery_{0};
     bool separateDumpQueue_{true};
-    bool skipLoadCollective_{false};
+    bool skipRemoteScatter_{false};
     bool skipLoadScatter_{false};
     bool loadBackendOnly_{false};
     std::mutex tasksMutex_;

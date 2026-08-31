@@ -63,7 +63,6 @@ if(UCM_RUNTIME_ASCEND_FAMILY)
         ucm_segmented_copy_kernels
         ucm_compact_scatter_kernels
         ascendcl
-        hccl
     )
 
     list(APPEND UCM_ALLGATHER_INSTALL_TARGETS

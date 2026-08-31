@@ -20,11 +20,11 @@ size_t StageMemoryPlan::TotalBytes() const { return PayloadBytes() + MetadataByt
 
 StageMemoryPlan CalculateStageMemoryPlan(const std::vector<size_t>& tensorSizes, size_t shardSize,
                                          size_t worldSize, bool replicated, size_t loadSlots,
-                                         size_t dumpSlots, size_t windowBlocks, size_t receiveSlots,
-                                         bool remoteScatter)
+                                         size_t dumpSlots, size_t windowBlocks,
+                                         bool bufferedRemoteScatter)
 {
     if (tensorSizes.empty() || shardSize == 0 || worldSize == 0 || loadSlots == 0 ||
-        dumpSlots == 0 || windowBlocks == 0 || receiveSlots == 0) {
+        dumpSlots == 0 || windowBlocks == 0) {
         throw std::invalid_argument("invalid allgather memory plan parameter");
     }
     const auto logicalSize =
@@ -37,10 +37,7 @@ StageMemoryPlan CalculateStageMemoryPlan(const std::vector<size_t>& tensorSizes,
         chunkCount += (size + kCopyChunkBytes - 1) / kCopyChunkBytes;
     }
     const bool distributed = replicated && worldSize > 1;
-    const bool collectiveEnabled = distributed && !remoteScatter;
     const size_t windowPayloadBytes = windowBlocks * shardSize;
-    const size_t frameBytes =
-        windowPayloadBytes + (collectiveEnabled ? CalculateFrameMetadataBytes(windowBlocks) : 0);
     const size_t maxWindowRows = windowBlocks * (distributed ? worldSize : 1);
 
     StageMemoryPlan plan;
@@ -51,36 +48,18 @@ StageMemoryPlan CalculateStageMemoryPlan(const std::vector<size_t>& tensorSizes,
     plan.windowBlocks = windowBlocks;
     plan.replicated = replicated;
     plan.loadSlots = loadSlots;
-    // Receive areas only cover the collective-to-scatter handoff, which one
-    // serialized collective stream saturates with a couple of buffers. They do
-    // not scale with the send slots that give the picker its choices.
-    plan.receiveSlots = std::min(receiveSlots, loadSlots);
     plan.dumpSlots = dumpSlots;
-    plan.loadSendBytes = loadSlots * frameBytes;
-    plan.loadReceiveBytes = collectiveEnabled ? plan.receiveSlots * worldSize * frameBytes : 0;
+    plan.loadSendBytes = loadSlots * windowPayloadBytes;
+    plan.loadReceiveBytes =
+        bufferedRemoteScatter && distributed ? loadSlots * worldSize * windowPayloadBytes : 0;
     plan.dumpSendBytes = dumpSlots * windowPayloadBytes;
     plan.chunkLayoutBytes = chunkCount * 4 * sizeof(uint64_t);
     plan.dumpDescriptorBytes = dumpSlots * windowBlocks * chunkCount * 3 * sizeof(uint64_t);
     plan.dumpOffsetBytes = dumpSlots * (kMaxCopyWorkers + 1) * sizeof(uint32_t);
-    // Framed mode keeps row addresses on the task, not per slot.
-    plan.loadDestinationBytes =
-        collectiveEnabled ? 0 : loadSlots * maxWindowRows * tensorSizes.size() * sizeof(uint64_t);
-    plan.loadRouteBytes = collectiveEnabled
-                              ? 0
-                              : loadSlots * maxWindowRows * 2 * sizeof(uint32_t) +
-                                    (remoteScatter ? loadSlots * worldSize * sizeof(void*) : 0);
+    plan.loadDestinationBytes = loadSlots * maxWindowRows * tensorSizes.size() * sizeof(uint64_t);
+    plan.loadRouteBytes = loadSlots * maxWindowRows * 2 * sizeof(uint32_t) +
+                          (distributed ? loadSlots * worldSize * sizeof(void*) : 0);
     return plan;
-}
-
-size_t CalculateCollectiveBytes(uint32_t bufferMb, bool collectiveEnabled,
-                                size_t collectiveGroupCount)
-{
-    if (!collectiveEnabled) { return 0; }
-    if (bufferMb == 0 || collectiveGroupCount == 0) {
-        throw std::invalid_argument("collective buffer parameters must be positive");
-    }
-    return static_cast<size_t>(bufferMb) * 1024 * 1024 * kCollectiveBufferCopies *
-           collectiveGroupCount;
 }
 
 }  // namespace UC::AllGatherStore

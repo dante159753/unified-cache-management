@@ -832,8 +832,18 @@ _HISTOGRAM_METRICS = [
         [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
     ),
     (
-        "allgather_load_collective_submit_ms",
-        "Total CPU time in all_gather_into_tensor calls for one load task (ms)",
+        "allgather_load_prefetch_ms",
+        "Time spent submitting owner-filtered backend prefetch for one load task (ms)",
+        [0, 0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100],
+    ),
+    (
+        "allgather_load_metadata_ms",
+        "Total host time preparing and submitting remote-scatter metadata for one load task (ms)",
+        [0, 0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100],
+    ),
+    (
+        "allgather_load_remote_ready_submit_ms",
+        "Total CPU time publishing and waiting for remote-scatter readiness (ms)",
         [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100],
     ),
     (
@@ -843,7 +853,7 @@ _HISTOGRAM_METRICS = [
     ),
     (
         "allgather_load_sync_ms",
-        "Final current-stream synchronization time after AllGather and compact scatter (ms)",
+        "Final completion-stream synchronization time after remote scatter (ms)",
         [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200],
     ),
     (
@@ -867,8 +877,8 @@ _HISTOGRAM_METRICS = [
         [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50],
     ),
     (
-        "allgather_load_collective_device_ms",
-        "Sampled device execution time for AllGather collectives in one load task (ms)",
+        "allgather_load_remote_ready_device_ms",
+        "Sampled device wait time for remote-scatter readiness in one load task (ms)",
         [0, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100],
     ),
     (

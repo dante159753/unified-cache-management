@@ -15,8 +15,8 @@ namespace UC::AllGatherStore {
 namespace {
 
 constexpr uint32_t kMagic = 0x55434950;
-constexpr uint32_t kVersion = 2;
-constexpr size_t kMaxHandleBytes = 128;
+constexpr uint32_t kVersion = 4;
+constexpr size_t kMaxHandleBytes = 256;
 constexpr auto kSetupTimeout = std::chrono::seconds(120);
 constexpr auto kDataTimeout = std::chrono::seconds(120);
 
@@ -26,8 +26,8 @@ struct alignas(64) SharedHeader {
     uint32_t worldSize;
     uint32_t slotCount;
     uint32_t memoryHandleBytes;
-    uint32_t eventHandleBytes;
     uint64_t joinedMask;
+    uint64_t authorizedMask;
     uint64_t openedMask;
     uint32_t unlinked;
 };
@@ -57,8 +57,8 @@ std::string SharedName(const std::vector<uint8_t>& key, const std::string& signa
 }
 
 struct Layout {
+    size_t processIds;
     size_t memoryHandles;
-    size_t eventHandles;
     size_t windowTags;
     size_t ready;
     size_t consumed;
@@ -69,9 +69,9 @@ Layout SharedLayout(uint32_t worldSize, size_t slotCount)
 {
     const size_t entries = static_cast<size_t>(worldSize) * slotCount;
     Layout layout{};
-    layout.memoryHandles = AlignUp(sizeof(SharedHeader), 64);
-    layout.eventHandles = layout.memoryHandles + entries * kMaxHandleBytes;
-    layout.windowTags = AlignUp(layout.eventHandles + entries * kMaxHandleBytes, 64);
+    layout.processIds = AlignUp(sizeof(SharedHeader), 64);
+    layout.memoryHandles = AlignUp(layout.processIds + worldSize * sizeof(int32_t), 64);
+    layout.windowTags = AlignUp(layout.memoryHandles + entries * kMaxHandleBytes, 64);
     layout.ready = layout.windowTags + entries * sizeof(uint64_t);
     layout.consumed = layout.ready + entries * sizeof(uint64_t);
     layout.bytes = layout.consumed + entries * sizeof(uint64_t);
@@ -112,33 +112,29 @@ RemoteScatterTransport::RemoteScatterTransport(std::shared_ptr<PlatformRuntime> 
 Expected<std::unique_ptr<RemoteScatterTransport>> RemoteScatterTransport::Create(
     std::shared_ptr<PlatformRuntime> platform, const std::vector<uint8_t>& bootstrapKey,
     const std::string& stageSignature, uint32_t rank, uint32_t worldSize,
-    const std::vector<void*>& localBuffers, const std::vector<EventHandle>& localEvents)
+    const std::vector<void*>& localBuffers, size_t bufferBytes)
 {
     if (platform == nullptr || !platform->SupportsRemoteScatter()) {
         return Status::Error("remote scatter is unavailable on this platform");
     }
     if (bootstrapKey.empty() || worldSize < 2 || worldSize > 64 || rank >= worldSize ||
-        localBuffers.empty() || localBuffers.size() > UINT32_MAX ||
-        localBuffers.size() != localEvents.size()) {
+        localBuffers.empty() || bufferBytes == 0 || localBuffers.size() > UINT32_MAX) {
         return Status::InvalidParam("invalid remote scatter transport configuration");
     }
     if (std::any_of(localBuffers.begin(), localBuffers.end(),
-                    [](const auto value) { return value == nullptr; }) ||
-        std::any_of(localEvents.begin(), localEvents.end(),
                     [](const auto value) { return value == nullptr; })) {
         return Status::InvalidParam("null remote scatter IPC resource");
     }
     auto result = std::unique_ptr<RemoteScatterTransport>(
         new RemoteScatterTransport(std::move(platform), rank, worldSize, localBuffers.size()));
-    auto status = result->Setup(bootstrapKey, stageSignature, localBuffers, localEvents);
+    auto status = result->Setup(bootstrapKey, stageSignature, localBuffers, bufferBytes);
     if (status.Failure()) { return status; }
     return std::move(result);
 }
 
 Status RemoteScatterTransport::Setup(const std::vector<uint8_t>& bootstrapKey,
                                      const std::string& stageSignature,
-                                     const std::vector<void*>& localBuffers,
-                                     const std::vector<EventHandle>& localEvents)
+                                     const std::vector<void*>& localBuffers, size_t bufferBytes)
 {
     sharedName_ = SharedName(bootstrapKey, stageSignature);
     const auto layout = SharedLayout(worldSize_, slotCount_);
@@ -195,73 +191,72 @@ Status RemoteScatterTransport::Setup(const std::vector<uint8_t>& bootstrapKey,
         return Status::InvalidParam("remote scatter shared state layout mismatch");
     }
 
+    auto processId = platform_->IpcProcessId();
+    if (!processId) { return processId.Error(); }
+    auto* processIds =
+        reinterpret_cast<int32_t*>(static_cast<uint8_t*>(mapping_) + layout.processIds);
+    processIds[rank_] = processId.Value();
+
     std::vector<std::vector<uint8_t>> memoryHandles(slotCount_);
-    std::vector<std::vector<uint8_t>> eventHandles(slotCount_);
     for (size_t slot = 0; slot < slotCount_; ++slot) {
-        auto memory = platform_->ExportDeviceMemory(localBuffers[slot]);
+        auto memory = platform_->ExportDeviceMemory(localBuffers[slot], bufferBytes);
         if (!memory) { return memory.Error(); }
-        auto event = platform_->ExportEvent(localEvents[slot]);
-        if (!event) { return event.Error(); }
-        if (memory.Value().size() > kMaxHandleBytes || event.Value().size() > kMaxHandleBytes) {
+        memoryHandles[slot] = std::move(memory.Value());
+        if (memoryHandles[slot].size() > kMaxHandleBytes) {
             return Status::Error("remote scatter IPC handle is too large");
         }
-        memoryHandles[slot] = std::move(memory.Value());
-        eventHandles[slot] = std::move(event.Value());
     }
     if (rank_ == 0) {
         __atomic_store_n(&header->memoryHandleBytes,
                          static_cast<uint32_t>(memoryHandles.front().size()), __ATOMIC_RELEASE);
-        __atomic_store_n(&header->eventHandleBytes,
-                         static_cast<uint32_t>(eventHandles.front().size()), __ATOMIC_RELEASE);
     } else {
         auto status = WaitUntil(
-            [&] {
-                return __atomic_load_n(&header->memoryHandleBytes, __ATOMIC_ACQUIRE) != 0 &&
-                       __atomic_load_n(&header->eventHandleBytes, __ATOMIC_ACQUIRE) != 0;
-            },
+            [&] { return __atomic_load_n(&header->memoryHandleBytes, __ATOMIC_ACQUIRE) != 0; },
             kSetupTimeout, "publishing remote scatter handle sizes");
         if (status.Failure()) { return status; }
     }
     for (size_t slot = 0; slot < slotCount_; ++slot) {
-        if (memoryHandles[slot].size() != header->memoryHandleBytes ||
-            eventHandles[slot].size() != header->eventHandleBytes) {
+        if (memoryHandles[slot].size() != header->memoryHandleBytes) {
             return Status::InvalidParam("inconsistent remote scatter IPC handle size");
         }
         const size_t index = static_cast<size_t>(rank_) * slotCount_ + slot;
         std::memcpy(
             static_cast<uint8_t*>(mapping_) + layout.memoryHandles + index * kMaxHandleBytes,
             memoryHandles[slot].data(), memoryHandles[slot].size());
-        std::memcpy(static_cast<uint8_t*>(mapping_) + layout.eventHandles + index * kMaxHandleBytes,
-                    eventHandles[slot].data(), eventHandles[slot].size());
     }
     __atomic_fetch_or(&header->joinedMask, uint64_t{1} << rank_, __ATOMIC_RELEASE);
     auto status = WaitUntil([&] { return Load(&header->joinedMask) == RankMask(worldSize_); },
                             kSetupTimeout, "exchanging remote scatter IPC handles");
     if (status.Failure()) { return status; }
 
+    std::vector<int32_t> peerProcessIds;
+    peerProcessIds.reserve(worldSize_ - 1);
+    for (uint32_t peer = 0; peer < worldSize_; ++peer) {
+        if (peer != rank_) { peerProcessIds.push_back(processIds[peer]); }
+    }
+    for (const auto& handle : memoryHandles) {
+        status = platform_->AuthorizeDeviceMemory(handle, peerProcessIds);
+        if (status.Failure()) { return status; }
+    }
+    __atomic_fetch_or(&header->authorizedMask, uint64_t{1} << rank_, __ATOMIC_RELEASE);
+    status = WaitUntil([&] { return Load(&header->authorizedMask) == RankMask(worldSize_); },
+                       kSetupTimeout, "authorizing remote scatter IPC handles");
+    if (status.Failure()) { return status; }
+
     peerBuffers_.assign(slotCount_, std::vector<void*>(worldSize_, nullptr));
-    peerEvents_.assign(slotCount_, std::vector<EventHandle>(worldSize_, nullptr));
     for (size_t slot = 0; slot < slotCount_; ++slot) {
         for (uint32_t peer = 0; peer < worldSize_; ++peer) {
             if (peer == rank_) {
                 peerBuffers_[slot][peer] = localBuffers[slot];
-                peerEvents_[slot][peer] = localEvents[slot];
                 continue;
             }
             const size_t index = static_cast<size_t>(peer) * slotCount_ + slot;
             std::vector<uint8_t> memory(header->memoryHandleBytes);
-            std::vector<uint8_t> event(header->eventHandleBytes);
             std::memcpy(
                 memory.data(),
                 static_cast<uint8_t*>(mapping_) + layout.memoryHandles + index * kMaxHandleBytes,
                 memory.size());
-            std::memcpy(
-                event.data(),
-                static_cast<uint8_t*>(mapping_) + layout.eventHandles + index * kMaxHandleBytes,
-                event.size());
             status = platform_->OpenDeviceMemory(memory, &peerBuffers_[slot][peer]);
-            if (status.Failure()) { return status; }
-            status = platform_->OpenEvent(event, &peerEvents_[slot][peer]);
             if (status.Failure()) { return status; }
         }
     }
@@ -289,7 +284,6 @@ RemoteScatterTransport::~RemoteScatterTransport()
             for (uint32_t peer = 0; peer < worldSize_; ++peer) {
                 if (peer == rank_) { continue; }
                 platform_->CloseDeviceMemory(peerBuffers_[slot][peer]);
-                platform_->DestroyEvent(peerEvents_[slot][peer]);
             }
         }
     }
@@ -313,41 +307,44 @@ Status RemoteScatterTransport::PublishReady(size_t slot, uint64_t generation, ui
     return Status::OK();
 }
 
-Expected<bool> RemoteScatterTransport::WaitReady(size_t slot, uint64_t generation,
-                                                 uint64_t windowTag, StreamHandle stream)
+Expected<RemoteScatterTransport::ReadyRanks> RemoteScatterTransport::WaitReady(size_t slot,
+                                                                               uint64_t generation,
+                                                                               uint64_t windowTag,
+                                                                               uint64_t pendingMask)
 {
-    if (slot >= slotCount_ || generation == 0) {
+    if (slot >= slotCount_ || generation == 0 || pendingMask == 0 ||
+        (pendingMask & ~RankMask(worldSize_)) != 0) {
         return Status::InvalidParam("invalid remote scatter wait generation");
     }
     const auto layout = SharedLayout(worldSize_, slotCount_);
     auto* windowTags =
         reinterpret_cast<uint64_t*>(static_cast<uint8_t*>(mapping_) + layout.windowTags);
     auto* ready = reinterpret_cast<uint64_t*>(static_cast<uint8_t*>(mapping_) + layout.ready);
-    bool failed = false;
-    for (uint32_t peer = 0; peer < worldSize_; ++peer) {
-        uint64_t state = 0;
-        auto status = WaitUntil(
-            [&] {
-                state = Load(ready + static_cast<size_t>(peer) * slotCount_ + slot);
-                return (state >> 1) >= generation;
-            },
-            kDataTimeout, "waiting for remote scatter producer");
-        if (status.Failure()) { return Status::StoreUnhealthy(status.ToString()); }
-        if ((state >> 1) != generation) {
-            return Status::StoreUnhealthy("remote scatter producer generation overrun");
+    const auto deadline = std::chrono::steady_clock::now() + kDataTimeout;
+    for (;;) {
+        ReadyRanks result;
+        for (uint32_t peer = 0; peer < worldSize_; ++peer) {
+            const uint64_t rankBit = uint64_t{1} << peer;
+            if ((pendingMask & rankBit) == 0) { continue; }
+            const size_t index = static_cast<size_t>(peer) * slotCount_ + slot;
+            const uint64_t state = Load(ready + index);
+            const uint64_t peerGeneration = state >> 1;
+            if (peerGeneration < generation) { continue; }
+            if (peerGeneration != generation) {
+                return Status::StoreUnhealthy("remote scatter producer generation overrun");
+            }
+            if (Load(windowTags + index) != windowTag) {
+                return Status::StoreUnhealthy("remote scatter window identity mismatch");
+            }
+            result.readyMask |= rankBit;
+            if ((state & 1) != 0) { result.failedMask |= rankBit; }
         }
-        const size_t index = static_cast<size_t>(peer) * slotCount_ + slot;
-        if (Load(windowTags + index) != windowTag) {
-            return Status::StoreUnhealthy("remote scatter window identity mismatch");
+        if (result.readyMask != 0) { return result; }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return Status::StoreUnhealthy("waiting for remote scatter producer timed out");
         }
-        const bool peerFailed = (state & 1) != 0;
-        failed = failed || peerFailed;
-        if (!peerFailed) {
-            status = platform_->WaitEvent(stream, peerEvents_[slot][peer]);
-            if (status.Failure()) { return status; }
-        }
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
     }
-    return failed;
 }
 
 void RemoteScatterTransport::PublishConsumed(size_t slot, uint64_t generation)

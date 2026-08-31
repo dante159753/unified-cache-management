@@ -1,6 +1,7 @@
 #include <cstring>
 #include <cuda_runtime.h>
 #include <random>
+#include <unistd.h>
 #include "platform_runtime.h"
 
 namespace UC::AllGatherStore {
@@ -159,13 +160,6 @@ public:
                           "cudaEventCreateWithFlags");
     }
 
-    Status CreateInterprocessEvent(EventHandle* event) override
-    {
-        return CudaStatus(cudaEventCreateWithFlags(reinterpret_cast<cudaEvent_t*>(event),
-                                                   cudaEventDisableTiming | cudaEventInterprocess),
-                          "cudaEventCreateWithFlags");
-    }
-
     void DestroyEvent(EventHandle event) override
     {
         if (event != nullptr) { (void)cudaEventDestroy(static_cast<cudaEvent_t>(event)); }
@@ -238,9 +232,32 @@ public:
                           "cudaMemcpyAsync");
     }
 
+    Status CopyDeviceBatchAsync(StreamHandle stream, const DeviceCopy* copies,
+                                size_t count) override
+    {
+        if (count == 0) { return Status::OK(); }
+        if (stream == nullptr || copies == nullptr) {
+            return Status::InvalidParam("invalid device batch copy input");
+        }
+        for (size_t i = 0; i < count; ++i) {
+            const auto& copy = copies[i];
+            if (copy.destination == nullptr || copy.source == nullptr || copy.bytes == 0) {
+                return Status::InvalidParam("invalid device batch copy descriptor({})", i);
+            }
+            auto status = CudaStatus(
+                cudaMemcpyAsync(copy.destination, copy.source, copy.bytes, cudaMemcpyDefault,
+                                static_cast<cudaStream_t>(stream)),
+                "cudaMemcpyAsync");
+            if (status.Failure()) { return status; }
+        }
+        return Status::OK();
+    }
+
     bool SupportsRemoteScatter() const override { return true; }
 
-    Expected<std::vector<uint8_t>> ExportDeviceMemory(void* data) override
+    Expected<int32_t> IpcProcessId() override { return static_cast<int32_t>(getpid()); }
+
+    Expected<std::vector<uint8_t>> ExportDeviceMemory(void* data, size_t) override
     {
         cudaIpcMemHandle_t handle{};
         auto status = CudaStatus(cudaIpcGetMemHandle(&handle, data), "cudaIpcGetMemHandle");
@@ -249,14 +266,10 @@ public:
         return std::vector<uint8_t>(begin, begin + sizeof(handle));
     }
 
-    Expected<std::vector<uint8_t>> ExportEvent(EventHandle event) override
+    Status AuthorizeDeviceMemory(const std::vector<uint8_t>&,
+                                 const std::vector<int32_t>&) override
     {
-        cudaIpcEventHandle_t handle{};
-        auto status = CudaStatus(cudaIpcGetEventHandle(&handle, static_cast<cudaEvent_t>(event)),
-                                 "cudaIpcGetEventHandle");
-        if (status.Failure()) { return status; }
-        const auto* begin = reinterpret_cast<const uint8_t*>(&handle);
-        return std::vector<uint8_t>(begin, begin + sizeof(handle));
+        return Status::OK();
     }
 
     Status OpenDeviceMemory(const std::vector<uint8_t>& handle, void** data) override
@@ -270,23 +283,12 @@ public:
                           "cudaIpcOpenMemHandle");
     }
 
-    Status OpenEvent(const std::vector<uint8_t>& handle, EventHandle* event) override
-    {
-        if (handle.size() != sizeof(cudaIpcEventHandle_t)) {
-            return Status::InvalidParam("invalid CUDA IPC event handle size({})", handle.size());
-        }
-        cudaIpcEventHandle_t value{};
-        std::memcpy(&value, handle.data(), sizeof(value));
-        return CudaStatus(cudaIpcOpenEventHandle(reinterpret_cast<cudaEvent_t*>(event), value),
-                          "cudaIpcOpenEventHandle");
-    }
-
     void CloseDeviceMemory(void* data) override
     {
         if (data != nullptr) { (void)cudaIpcCloseMemHandle(data); }
     }
 
-    Expected<std::vector<uint8_t>> CreateRootInfo() override
+    Expected<std::vector<uint8_t>> CreateBootstrapKey() override
     {
         std::vector<uint8_t> key(kBootstrapKeyBytes);
         std::random_device random;
@@ -294,41 +296,7 @@ public:
         return key;
     }
 
-    size_t RootInfoSize() const override { return kBootstrapKeyBytes; }
-
-    Status CreateCollective(uint32_t rank, uint32_t worldSize, uint32_t bufferMb,
-                            uint32_t expansionMode, const std::vector<uint8_t>& rootInfo,
-                            CollectiveHandle* collective) override
-    {
-        (void)rank;
-        (void)worldSize;
-        (void)bufferMb;
-        (void)expansionMode;
-        (void)rootInfo;
-        (void)collective;
-        return Status::Error("payload collectives are disabled on CUDA");
-    }
-
-    void DestroyCollective(CollectiveHandle) override {}
-
-    Status AllGather(void* send, void* receive, size_t bytes, CollectiveHandle collective,
-                     StreamHandle stream) override
-    {
-        (void)send;
-        (void)receive;
-        (void)bytes;
-        (void)collective;
-        (void)stream;
-        return Status::Error("payload collectives are disabled on CUDA");
-    }
-
-    bool SupportsAllGatherV() const override { return false; }
-
-    Status AllGatherV(void*, size_t, void*, const uint64_t*, const uint64_t*, CollectiveHandle,
-                      StreamHandle) override
-    {
-        return Status::Error("AllGatherV is unavailable on CUDA");
-    }
+    size_t BootstrapKeySize() const override { return kBootstrapKeyBytes; }
 
     Status LaunchSegmentedCopy(StreamHandle stream, void* descriptors, void* coreOffsets,
                                uint32_t usedWorkers) override
@@ -365,30 +333,6 @@ public:
         return CudaStatus(cudaGetLastError(), "RemoteScatterKernel");
     }
 
-    Status LaunchFramedScatter(StreamHandle stream, void* receiveBuffer, void* destinationAddresses,
-                               void* chunks, void* taskError, uint32_t rowCount, uint32_t worldSize,
-                               uint32_t windowBlocks, uint32_t chunksPerBlock, uint32_t tensorCount,
-                               uint64_t frameStride, uint64_t metadataBytes, uint64_t shardSize,
-                               uint64_t sequence, uint32_t round, uint32_t usedWorkers) override
-    {
-        (void)stream;
-        (void)receiveBuffer;
-        (void)destinationAddresses;
-        (void)chunks;
-        (void)taskError;
-        (void)rowCount;
-        (void)worldSize;
-        (void)windowBlocks;
-        (void)chunksPerBlock;
-        (void)tensorCount;
-        (void)frameStride;
-        (void)metadataBytes;
-        (void)shardSize;
-        (void)sequence;
-        (void)round;
-        (void)usedWorkers;
-        return Status::Error("framed collective scatter is disabled on CUDA");
-    }
 };
 
 }  // namespace

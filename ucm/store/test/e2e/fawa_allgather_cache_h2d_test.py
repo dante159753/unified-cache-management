@@ -9,7 +9,7 @@ import statistics
 import time
 
 from _allgather_cache_store_benchmark import (
-    _broadcast_root_info,
+    _broadcast_remote_scatter_key,
     _find_free_port,
     _group_max_seconds,
     _make_block_ids,
@@ -43,11 +43,9 @@ def _store_config(
     device_id: int,
     unique_id: str,
     runtime_key: str,
-    root_info: list[int],
+    remote_scatter_key: list[int],
     load_slots: int,
     window_blocks: int,
-    buffer_mb: int,
-    variable_counts: bool,
     scatter_only: bool,
     load_backend_only: bool,
     cache_numa_node: int | None,
@@ -73,13 +71,11 @@ def _store_config(
         "allgather_replicated_data": True,
         "allgather_scatter_only": scatter_only,
         "allgather_runtime_key": runtime_key,
-        "allgather_collective_root_info": root_info,
+        "allgather_remote_scatter_key": remote_scatter_key,
         "allgather_window_blocks_per_rank": window_blocks,
         "allgather_load_slots": load_slots,
         "allgather_dump_slots": 2,
-        "allgather_collective_buffer_mb": buffer_mb,
         "allgather_separate_dump_queue": True,
-        "allgather_collective_variable_counts": variable_counts,
         "allgather_load_backend_only": load_backend_only,
     }
     if cache_numa_node is not None:
@@ -108,7 +104,9 @@ def _worker(
     wa_store = None
     try:
         fa_roots = (
-            [] if args.scatter_only else _broadcast_root_info(torch, dist, rank, device)
+            []
+            if args.scatter_only
+            else _broadcast_remote_scatter_key(torch, dist, rank, device)
         )
         wa_roots = (
             fa_roots
@@ -116,7 +114,7 @@ def _worker(
             else (
                 []
                 if args.scatter_only
-                else _broadcast_root_info(torch, dist, rank, device)
+                else _broadcast_remote_scatter_key(torch, dist, rank, device)
             )
         )
         runtime_base = f"fawa-cache-benchmark-{unique_id}"
@@ -137,8 +135,6 @@ def _worker(
                 fa_roots,
                 4,
                 args.fa_window_blocks,
-                args.buffer_mb,
-                args.variable_counts,
                 args.scatter_only,
                 args.load_backend_only,
                 None if args.cache_numa_nodes is None else args.cache_numa_nodes[rank],
@@ -156,8 +152,6 @@ def _worker(
                 wa_roots,
                 1,
                 args.wa_window_blocks,
-                args.buffer_mb,
-                args.variable_counts,
                 args.scatter_only,
                 args.load_backend_only,
                 None if args.cache_numa_nodes is None else args.cache_numa_nodes[rank],
@@ -200,11 +194,9 @@ def _worker(
             result = {
                 "runtime": "shared" if args.share_runtime else "split",
                 "world_size": len(devices),
-                "buffer_mb": args.buffer_mb,
                 "fa_blocks": args.fa_blocks,
                 "fa_window_blocks": args.fa_window_blocks,
                 "wa_window_blocks": args.wa_window_blocks,
-                "variable_counts": args.variable_counts,
                 "scatter_only": args.scatter_only,
                 "load_backend_only": args.load_backend_only,
                 "mean_ms": mean_seconds * 1000,
@@ -230,12 +222,10 @@ def main() -> None:
     parser.add_argument("--fa-blocks", type=int, default=240)
     parser.add_argument("--fa-window-blocks", type=int, default=4)
     parser.add_argument("--wa-window-blocks", type=int, default=4)
-    parser.add_argument("--buffer-mb", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=30)
     parser.add_argument("--block-id-seed", type=int, default=20260814)
     parser.add_argument("--share-runtime", action="store_true")
-    parser.add_argument("--variable-counts", action="store_true")
     parser.add_argument("--scatter-only", action="store_true")
     parser.add_argument("--load-backend-only", action="store_true")
     args = parser.parse_args()
@@ -248,7 +238,6 @@ def main() -> None:
             args.fa_blocks,
             args.fa_window_blocks,
             args.wa_window_blocks,
-            args.buffer_mb,
             args.iterations,
         )
         <= 0

@@ -11,27 +11,26 @@ namespace py = pybind11;
 
 namespace {
 
-std::vector<uint8_t> CreateRootInfo()
+std::vector<uint8_t> CreateBootstrapKey()
 {
     auto platform = UC::AllGatherStore::CreatePlatformRuntime();
-    auto result = platform->CreateRootInfo();
+    auto result = platform->CreateBootstrapKey();
     if (!result) { throw std::runtime_error(result.Error().ToString()); }
     return std::move(result.Value());
 }
 
 py::dict CalculateMemoryPlan(const std::vector<size_t>& tensorSizes, size_t shardSize,
                              size_t worldSize, bool replicated, size_t loadSlots, size_t dumpSlots,
-                             size_t windowBlocks, size_t receiveSlots, bool remoteScatter)
+                             size_t windowBlocks, bool bufferedRemoteScatter)
 {
     const auto plan = UC::AllGatherStore::CalculateStageMemoryPlan(
         tensorSizes, shardSize, worldSize, replicated, loadSlots, dumpSlots, windowBlocks,
-        receiveSlots, remoteScatter);
+        bufferedRemoteScatter);
     py::dict result;
     result["window_blocks"] = plan.windowBlocks;
     result["shard_size"] = plan.shardSize;
     result["tensor_count"] = plan.tensorCount;
     result["chunk_count"] = plan.chunkCount;
-    result["receive_slots"] = plan.receiveSlots;
     result["load_send_bytes"] = plan.loadSendBytes;
     result["load_receive_bytes"] = plan.loadReceiveBytes;
     result["dump_send_bytes"] = plan.dumpSendBytes;
@@ -44,14 +43,13 @@ py::dict CalculateMemoryPlan(const std::vector<size_t>& tensorSizes, size_t shar
 
 PYBIND11_MODULE(ucm_allgather_runtime, module)
 {
-    module.def("create_root_info", &CreateRootInfo);
-    module.def("root_info_size",
-               [] { return UC::AllGatherStore::CreatePlatformRuntime()->RootInfoSize(); });
+    module.def("create_bootstrap_key", &CreateBootstrapKey);
+    module.def("bootstrap_key_size",
+               [] { return UC::AllGatherStore::CreatePlatformRuntime()->BootstrapKeySize(); });
     module.def("platform_name", [] { return UC::AllGatherStore::CreatePlatformRuntime()->Name(); });
     module.def("calculate_memory_plan", &CalculateMemoryPlan, py::arg("tensor_sizes"),
                py::arg("shard_size"), py::arg("world_size"), py::arg("replicated"),
                py::arg("load_slots") = 2, py::arg("dump_slots") = 2,
                py::arg("window_blocks") = UC::AllGatherStore::kDefaultWindowBlocks,
-               py::arg("receive_slots") = UC::AllGatherStore::kDefaultReceiveSlotCount,
-               py::arg("remote_scatter") = false);
+               py::arg("buffered_remote_scatter") = false);
 }

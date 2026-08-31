@@ -31,7 +31,7 @@ def _worker(
     return SimpleNamespace(model_runner=model_runner, vllm_config=vllm_config)
 
 
-def _install_native_plan(monkeypatch, platform="ascend"):
+def _install_native_plan(monkeypatch):
     calls = []
 
     def calculate_memory_plan(
@@ -42,8 +42,7 @@ def _install_native_plan(monkeypatch, platform="ascend"):
         load_slots,
         dump_slots,
         window_blocks,
-        receive_slots,
-        remote_scatter=False,
+        buffered_remote_scatter=False,
     ):
         calls.append(
             (
@@ -54,8 +53,7 @@ def _install_native_plan(monkeypatch, platform="ascend"):
                 load_slots,
                 dump_slots,
                 window_blocks,
-                receive_slots,
-                remote_scatter,
+                buffered_remote_scatter,
             )
         )
         return {"total_bytes": shard_size}
@@ -67,7 +65,6 @@ def _install_native_plan(monkeypatch, platform="ascend"):
         "ucm_allgather_runtime",
         SimpleNamespace(
             calculate_memory_plan=calculate_memory_plan,
-            platform_name=lambda: platform,
         ),
         raising=False,
     )
@@ -75,10 +72,7 @@ def _install_native_plan(monkeypatch, platform="ascend"):
 
 
 def test_layerwise_reservation_reuses_largest_stage_and_keeps_chunk_blocks(monkeypatch):
-    config = {
-        "use_layerwise": True,
-        "allgather_collective_buffer_mb": 1,
-    }
+    config = {"use_layerwise": True}
     monkeypatch.setattr(reservation, "get_allgather_pipeline_config", lambda _: config)
     calls = _install_native_plan(monkeypatch)
 
@@ -91,7 +85,7 @@ def test_layerwise_reservation_reuses_largest_stage_and_keeps_chunk_blocks(monke
         [8192, 8192, 8192],
     ]
     assert [call[1] for call in calls] == [12288, 24576]
-    assert result == 24576 + 2 * 1024 * 1024
+    assert result == 24576
 
 
 def test_pipeline_config_reads_layerwise_from_launch_config():
@@ -118,10 +112,7 @@ def test_pipeline_config_reads_layerwise_from_launch_config():
 
 
 def test_non_layerwise_reservation_repeats_tensor_layout_per_chunk(monkeypatch):
-    config = {
-        "use_layerwise": False,
-        "allgather_collective_buffer_mb": 1,
-    }
+    config = {"use_layerwise": False}
     monkeypatch.setattr(reservation, "get_allgather_pipeline_config", lambda _: config)
     calls = _install_native_plan(monkeypatch)
 
@@ -129,23 +120,20 @@ def test_non_layerwise_reservation_repeats_tensor_layout_per_chunk(monkeypatch):
         _worker([4096, 8192], blocks_per_chunk=2, replicated=False)
     )
 
-    assert calls == [
-        ([4096, 8192, 4096, 8192], 24576, 8, False, 2, 2, 4, 2, False)
-    ]
+    assert calls == [([4096, 8192, 4096, 8192], 24576, 8, False, 2, 2, 4, False)]
 
 
-def test_scatter_only_reservation_omits_collective_memory(monkeypatch):
+def test_scatter_only_reservation_uses_local_memory_plan(monkeypatch):
     config = {
         "use_layerwise": False,
         "allgather_scatter_only": True,
-        "allgather_collective_buffer_mb": 8,
     }
     monkeypatch.setattr(reservation, "get_allgather_pipeline_config", lambda _: config)
     calls = _install_native_plan(monkeypatch)
 
     result = reservation.calculate_vllm_reservation(_worker([4096]))
 
-    assert calls == [([4096], 4096, 8, False, 2, 2, 4, 2, False)]
+    assert calls == [([4096], 4096, 8, False, 2, 2, 4, False)]
     assert result == 4096
 
 
@@ -178,17 +166,14 @@ def test_fawa_stage_windows_are_reserved(monkeypatch):
     assert [call[6] for call in calls] == [4, 64]
 
 
-def test_cuda_remote_scatter_omits_collective_reservation(monkeypatch):
-    config = {
-        "use_layerwise": True,
-        "allgather_collective_buffer_mb": 8,
-    }
+def test_remote_scatter_reservation_uses_send_slots(monkeypatch):
+    config = {"use_layerwise": True}
     monkeypatch.setattr(reservation, "get_allgather_pipeline_config", lambda _: config)
-    calls = _install_native_plan(monkeypatch, platform="cuda")
+    calls = _install_native_plan(monkeypatch)
 
     result = reservation.calculate_vllm_reservation(_worker([4096]))
 
-    assert calls == [([4096], 4096, 8, True, 2, 2, 4, 1, True)]
+    assert calls == [([4096], 4096, 8, True, 2, 2, 4, False)]
     assert result == 4096
 
 
@@ -208,11 +193,21 @@ def test_fawa_stage_slots_are_reserved(monkeypatch):
     assert [call[4] for call in calls] == [8, 2]
 
 
-def test_fawa_default_load_slots_and_groups_are_reserved(monkeypatch):
+def test_copy_then_scatter_receive_buffer_is_reserved(monkeypatch):
     config = {
         "use_layerwise": True,
-        "allgather_collective_buffer_mb": 1,
+        "allgather_remote_scatter_mode": "copy_then_scatter",
     }
+    monkeypatch.setattr(reservation, "get_allgather_pipeline_config", lambda _: config)
+    calls = _install_native_plan(monkeypatch)
+
+    reservation.calculate_vllm_reservation(_worker([4096]))
+
+    assert calls == [([4096], 4096, 8, True, 2, 2, 4, True)]
+
+
+def test_fawa_default_load_slots_are_reserved(monkeypatch):
+    config = {"use_layerwise": True}
     monkeypatch.setattr(reservation, "get_allgather_pipeline_config", lambda _: config)
     calls = _install_native_plan(monkeypatch)
 
@@ -221,7 +216,7 @@ def test_fawa_default_load_slots_and_groups_are_reserved(monkeypatch):
     )
 
     assert [call[4] for call in calls] == [4, 1]
-    assert result == 151552 + 4096 + 2 * 1024 * 1024
+    assert result == 151552 + 4096
 
 
 def test_explicit_blocks_per_chunk_overrides_connector(monkeypatch):

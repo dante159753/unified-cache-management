@@ -155,13 +155,13 @@ def _synchronize(torch, device_type: str) -> None:
         torch.cuda.synchronize()
 
 
-def _broadcast_root_info(torch, dist, rank: int, device: str) -> list[int]:
+def _broadcast_remote_scatter_key(torch, dist, rank: int, device: str) -> list[int]:
     from ucm.store.allgather import ucm_allgather_runtime
 
-    size = int(ucm_allgather_runtime.root_info_size())
+    size = int(ucm_allgather_runtime.bootstrap_key_size())
     if rank == 0:
-        root_info = ucm_allgather_runtime.create_root_info()
-        tensor = torch.tensor(root_info, dtype=torch.uint8, device=device)
+        key = ucm_allgather_runtime.create_bootstrap_key()
+        tensor = torch.tensor(key, dtype=torch.uint8, device=device)
     else:
         tensor = torch.empty(size, dtype=torch.uint8, device=device)
     dist.broadcast(tensor, src=0)
@@ -188,7 +188,7 @@ def _make_store_config(
     world_size: int,
     device_id: int,
     unique_id: str,
-    root_info: list[int],
+    remote_scatter_key: list[int],
 ) -> dict[str, object]:
     use_allgather = store_mode == "allgather"
     scatter_only = use_allgather and args.scatter_only
@@ -226,21 +226,17 @@ def _make_store_config(
                 "allgather_window_blocks_per_rank": args.window_blocks,
                 "allgather_load_slots": args.load_slots,
                 "allgather_dump_slots": args.dump_slots,
-                "allgather_collective_buffer_mb": args.collective_buffer_mb,
-                "allgather_collective_mode": args.collective_mode,
                 "allgather_profile_sample_every": args.profile_sample_every,
                 "allgather_separate_dump_queue": not args.shared_dump_queue,
-                "allgather_collective_count_crop": not args.disable_count_crop,
                 "allgather_scatter_aiv_cores": args.scatter_aiv_cores,
                 "allgather_load_backend_only": args.load_backend_only,
-                "allgather_load_skip_collective": args.skip_collective,
+                "allgather_load_skip_remote_scatter": args.skip_remote_scatter,
                 "allgather_load_skip_scatter": args.skip_scatter,
+                "allgather_remote_scatter_mode": args.remote_scatter_mode,
             }
         )
-        if args.variable_counts is not None:
-            config["allgather_collective_variable_counts"] = args.variable_counts
         if replicated_data and not scatter_only and world_size > 1:
-            config["allgather_collective_root_info"] = root_info
+            config["allgather_remote_scatter_key"] = remote_scatter_key
     if direction == "h2d" and not args.verify_roundtrip:
         config["fake_always_hit"] = True
         config["fake_fail_load"] = args.fail_rank == rank
@@ -323,6 +319,7 @@ def _run_iterations(
             for row_tensors in tensors:
                 for tensor in row_tensors:
                     tensor.zero_()
+            _synchronize(torch, device_type)
         prime = store.load(block_ids, shard_indexes, tensors)
         store.wait(prime)
         _synchronize(torch, device_type)
@@ -330,9 +327,20 @@ def _run_iterations(
             for row, row_tensors in enumerate(tensors):
                 for tensor_index, tensor in enumerate(row_tensors):
                     expected = (row * len(row_tensors) + tensor_index + 1) % 251
-                    if not bool(torch.all(tensor == expected).item()):
+                    mismatch = tensor != expected
+                    if bool(torch.any(mismatch).item()):
+                        first = int(torch.nonzero(mismatch.flatten())[0].item())
+                        actual = int(tensor.flatten()[first].item())
+                        mismatch_count = int(torch.count_nonzero(mismatch).item())
+                        owner = (
+                            int.from_bytes(block_ids[row][:8], byteorder="little")
+                            % world_size
+                        )
                         raise RuntimeError(
-                            f"roundtrip mismatch at row {row}, tensor {tensor_index}"
+                            f"roundtrip mismatch at rank {rank}, row {row}, "
+                            f"owner {owner}, tensor {tensor_index}, offset {first}, "
+                            f"expected {expected}, actual {actual}, "
+                            f"mismatches {mismatch_count}/{tensor.numel()}"
                         )
             if rank == 0:
                 print("ALLGATHER_CACHE_ROUNDTRIP_PASS", flush=True)
@@ -479,8 +487,8 @@ def _worker(
     )
     store = None
     try:
-        root_info = (
-            _broadcast_root_info(torch, dist, rank, device)
+        remote_scatter_key = (
+            _broadcast_remote_scatter_key(torch, dist, rank, device)
             if store_mode == "allgather"
             and not args.local_coalesced
             and not args.scatter_only
@@ -498,7 +506,7 @@ def _worker(
             len(devices),
             devices[rank],
             unique_id,
-            root_info,
+            remote_scatter_key,
         )
         store = UcmPipelineStore(config)
         timings = _run_iterations(
@@ -565,12 +573,6 @@ def _build_parser(direction: str, store_mode: str) -> argparse.ArgumentParser:
     parser.add_argument("--load-slots", type=int, default=2)
     parser.add_argument("--dump-slots", type=int, default=2)
     parser.add_argument("--window-blocks", type=int, default=4)
-    parser.add_argument("--collective-buffer-mb", type=int, default=8)
-    parser.add_argument(
-        "--collective-mode",
-        choices=("auto", "host", "aicpu_ts", "aiv"),
-        default="host",
-    )
     parser.add_argument("--timeout-ms", type=int, default=120000)
     parser.add_argument("--master-port", type=int, default=0)
     parser.add_argument("--block-id-seed", type=int, default=20260812)
@@ -583,18 +585,19 @@ def _build_parser(direction: str, store_mode: str) -> argparse.ArgumentParser:
     parser.add_argument("--local-coalesced", action="store_true")
     parser.add_argument("--scatter-only", action="store_true")
     parser.add_argument("--load-backend-only", action="store_true")
-    parser.add_argument("--skip-collective", action="store_true")
+    parser.add_argument("--skip-remote-scatter", action="store_true")
     parser.add_argument("--skip-scatter", action="store_true")
-    parser.add_argument("--disable-count-crop", action="store_true")
-    variable_counts = parser.add_mutually_exclusive_group()
-    variable_counts.add_argument(
-        "--variable-counts", dest="variable_counts", action="store_true"
-    )
-    variable_counts.add_argument(
-        "--disable-variable-counts", dest="variable_counts", action="store_false"
-    )
-    parser.set_defaults(variable_counts=None)
     parser.add_argument("--scatter-aiv-cores", type=int, default=1)
+    parser.add_argument(
+        "--remote-scatter-mode",
+        choices=(
+            "kernel",
+            "batched_remote_scatter",
+            "batch_copy",
+            "copy_then_scatter",
+        ),
+        default="batch_copy",
+    )
     parser.add_argument(
         "--fake-load-delay-us",
         type=lambda value: [int(delay) for delay in value.split(",")],
@@ -623,7 +626,6 @@ def run(direction: str, store_mode: str = "allgather") -> None:
         "load_slots",
         "dump_slots",
         "window_blocks",
-        "collective_buffer_mb",
         "scatter_aiv_cores",
         "timeout_ms",
     ):
@@ -648,11 +650,11 @@ def run(direction: str, store_mode: str = "allgather") -> None:
         parser.error("--scatter-only requires the AllGatherStore benchmark")
     if args.scatter_only and args.local_coalesced:
         parser.error("--scatter-only and --local-coalesced are mutually exclusive")
-    if (args.skip_collective or args.skip_scatter) and store_mode != "allgather":
-        parser.error("--skip-collective and --skip-scatter require AllGatherStore")
-    if args.verify_roundtrip and (args.skip_collective or args.skip_scatter):
+    if (args.skip_remote_scatter or args.skip_scatter) and store_mode != "allgather":
+        parser.error("--skip-remote-scatter and --skip-scatter require AllGatherStore")
+    if args.verify_roundtrip and (args.skip_remote_scatter or args.skip_scatter):
         parser.error(
-            "--verify-roundtrip cannot be combined with --skip-collective or "
+            "--verify-roundtrip cannot be combined with --skip-remote-scatter or "
             "--skip-scatter"
         )
     if direction != "h2d" and args.inflight_tasks != 1:

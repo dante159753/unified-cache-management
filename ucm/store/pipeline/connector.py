@@ -38,8 +38,8 @@ import torch
 from ucm.store.ucmstore_v1 import Task, UcmKVStoreBaseV1
 
 _preloaded_libraries: Dict[Path, ctypes.CDLL] = {}
-_allgather_root_infos: Dict[str, List[int]] = {}
-_allgather_root_infos_lock = threading.Lock()
+_remote_scatter_keys: Dict[str, List[int]] = {}
+_remote_scatter_keys_lock = threading.Lock()
 
 
 def _preload_library(path: Path) -> None:
@@ -242,10 +242,10 @@ def _cache_posix_pipeline_builder(
     pipeline.Stack("Cache", str(store_dir / "cache/libcachestore.so"), config)
 
 
-def _allgather_root_info(config: Dict[str, object]) -> List[int]:
+def _remote_scatter_key(config: Dict[str, object]) -> List[int]:
     runtime_key = str(config["allgather_runtime_key"])
-    with _allgather_root_infos_lock:
-        cached = _allgather_root_infos.get(runtime_key)
+    with _remote_scatter_keys_lock:
+        cached = _remote_scatter_keys.get(runtime_key)
         if cached is not None:
             return cached
 
@@ -259,14 +259,12 @@ def _allgather_root_info(config: Dict[str, object]) -> List[int]:
         group_rank = dist.get_rank(group)
         group_ranks = dist.get_process_group_ranks(group)
         root = group_ranks[0]
-        size = int(ucm_allgather_runtime.root_info_size())
+        size = int(ucm_allgather_runtime.bootstrap_key_size())
         platform = str(ucm_allgather_runtime.platform_name())
         device_type = "npu" if platform == "ascend" else platform
-        # Ascend uses this as the collective root; CUDA uses it as the
-        # cross-rank IPC bootstrap key.
         if group_rank == 0:
             tensor = torch.tensor(
-                ucm_allgather_runtime.create_root_info(),
+                ucm_allgather_runtime.create_bootstrap_key(),
                 dtype=torch.uint8,
                 device=f"{device_type}:{int(config['device_id'])}",
             )
@@ -278,7 +276,7 @@ def _allgather_root_info(config: Dict[str, object]) -> List[int]:
             )
         dist.broadcast(tensor, src=root, group=group)
         cached = tensor.cpu().tolist()
-        _allgather_root_infos[runtime_key] = cached
+        _remote_scatter_keys[runtime_key] = cached
         return cached
 
 
@@ -301,10 +299,9 @@ def _allgather_stage_configs(
             bool(config.get("allgather_replicated_data", False))
             and not scatter_only
             and int(config.get("allgather_world_size", 1)) > 1
-            and "allgather_collective_root_info" not in allgather_config
-            and "allgather_hccl_root_info" not in allgather_config
+            and "allgather_remote_scatter_key" not in allgather_config
         ):
-            allgather_config["allgather_collective_root_info"] = _allgather_root_info(
+            allgather_config["allgather_remote_scatter_key"] = _remote_scatter_key(
                 allgather_config
             )
     return cache_config, allgather_config
