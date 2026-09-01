@@ -2392,15 +2392,66 @@ def test_fawa_records_only_successful_load_task_bytes():
     failed_requests = []
     connector._handle_load_err = failed_requests.append
     tasks = [
-        FAWALoadTask("req-1", "FA", None, "fa", 2),
-        FAWALoadTask("req-1", "WA", None, "wa", 1),
-        FAWALoadTask("req-2", "WA", None, "failed", 1),
+        FAWALoadTask(("req-1",), "FA", None, "fa", 2),
+        FAWALoadTask(("req-1",), "WA", None, "wa", 1),
+        FAWALoadTask(("req-2", "req-3"), "WA", None, "failed", 1),
     ]
 
     connector._wait_all_load_task(tasks)
 
     assert fake_ucmmetrics.updated == [{"load_bytes_total": 240}]
-    assert failed_requests == ["req-2"]
+    assert failed_requests == ["req-2", "req-3"]
+
+
+def test_fawa_submits_one_fa_and_one_wa_load_per_batch():
+    _reset_fakes()
+    from ucm.integration.vllm.hma_connector import (
+        FAWALoadTask,
+        UCMFAWAConnector,
+        UCMFAWAConnectorMetadata,
+    )
+
+    connector = object.__new__(UCMFAWAConnector)
+    connector.fa_store = "fa-store"
+    connector.wa_store = "wa-store"
+    connector._get_connector_metadata = lambda: UCMFAWAConnectorMetadata(
+        request_meta={
+            "req-1": SimpleNamespace(
+                load_keys=[b"a", b"b"],
+                load_hash_start=0,
+                load_hash_end=2,
+                load_vllm_block_ids=([1, 2],),
+            ),
+            "req-2": SimpleNamespace(
+                load_keys=[b"c"],
+                load_hash_start=0,
+                load_hash_end=1,
+                load_vllm_block_ids=([3],),
+            ),
+        }
+    )
+    connector._extract_fa_ptr = lambda keys, *_: [[len(keys), 0] for _ in keys]
+    connector._extract_wa_ptr = lambda keys, *_: [[len(keys)] for _ in keys]
+    submissions = []
+
+    def submit(block_ids_by_request, label, store, keys, ptrs):
+        submissions.append((block_ids_by_request, label, store, keys, ptrs.copy()))
+        return FAWALoadTask(tuple(block_ids_by_request), label, store, label, len(keys))
+
+    connector._submit_load_task = submit
+    waited = []
+    connector._wait_all_load_task = waited.extend
+
+    connector.start_load_kv(None)
+
+    assert len(submissions) == 2
+    assert submissions[0][0] == {"req-1": [b"a", b"b"], "req-2": [b"c"]}
+    assert submissions[0][1:4] == ("FA", "fa-store", [b"a", b"b", b"c"])
+    assert submissions[0][4] == [[2, 0], [2, 0], [1, 0]]
+    assert submissions[1][0] == {"req-1": [b"b"], "req-2": [b"c"]}
+    assert submissions[1][1:4] == ("WA", "wa-store", [b"b", b"c"])
+    assert submissions[1][4] == [[1], [1]]
+    assert [task.label for task in waited] == ["FA", "WA"]
 
 
 def test_fawa_records_submitted_save_bytes():

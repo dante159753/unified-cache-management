@@ -294,7 +294,7 @@ class UCMFAWAConnectorMetadata(KVConnectorMetadata):
 class FAWALoadTask:
     """Outstanding FAWA load task plus scheduler-visible failure anchors."""
 
-    request_id: str
+    request_ids: tuple[str, ...]
     label: str
     store: UcmKVStoreBaseV1
     task: Task
@@ -1184,7 +1184,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
 
     def _submit_load_task(
         self,
-        request_id: str,
+        block_ids_by_request: dict[str, list[bytes]],
         label: str,
         store: UcmKVStoreBaseV1,
         keys: list[bytes],
@@ -1195,13 +1195,13 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         shard_indices = [0] * len(keys)
         task = self._rank_consistency.submit_load(
             store,
-            {request_id: keys},
+            block_ids_by_request,
             keys,
             shard_indices,
             ptrs,
         )
         return FAWALoadTask(
-            request_id=request_id,
+            request_ids=tuple(block_ids_by_request),
             label=label,
             store=store,
             task=task,
@@ -1235,16 +1235,17 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             # the group is now out of step, so failing one request would leave
             # the peers waiting on collectives this worker will never issue.
             logger.exception(
-                f"request {load_task.request_id} hit an unrecoverable "
+                f"requests {load_task.request_ids} hit an unrecoverable "
                 f"{load_task.label} store failure; the engine cannot continue."
             )
             raise
         except Exception as e:
             logger.error(
-                f"request {load_task.request_id} wait FAWA load "
+                f"requests {load_task.request_ids} wait FAWA load "
                 f"task label={load_task.label} error. {type(e).__name__}: {e}"
             )
-            self._handle_load_err(load_task.request_id)
+            for request_id in load_task.request_ids:
+                self._handle_load_err(request_id)
             return False
         return True
 
@@ -1362,23 +1363,17 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         if not isinstance(metadata, UCMFAWAConnectorMetadata):
             raise RuntimeError(f"Unexpected FAWA metadata type: {type(metadata)}")
 
-        tasks: list[FAWALoadTask] = []
+        fa_keys: list[bytes] = []
+        wa_keys: list[bytes] = []
+        fa_keys_by_request: dict[str, list[bytes]] = {}
+        wa_keys_by_request: dict[str, list[bytes]] = {}
+        fa_ptr_rows: list[np.ndarray] = []
+        wa_ptr_rows: list[np.ndarray] = []
         for request_id, request in metadata.request_meta.items():
             if not request.load_keys:
                 continue
 
-            submitted: list[FAWALoadTask] = []
             try:
-                if self.fa_store is None:
-                    raise RuntimeError("FA store is not initialized.")
-                if self.wa_store is None:
-                    raise RuntimeError("WA store is not initialized.")
-
-                # Build every argument before submitting anything. A submit that
-                # succeeds for FA and then fails for WA cannot be taken back, and
-                # under a collective each store's task count has to match on all
-                # ranks, so a partial submit desynchronizes the whole TP group.
-                # FA groups are loaded for every external-hit canonical block.
                 fa_ptrs = self._extract_fa_ptr(
                     request.load_keys,
                     request.load_hash_start,
@@ -1399,41 +1394,52 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 self._handle_load_err(request_id)
                 continue
 
-            try:
-                submitted.append(
-                    self._submit_load_task(
-                        request_id,
-                        "FA",
-                        self.fa_store,
-                        request.load_keys,
-                        fa_ptrs,
-                    )
-                )
-                submitted.append(
-                    self._submit_load_task(
-                        request_id,
-                        "WA",
-                        self.wa_store,
-                        window_keys,
-                        window_ptrs,
-                    )
-                )
-            except Exception as e:
-                if self._collective_load_active:
-                    raise RuntimeError(
-                        f"request {request_id} submitted {len(submitted)} of 2 FAWA "
-                        f"load tasks; the TP group's collective sequence can no "
-                        f"longer match across ranks."
-                    ) from e
-                logger.error(
-                    f"request {request_id} submit FAWA load task "
-                    f"error. {type(e).__name__}: {e}"
-                )
-                self._handle_load_err(request_id)
-                tasks.extend(submitted)
-                continue
+            fa_keys.extend(request.load_keys)
+            wa_keys.extend(window_keys)
+            fa_keys_by_request[request_id] = request.load_keys
+            wa_keys_by_request[request_id] = window_keys
+            fa_ptr_rows.append(fa_ptrs)
+            wa_ptr_rows.append(window_ptrs)
 
-            tasks.extend(submitted)
+        if not fa_keys:
+            self._wait_all_load_task([])
+            return
+        if self.fa_store is None:
+            raise RuntimeError("FA store is not initialized.")
+        if self.wa_store is None:
+            raise RuntimeError("WA store is not initialized.")
+
+        tasks: list[FAWALoadTask] = []
+        try:
+            tasks.append(
+                self._submit_load_task(
+                    fa_keys_by_request,
+                    "FA",
+                    self.fa_store,
+                    fa_keys,
+                    np.concatenate(fa_ptr_rows, axis=0),
+                )
+            )
+            tasks.append(
+                self._submit_load_task(
+                    wa_keys_by_request,
+                    "WA",
+                    self.wa_store,
+                    wa_keys,
+                    np.concatenate(wa_ptr_rows, axis=0),
+                )
+            )
+        except Exception as e:
+            if self._collective_load_active:
+                raise RuntimeError(
+                    f"submitted {len(tasks)} of 2 batched FAWA load tasks; the TP "
+                    f"group's collective sequence can no longer match across ranks."
+                ) from e
+            logger.error(
+                f"submit batched FAWA load task error. {type(e).__name__}: {e}"
+            )
+            for request_id in fa_keys_by_request:
+                self._handle_load_err(request_id)
 
         self._wait_all_load_task(tasks)
 
