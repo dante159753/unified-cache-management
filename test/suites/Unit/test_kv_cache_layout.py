@@ -300,11 +300,17 @@ def _create_minimax_layout(
         layout_globals["current_platform"] = original_platform
 
 
-def _create_direct_layout(kvcaches, *, num_blocks: int = 3):
+def _create_direct_layout(
+    kvcaches,
+    *,
+    num_blocks: int = 3,
+    platform: str = "cuda",
+):
     return _create_minimax_layout(
         kvcaches,
         use_layerwise=False,
         num_blocks=num_blocks,
+        platform=platform,
     )
 
 
@@ -377,32 +383,12 @@ class KVCacheLayoutTest(unittest.TestCase):
                 FakeTensor(0x300000, 32768, dimensions=3),
             ),
         }
-        layout = _create_direct_layout(kvcaches, num_blocks=2)
+        layout = _create_direct_layout(kvcaches, num_blocks=2, platform="npu")
 
         self.assertEqual(layout.tensor_size_list, [32768, 32768, 32768])
         self.assertEqual(layout.buffer_sizes.tolist(), [65536, 65536, 65536])
 
-    def test_direct_layout_supports_legacy_kv_major_5d_cache(self):
-        ptr = 0x100000
-        layout = _create_direct_layout(
-            {
-                "model.layers.0.self_attn.attn": FakeCombinedTensor(
-                    ptr,
-                    4096,
-                )
-            }
-        )
-
-        self.assertEqual(layout.tensor_size_list, [4096, 4096])
-        self.assertEqual(layout.block_stride_lists.tolist(), [4096, 4096])
-        self.assertEqual(layout.base_ptrs.tolist(), [ptr, ptr + 3 * 4096])
-        self.assertEqual(layout.buffer_sizes.tolist(), [2 * 3 * 4096, 0])
-        self.assertEqual(
-            layout.extract_block_addrs([2])[0].tolist(),
-            [ptr + 2 * 4096, ptr + 5 * 4096],
-        )
-
-    def test_direct_layout_supports_old_block_major_5d_cache(self):
+    def test_direct_layout_supports_vllm_024_block_first_5d_cache(self):
         ptr = 0x200000
         layout = _create_direct_layout(
             {
@@ -422,23 +408,16 @@ class KVCacheLayoutTest(unittest.TestCase):
         self.assertEqual(layout.buffer_sizes.tolist(), [4 * 8192])
         self.assertEqual(layout.extract_block_addrs([2])[0, 0], ptr + 2 * 8192)
 
-    def test_direct_layout_splits_block_major_view_over_kv_major_storage(self):
-        ptr = 0x300000
-        layout = _create_direct_layout(
-            {
-                "model.layers.0.self_attn.attn": FakeCombinedTensor(
-                    ptr,
-                    4096,
-                    block_major=True,
-                    kv_stride=3 * 4096,
-                )
-            }
-        )
-
-        self.assertEqual(layout.tensor_size_list, [4096, 4096])
-        self.assertEqual(layout.block_stride_lists.tolist(), [4096, 4096])
-        self.assertEqual(layout.base_ptrs.tolist(), [ptr, ptr + 3 * 4096])
-        self.assertEqual(layout.buffer_sizes.tolist(), [2 * 3 * 4096, 0])
+    def test_direct_layout_rejects_pre_m3_cuda_kv_major_cache(self):
+        with self.assertRaisesRegex(ValueError, r"must use \[num_blocks, 2, \.\.\.\]"):
+            _create_direct_layout(
+                {
+                    "model.layers.0.self_attn.attn": FakeCombinedTensor(
+                        0x300000,
+                        4096,
+                    )
+                }
+            )
 
     def test_direct_layout_supports_new_packed_hnd_and_nhd_cache(self):
         num_blocks = 3
@@ -479,21 +458,6 @@ class KVCacheLayoutTest(unittest.TestCase):
                     layout.extract_block_addrs([2])[0, 0], ptr + 2 * page_size
                 )
 
-    def test_direct_layout_preserves_copy_size_and_padded_block_stride(self):
-        ptr = 0x500000
-        tensor = FakeTensor(
-            ptr,
-            block_stride=1,
-            shape=(3, 1, 1, 1024),
-            strides=(2048, 1024, 1024, 1),
-        )
-        layout = _create_direct_layout({"model.layers.0.self_attn.attn": tensor})
-
-        self.assertEqual(layout.tensor_size_list, [1024])
-        self.assertEqual(layout.block_stride_lists.tolist(), [2048])
-        self.assertEqual(layout.buffer_sizes.tolist(), [5120])
-        self.assertEqual(layout.extract_block_addrs([2])[0, 0], ptr + 4096)
-
     def test_direct_layout_allows_more_physical_blocks_than_configured(self):
         ptr = 0x580000
         tensor = FakeTensor(ptr, 1024, num_blocks=5)
@@ -524,34 +488,17 @@ class KVCacheLayoutTest(unittest.TestCase):
                 num_blocks=3,
             )
 
-    def test_five_dimensional_layout_rejects_ambiguous_two_block_shape(self):
-        with self.assertRaisesRegex(
-            ValueError, r"Ambiguous MiniMax M3 5D KV cache layout"
-        ):
-            _create_direct_layout(
-                {
-                    "model.layers.0.self_attn.attn": FakeCombinedTensor(
-                        0x600000,
-                        4096,
-                        num_blocks=2,
-                    )
-                },
-                num_blocks=2,
-            )
-
-    def test_minimax_layerwise_layout_preserves_strides_and_indexer_padding(self):
+    def test_minimax_layerwise_layout_pads_missing_indexer(self):
         kvcaches = {
             "model.layers.0.self_attn.attn": FakeTensor(
                 0x700000,
-                block_stride=1,
-                shape=(3, 1, 1, 1024),
-                strides=(2048, 1024, 1024, 1),
+                block_stride=1024,
+                num_blocks=3,
             ),
             "model.layers.1.self_attn.attn": FakeTensor(
                 0x800000,
-                block_stride=1,
-                shape=(3, 1, 1, 1024),
-                strides=(3072, 1024, 1024, 1),
+                block_stride=1024,
+                num_blocks=3,
             ),
             "model.layers.1.self_attn.attn.index_cache": FakeTensor(
                 0x900000,
@@ -563,8 +510,8 @@ class KVCacheLayoutTest(unittest.TestCase):
         layout = _create_minimax_layout(kvcaches)
 
         self.assertEqual(layout.tensor_size_lists.tolist(), [[1024, 512], [1024, 512]])
-        self.assertEqual(layout.block_stride_lists.tolist(), [[2048, 0], [3072, 512]])
-        self.assertEqual(layout.buffer_sizes.tolist(), [[5120, 0], [7168, 1536]])
+        self.assertEqual(layout.block_stride_lists.tolist(), [[1024, 0], [1024, 512]])
+        self.assertEqual(layout.buffer_sizes.tolist(), [[3072, 0], [3072, 1536]])
 
     def test_generic_layerwise_layout_accepts_regular_matrix(self):
         layout = _build_layout(
@@ -651,74 +598,18 @@ class KVCacheLayoutTest(unittest.TestCase):
         self.assertTrue(np.all(layout.block_stride_lists[3:, 2] == 32768))
         self.assertTrue(np.all(layout.buffer_sizes[3:, 2] == 65536))
 
-    def test_minimax_m3_ascend_legacy_merged_indexer_layout(self):
-        num_physical_blocks = 4
-        configured_num_blocks = 3
-        slot_size = 32768
-        next_ptr = 0x100000
-        kvcaches = {}
-        layer_ptrs = {}
-        for layer_id in range(6):
-            key_size = slot_size if layer_id < 3 else 2 * slot_size
-            key_ptr = next_ptr
-            value_ptr = next_ptr + 0x100000
-            layer_ptrs[layer_id] = (key_ptr, value_ptr)
-            kvcaches[f"model.layers.{layer_id}.self_attn.attn"] = (
-                FakeTensor(
-                    key_ptr,
-                    key_size,
-                    num_blocks=num_physical_blocks,
-                ),
-                FakeTensor(
-                    value_ptr,
-                    slot_size,
-                    num_blocks=num_physical_blocks,
-                ),
+    def test_minimax_m3_ascend_layout_requires_separate_k_and_v(self):
+        with self.assertRaisesRegex(ValueError, r"separate K and V tensors"):
+            _create_minimax_layout(
+                {
+                    "model.layers.0.self_attn.attn": FakeTensor(
+                        0x100000,
+                        32768,
+                    )
+                },
+                num_blocks=2,
+                platform="npu",
             )
-            next_ptr += 0x200000
-
-        layout = _create_minimax_layout(
-            kvcaches,
-            num_blocks=configured_num_blocks,
-            platform="npu",
-        )
-
-        self.assertEqual(layout.tensor_size_list, [slot_size, slot_size, slot_size])
-        self.assertEqual(layout.base_ptrs.shape, (6, 3))
-        self.assertEqual(
-            layout.base_ptrs[0].tolist(),
-            [layer_ptrs[0][0], layer_ptrs[0][1], 0],
-        )
-        self.assertEqual(
-            layout.base_ptrs[3].tolist(),
-            [
-                layer_ptrs[3][0],
-                layer_ptrs[3][1],
-                layer_ptrs[3][0] + slot_size,
-            ],
-        )
-        self.assertEqual(
-            layout.block_stride_lists[0].tolist(),
-            [slot_size, slot_size, 0],
-        )
-        self.assertEqual(
-            layout.block_stride_lists[3].tolist(),
-            [2 * slot_size, slot_size, 2 * slot_size],
-        )
-        self.assertEqual(
-            layout.buffer_sizes[3].tolist(),
-            [num_physical_blocks * 2 * slot_size, num_physical_blocks * slot_size, 0],
-        )
-
-        block_one_addrs = layout.extract_block_addrs([1], layer_first=True)
-        self.assertEqual(
-            block_one_addrs[3, 0].tolist(),
-            [
-                layer_ptrs[3][0] + 2 * slot_size,
-                layer_ptrs[3][1] + slot_size,
-                layer_ptrs[3][0] + 3 * slot_size,
-            ],
-        )
 
     def test_shared_indexer_layout_supports_cuda(self):
         supports_globals = SharedIndexerKVCacheLayout.supports.__func__.__globals__
@@ -989,25 +880,6 @@ class KVCacheLayoutTest(unittest.TestCase):
         self.assertTrue(np.all(layout.block_stride_lists[:3, 1] == 0))
         self.assertEqual(layout.base_ptrs[3, 1], indexer_ptrs[3])
         self.assertTrue(np.all(layout.block_stride_lists[3:, 1] == 32768))
-
-    def test_cuda_tuple_kv_cache_uses_two_segments(self):
-        kvcaches = {
-            "model.layers.0.self_attn.attn": (
-                FakeTensor(0x100000, 4096, num_blocks=3),
-                FakeTensor(0x200000, 4096, num_blocks=3),
-            ),
-            "model.layers.0.self_attn.attn.index_cache": FakeTensor(
-                0x300000,
-                1024,
-                num_blocks=3,
-                dimensions=3,
-            ),
-        }
-
-        layout = _create_minimax_layout(kvcaches)
-
-        self.assertEqual(layout.tensor_size_list, [4096, 4096, 1024])
-        self.assertEqual(layout.block_stride_lists[0].tolist(), [4096, 4096, 1024])
 
     def test_cuda_shared_indexer_rejects_attention_size_mismatch(self):
         entries = [
