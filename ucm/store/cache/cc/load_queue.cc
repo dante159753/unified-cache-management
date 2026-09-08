@@ -112,12 +112,15 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
     const auto nShard = task->desc.size();
     size_t backendSubmitCount = 0;
     size_t waitShardCount = 0;
+    auto backendWaitStats = std::make_shared<BackendWaitStats>();
     const auto indexes = RearrangeIndex(nShard, deviceId_, localRankSize_);
     for (size_t i = 0; i < nShard; i++) {
         auto& shard = task->desc[indexes[i]];
         ShardTask shardTask;
         shardTask.bufferHandle = buffer_->Get(shard.owner, shard.index, true, true);
         shardTask.backendTaskHandle = 0;
+        shardTask.backendWaitStats = backendWaitStats;
+        shardTask.owned = shardTask.bufferHandle.Owner();
         shardTask.fromPosix = !shardTask.bufferHandle.Ready();
         if (shardTask.fromPosix) { waitShardCount++; }
         if (shardTask.bufferHandle.Owner() && !shardTask.bufferHandle.Ready()) {
@@ -194,6 +197,7 @@ void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& task)
         RecordFailedShards(1);
         if (task.waiter) {
             holder_.clear();
+            RecordBackendWaitMetrics(*task.backendWaitStats);
             task.waiter->Done();
         }
         return;
@@ -204,13 +208,15 @@ void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& task)
     do {
         auto tpBackendWait = NowTime::Now();
         s = WaitBackendTaskReady(task);
+        auto tpBackendReady = NowTime::Now();
+        auto backendWaitMs = (tpBackendReady - tpBackendWait) * 1e3;
+        task.backendWaitStats->totalMs += backendWaitMs;
+        if (task.owned) { task.backendWaitStats->ownedMs += backendWaitMs; }
         if (s.Failure()) [[unlikely]] {
             RecordShardResults(holder_, &task, false);
             break;
         }
-        auto tpBackendReady = NowTime::Now();
-        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_shard_backend_wait_ms"),
-                                 (tpBackendReady - tpBackendWait) * 1e3);
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_shard_backend_wait_ms"), backendWaitMs);
 
         auto* host = cacheSdmaDirect_ ? task.bufferHandle.DeviceData() : task.bufferHandle.Data();
         s = HostToDeviceAsync(stream, host, task.shard.addrs.data());
@@ -243,7 +249,10 @@ void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& task)
         parentTask->Fail(s);
         failureSet_->Insert(taskHandle);
     }
-    if (waiter) { waiter->Done(); }
+    if (waiter) {
+        RecordBackendWaitMetrics(*task.backendWaitStats);
+        waiter->Done();
+    }
 }
 
 Status LoadQueue::WaitBackendTaskReady(ShardTask& task)
@@ -316,6 +325,14 @@ void LoadQueue::RecordLoadSourceShards(size_t total, size_t wait) const
                              static_cast<double>(total));
     UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_wait_shards_total"),
                              static_cast<double>(wait));
+}
+
+void LoadQueue::RecordBackendWaitMetrics(const BackendWaitStats& stats) const
+{
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_backend_wait_duration_ms"),
+                             stats.totalMs);
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_owned_backend_wait_duration_ms"),
+                             stats.ownedMs);
 }
 
 void LoadQueue::RecordH2dSyncMetrics(double h2dSyncMs) const

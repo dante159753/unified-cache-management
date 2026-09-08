@@ -515,6 +515,16 @@ _HISTOGRAM_METRICS = [
         [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
     ),
     (
+        "cache_load_backend_wait_duration_ms",
+        "Total backend wait duration across all shards in one Cache load task (ms).",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+    ),
+    (
+        "cache_load_owned_backend_wait_duration_ms",
+        "Total backend wait duration across owner shards in one Cache load task (ms).",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+    ),
+    (
         "cache_shard_backend_wait_ms",
         (
             "Cache load per-shard time spent in WaitBackendTaskReady before H2D submit "

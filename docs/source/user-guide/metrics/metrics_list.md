@@ -90,6 +90,8 @@ No Cache Store-specific Gauges are exported by default.
 | `ucm:cache_load_queue_wait_duration_ms`     | Time a Cache Load task waits before a dispatch worker picks it up                        |
 | `ucm:cache_dump_queue_wait_duration_ms`     | Time a Cache Dump task waits before a dispatch worker picks it up                        |
 | `ucm:cache_load_backend_submit_duration_ms` | Time to allocate a Cache buffer and synchronously submit the backend Load                |
+| `ucm:cache_load_backend_wait_duration_ms`   | Total backend wait time accumulated by all shards in one Cache Load task                 |
+| `ucm:cache_load_owned_backend_wait_duration_ms` | Total backend wait time accumulated by owner shards in one Cache Load task           |
 | `ucm:cache_shard_backend_wait_ms`           | Time one shard waits for the backend to become ready before H2D submission               |
 | `ucm:cache_h2d_submit_ms`                   | CPU overhead of one asynchronous shard H2D submission, excluding transfer time           |
 | `ucm:cache_h2d_sync_ms`                     | Remaining H2D stream drain time after the final shard submission                         |

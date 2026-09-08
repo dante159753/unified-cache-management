@@ -1054,6 +1054,124 @@ vllm:num_requests_running{worker_id="1"} 5
         for name, dashboard in module.DASHBOARDS.items():
             self.assertEqual(load_config(name), module.build_config(name, dashboard))
 
+    def test_vllm_yuanrong_hit_rate_falls_back_to_total_without_resource_data(self):
+        config = load_config("vllm")
+        names = {
+            "KV Cache Hit Rate Breakdown: YuanRong DRAM",
+            "KV Cache Hit Rate Breakdown: YuanRong SSD",
+            "KV Cache Hit Rate Breakdown: YuanRong Total",
+        }
+        selector = (
+            '{model_name="$model_name", job=~"$job", instance="$instance", '
+            'engine=~"$engine"}'
+        )
+        metrics = []
+        for metric in config["metrics"]:
+            if metric["name"] not in names:
+                continue
+            metric = dict(metric)
+            metric["expr"] = metric["expr"].replace(selector, "")
+            metrics.append(metric)
+
+        initial = """
+vllm:prefix_cache_hits_total 0
+vllm:prefix_cache_queries_total 10
+vllm:external_prefix_cache_hits_total 0
+vllm:external_prefix_cache_queries_total 10
+ucm:yuanrong_load_success_shards_total 0
+ucm:yuanrong_lookup_miss_posix_load_success_shards_total 0
+ucm:yuanrong_load_fallback_posix_load_success_shards_total 0
+"""
+        final = """
+vllm:prefix_cache_hits_total 0
+vllm:prefix_cache_queries_total 110
+vllm:external_prefix_cache_hits_total 50
+vllm:external_prefix_cache_queries_total 110
+ucm:yuanrong_load_success_shards_total 10
+ucm:yuanrong_lookup_miss_posix_load_success_shards_total 20
+ucm:yuanrong_load_fallback_posix_load_success_shards_total 0
+"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with MetricsStore(Path(tmp) / "metrics.db") as store:
+                store.write_samples(parse_prometheus_text(initial), 0)
+                store.write_samples(parse_prometheus_text(final), 60_000)
+                rows = QueryEngine(store).query_config(
+                    {"metrics": metrics}, 60, start_ms=0
+                )
+
+        values = {
+            row.metric: next(iter(row.values.values())) for row in rows if row.values
+        }
+        self.assertNotIn("KV Cache Hit Rate Breakdown: YuanRong DRAM", values)
+        self.assertNotIn("KV Cache Hit Rate Breakdown: YuanRong SSD", values)
+        self.assertAlmostEqual(
+            values["KV Cache Hit Rate Breakdown: YuanRong Total"], 1 / 6
+        )
+
+    def test_vllm_yuanrong_hit_rate_uses_resource_tiers_when_available(self):
+        config = load_config("vllm")
+        names = {
+            "KV Cache Hit Rate Breakdown: YuanRong DRAM",
+            "KV Cache Hit Rate Breakdown: YuanRong SSD",
+            "KV Cache Hit Rate Breakdown: YuanRong Total",
+        }
+        selector = (
+            '{model_name="$model_name", job=~"$job", instance="$instance", '
+            'engine=~"$engine"}'
+        )
+        metrics = []
+        for metric in config["metrics"]:
+            if metric["name"] not in names:
+                continue
+            metric = dict(metric)
+            metric["expr"] = metric["expr"].replace(selector, "")
+            metrics.append(metric)
+
+        initial = """
+vllm:prefix_cache_hits_total 0
+vllm:prefix_cache_queries_total 10
+vllm:external_prefix_cache_hits_total 0
+vllm:external_prefix_cache_queries_total 10
+ucm:yuanrong_load_success_shards_total 0
+ucm:yuanrong_lookup_miss_posix_load_success_shards_total 0
+ucm:yuanrong_load_fallback_posix_load_success_shards_total 0
+ucm:yuanrong_local_dram_load_hits_total 0
+ucm:yuanrong_remote_load_hits_total 0
+ucm:yuanrong_local_ssd_load_hits_total 0
+"""
+        final = """
+vllm:prefix_cache_hits_total 0
+vllm:prefix_cache_queries_total 110
+vllm:external_prefix_cache_hits_total 50
+vllm:external_prefix_cache_queries_total 110
+ucm:yuanrong_load_success_shards_total 10
+ucm:yuanrong_lookup_miss_posix_load_success_shards_total 20
+ucm:yuanrong_load_fallback_posix_load_success_shards_total 0
+ucm:yuanrong_local_dram_load_hits_total 5
+ucm:yuanrong_remote_load_hits_total 3
+ucm:yuanrong_local_ssd_load_hits_total 2
+"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with MetricsStore(Path(tmp) / "metrics.db") as store:
+                store.write_samples(parse_prometheus_text(initial), 0)
+                store.write_samples(parse_prometheus_text(final), 60_000)
+                rows = QueryEngine(store).query_config(
+                    {"metrics": metrics}, 60, start_ms=0
+                )
+
+        values = {
+            row.metric: next(iter(row.values.values())) for row in rows if row.values
+        }
+        self.assertAlmostEqual(
+            values["KV Cache Hit Rate Breakdown: YuanRong DRAM"], 2 / 15
+        )
+        self.assertAlmostEqual(
+            values["KV Cache Hit Rate Breakdown: YuanRong SSD"], 1 / 30
+        )
+        self.assertNotIn("KV Cache Hit Rate Breakdown: YuanRong Total", values)
+
     def test_dashboard_presets_render_dynamic_grafana_line_names(self):
         samples = parse_prometheus_text(
             """

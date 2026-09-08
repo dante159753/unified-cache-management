@@ -42,12 +42,18 @@ class LoadQueue {
     using WaiterPtr = std::shared_ptr<Latch>;
     using TaskPair = std::pair<TaskPtr, WaiterPtr>;
     using TaskIdSet = HashSet<Detail::TaskHandle>;
+    struct BackendWaitStats {
+        double totalMs{0};
+        double ownedMs{0};
+    };
     struct ShardTask {
         TaskPtr task;
         Detail::Shard shard;
         TransBuffer::Handle bufferHandle;
         Detail::TaskHandle backendTaskHandle;
+        std::shared_ptr<BackendWaitStats> backendWaitStats;
         WaiterPtr waiter;
+        bool owned{false};
         bool fromPosix{false};
     };
 
@@ -87,6 +93,7 @@ private:
                             bool success) const;
     void RecordLoadSourceShards(size_t total, size_t wait) const;
     void RecordFailedShards(size_t count) const;
+    void RecordBackendWaitMetrics(const BackendWaitStats& stats) const;
     void RecordH2dSyncMetrics(double h2dSyncMs) const;
 };
 

@@ -229,9 +229,9 @@
       },
       "id": 37,
       "panels": [],
-      "title": "Cache Store",
+      "title": "Cache Store (Task Level)",
       "type": "row",
-      "description": "Cache Store 性能指标，默认展开。"
+      "description": "Cache Store task 级性能指标，默认展开。"
     },
     {
       "datasource": {
@@ -844,7 +844,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "- `queue wait`：指标 `ucm:cache_load_queue_wait_duration_ms`；Load 任务从提交到调度线程取出的等待时间。代码位置：`ucm/store/cache/cc/load_queue.cc` / `LoadQueue::DispatchOneTask` / 开始处理任务时。\n- `backend submit`：指标 `ucm:cache_load_backend_submit_duration_ms`；分配 Cache buffer 并向下层 Store 提交 Load 的耗时。代码位置：`ucm/store/cache/cc/load_queue.cc` / `LoadQueue::DispatchOneTask` / shard 分发完成后。\n- `backend wait`：指标 `ucm:cache_shard_backend_wait_ms`；单个 Load shard 等待 Cache buffer 或下层 Load 任务就绪的时间。代码位置：`ucm/store/cache/cc/load_queue.cc` / `LoadQueue::TransferOneTask` / `WaitBackendTaskReady` 返回后。\n- `H2D sync`：指标 `ucm:cache_h2d_sync_ms`；最后一组 shard 的 H2D stream 同步耗时。代码位置：`ucm/store/cache/cc/load_queue.cc` / `LoadQueue::RecordH2dSyncMetrics` / stream 同步完成后。\n- `h2d submit & other`：计算方法 `Load 总耗时 - queue wait - backend submit - backend wait - H2D sync`；总耗时扣除其他分段平均耗时后的估算值。总耗时代码位置：`ucm/store/cache/cc/trans_manager.h` / `TransManager::Dispatch` / waiter 完成回调。",
+      "description": "- `queue wait`：指标 `ucm:cache_load_queue_wait_duration_ms`；Load 任务从提交到调度线程取出的等待时间。代码位置：`ucm/store/cache/cc/load_queue.cc` / `LoadQueue::DispatchOneTask` / 开始处理任务时。\n- `backend submit`：指标 `ucm:cache_load_backend_submit_duration_ms`；分配 Cache buffer 并向下层 Store 提交 Load 的耗时。代码位置：`ucm/store/cache/cc/load_queue.cc` / `LoadQueue::DispatchOneTask` / shard 分发完成后。\n- `backend wait`：指标 `ucm:cache_load_backend_wait_duration_ms`；一个 Cache Load task 内所有 shard 的 backend wait 累计耗时。代码位置：`ucm/store/cache/cc/load_queue.cc` / `LoadQueue::RecordBackendWaitMetrics` / task 最后一个 shard 完成时。\n- `H2D sync`：指标 `ucm:cache_h2d_sync_ms`；最后一组 shard 的 H2D stream 同步耗时。代码位置：`ucm/store/cache/cc/load_queue.cc` / `LoadQueue::RecordH2dSyncMetrics` / stream 同步完成后。\n- `h2d submit & other`：计算方法 `Load 总耗时 - queue wait - backend submit - task backend wait - H2D sync`；总耗时扣除其他 task 粒度分段平均耗时后的估算值。总耗时代码位置：`ucm/store/cache/cc/trans_manager.h` / `TransManager::Dispatch` / waiter 完成回调。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -949,7 +949,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "(\n  sum by (${perWorker:raw}) (rate(ucm:cache_shard_backend_wait_ms_sum{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[40s]))\n  /\n  sum by (${perWorker:raw}) (rate(ucm:cache_shard_backend_wait_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[40s]))\n)\nor\n(\n  0 * sum by (${perWorker:raw}) (rate(ucm:cache_load_duration_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[40s]))\n)",
+          "expr": "(\n  sum by (${perWorker:raw}) (rate(ucm:cache_load_backend_wait_duration_ms_sum{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[40s]))\n  /\n  sum by (${perWorker:raw}) (rate(ucm:cache_load_backend_wait_duration_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[40s]))\n)\nor\n(\n  0 * sum by (${perWorker:raw}) (rate(ucm:cache_load_duration_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[40s]))\n)",
           "legendFormat": "backend wait {{engine}} {{worker_rank}}",
           "range": true,
           "refId": "E"
@@ -960,7 +960,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "clamp_min(\n  (\n    sum by (${perWorker:raw}) (rate(ucm:cache_load_duration_ms_sum{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[40s]))\n    /\n    sum by (${perWorker:raw}) (rate(ucm:cache_load_duration_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[40s]))\n  )\n  -\n  (\n    sum by (${perWorker:raw}) (rate(ucm:cache_load_queue_wait_duration_ms_sum{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[40s]))\n    /\n    sum by (${perWorker:raw}) (rate(ucm:cache_load_queue_wait_duration_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[40s]))\n  )\n  -\n  (\n    sum by (${perWorker:raw}) (rate(ucm:cache_load_backend_submit_duration_ms_sum{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[40s]))\n    /\n    sum by (${perWorker:raw}) (rate(ucm:cache_load_backend_submit_duration_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[40s]))\n  )\n  -\n  (\n    (\n      sum by (${perWorker:raw}) (rate(ucm:cache_shard_backend_wait_ms_sum{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[40s]))\n      /\n      sum by (${perWorker:raw}) (rate(ucm:cache_shard_backend_wait_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[40s]))\n    )\n    or\n    (\n      0 * sum by (${perWorker:raw}) (rate(ucm:cache_load_duration_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[40s]))\n    )\n  )\n  -\n  (\n    (\n      sum by (${perWorker:raw}) (rate(ucm:cache_h2d_sync_ms_sum{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[40s]))\n      /\n      sum by (${perWorker:raw}) (rate(ucm:cache_h2d_sync_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[40s]))\n    )\n    or\n    (\n      0 * sum by (${perWorker:raw}) (rate(ucm:cache_load_duration_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[40s]))\n    )\n  ),\n  0\n)",
+          "expr": "clamp_min(\n  (\n    sum by (${perWorker:raw}) (rate(ucm:cache_load_duration_ms_sum{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[40s]))\n    /\n    sum by (${perWorker:raw}) (rate(ucm:cache_load_duration_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[40s]))\n  )\n  -\n  (\n    sum by (${perWorker:raw}) (rate(ucm:cache_load_queue_wait_duration_ms_sum{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[40s]))\n    /\n    sum by (${perWorker:raw}) (rate(ucm:cache_load_queue_wait_duration_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[40s]))\n  )\n  -\n  (\n    sum by (${perWorker:raw}) (rate(ucm:cache_load_backend_submit_duration_ms_sum{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[40s]))\n    /\n    sum by (${perWorker:raw}) (rate(ucm:cache_load_backend_submit_duration_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[40s]))\n  )\n  -\n  (\n    (\n      sum by (${perWorker:raw}) (rate(ucm:cache_load_backend_wait_duration_ms_sum{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[40s]))\n      /\n      sum by (${perWorker:raw}) (rate(ucm:cache_load_backend_wait_duration_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[40s]))\n    )\n    or\n    (\n      0 * sum by (${perWorker:raw}) (rate(ucm:cache_load_duration_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[40s]))\n    )\n  )\n  -\n  (\n    (\n      sum by (${perWorker:raw}) (rate(ucm:cache_h2d_sync_ms_sum{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[40s]))\n      /\n      sum by (${perWorker:raw}) (rate(ucm:cache_h2d_sync_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[40s]))\n    )\n    or\n    (\n      0 * sum by (${perWorker:raw}) (rate(ucm:cache_load_duration_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[40s]))\n    )\n  ),\n  0\n)",
           "legendFormat": "h2d submit & other {{engine}} {{worker_rank}}",
           "range": true,
           "refId": "C"
@@ -2140,7 +2140,7 @@
           "refId": "D"
         }
       ],
-      "title": "Cache Load H2D Duration",
+      "title": "Cache Load H2D Sync Duration",
       "type": "timeseries"
     },
     {
@@ -2769,213 +2769,6 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "指标：`ucm:cache_h2d_submit_ms` 表示单个 shard 在下层数据就绪后提交 H2D 异步拷贝的 CPU 耗时，不包含实际传输和 stream 同步时间。代码位置：`ucm/store/cache/cc/load_queue.cc` / `LoadQueue::TransferOneTask` / `HostToDeviceAsync` 返回后。",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": 60000,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "ms"
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "^p50.*"
-            },
-            "properties": [
-              {
-                "id": "custom.lineStyle",
-                "value": {
-                  "fill": "solid"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "^p90.*"
-            },
-            "properties": [
-              {
-                "id": "custom.lineStyle",
-                "value": {
-                  "fill": "dash",
-                  "dash": [
-                    10,
-                    6
-                  ]
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "^p99.*"
-            },
-            "properties": [
-              {
-                "id": "custom.lineStyle",
-                "value": {
-                  "fill": "dash",
-                  "dash": [
-                    4,
-                    4
-                  ]
-                }
-              },
-              {
-                "id": "custom.lineWidth",
-                "value": 2
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "^avg.*"
-            },
-            "properties": [
-              {
-                "id": "custom.lineStyle",
-                "value": {
-                  "fill": "solid"
-                }
-              },
-              {
-                "id": "custom.lineWidth",
-                "value": 1
-              },
-              {
-                "id": "custom.fillOpacity",
-                "value": 5
-              }
-            ]
-          }
-        ]
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 73
-      },
-      "id": 6,
-      "options": {
-        "legend": {
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ],
-          "displayMode": "table",
-          "maxHeight": "50%",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, ${perWorker:raw}) (rate(ucm:cache_h2d_submit_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
-          "legendFormat": "p50 {{engine}} {{worker_rank}}",
-          "range": true,
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.9, sum by (le, ${perWorker:raw}) (rate(ucm:cache_h2d_submit_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
-          "legendFormat": "p90 {{engine}} {{worker_rank}}",
-          "range": true,
-          "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, ${perWorker:raw}) (rate(ucm:cache_h2d_submit_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
-          "legendFormat": "p99 {{engine}} {{worker_rank}}",
-          "range": true,
-          "refId": "C"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "sum by (${perWorker:raw}) (rate(ucm:cache_h2d_submit_ms_sum{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))\n/\nsum by (${perWorker:raw}) (rate(ucm:cache_h2d_submit_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))",
-          "legendFormat": "avg {{engine}} {{worker_rank}}",
-          "range": true,
-          "refId": "D"
-        }
-      ],
-      "title": "Cache Load H2D Submit Cost",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
       "description": "指标：`ucm:cache_dump_backend_submit_duration_ms` 表示向下层 Store 同步提交 Dump 的耗时，不包含下层写入完成时间。代码位置：`ucm/store/cache/cc/dump_queue.cc` / `DumpQueue::DumpOneTask` / `backend_->Dump` 返回后。",
       "fieldConfig": {
         "defaults": {
@@ -3597,7 +3390,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "指标：`ucm:cache_shard_backend_wait_ms` 表示单个 Cache Load shard 等待 buffer 或下层 Load 任务就绪的时间，本面板展示 p50、p90、p99 和平均值。代码位置：`ucm/store/cache/cc/load_queue.cc` / `LoadQueue::TransferOneTask` / `WaitBackendTaskReady` 返回后。",
+      "description": "指标：`ucm:cache_load_backend_wait_duration_ms` 表示一个 Cache Load task 内所有 shard 的 backend wait 累计耗时，本面板展示 p50、p90、p99 和平均值。代码位置：`ucm/store/cache/cc/load_queue.cc` / `LoadQueue::RecordBackendWaitMetrics` / task 最后一个 shard 完成时。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3757,7 +3550,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, ${perWorker:raw}) (rate(ucm:cache_shard_backend_wait_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le, ${perWorker:raw}) (rate(ucm:cache_load_backend_wait_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
           "legendFormat": "p50 {{engine}} {{worker_rank}}",
           "range": true,
           "refId": "A"
@@ -3768,7 +3561,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.9, sum by (le, ${perWorker:raw}) (rate(ucm:cache_shard_backend_wait_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.9, sum by (le, ${perWorker:raw}) (rate(ucm:cache_load_backend_wait_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
           "legendFormat": "p90 {{engine}} {{worker_rank}}",
           "range": true,
           "refId": "B"
@@ -3779,7 +3572,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, ${perWorker:raw}) (rate(ucm:cache_shard_backend_wait_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le, ${perWorker:raw}) (rate(ucm:cache_load_backend_wait_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
           "legendFormat": "p99 {{engine}} {{worker_rank}}",
           "range": true,
           "refId": "C"
@@ -3790,7 +3583,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum by (${perWorker:raw}) (rate(ucm:cache_shard_backend_wait_ms_sum{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))\n/\nsum by (${perWorker:raw}) (rate(ucm:cache_shard_backend_wait_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))",
+          "expr": "sum by (${perWorker:raw}) (rate(ucm:cache_load_backend_wait_duration_ms_sum{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))\n/\nsum by (${perWorker:raw}) (rate(ucm:cache_load_backend_wait_duration_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))",
           "legendFormat": "avg {{engine}} {{worker_rank}}",
           "range": true,
           "refId": "D"
@@ -4421,363 +4214,983 @@
       "type": "timeseries"
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "指标：`ucm:cache_load_owned_backend_wait_duration_ms` 表示一个 Cache Load task 内当前 Store 是 owner 的 shard 的 backend wait 累计耗时，本面板展示 p50、p90、p99 和平均值。代码位置：`ucm/store/cache/cc/load_queue.cc` / `LoadQueue::RecordBackendWaitMetrics` / task 最后一个 shard 完成时。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": 60000,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^p50.*"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "solid"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^p90.*"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    6
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^p99.*"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    4,
+                    4
+                  ]
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^avg.*"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "solid"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 5
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 73
+      },
+      "id": 71,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "maxHeight": "50%",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le, ${perWorker:raw}) (rate(ucm:cache_load_owned_backend_wait_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{engine}} {{worker_rank}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.9, sum by (le, ${perWorker:raw}) (rate(ucm:cache_load_owned_backend_wait_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+          "legendFormat": "p90 {{engine}} {{worker_rank}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le, ${perWorker:raw}) (rate(ucm:cache_load_owned_backend_wait_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+          "legendFormat": "p99 {{engine}} {{worker_rank}}",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (${perWorker:raw}) (rate(ucm:cache_load_owned_backend_wait_duration_ms_sum{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))\n/\nsum by (${perWorker:raw}) (rate(ucm:cache_load_owned_backend_wait_duration_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))",
+          "legendFormat": "avg {{engine}} {{worker_rank}}",
+          "range": true,
+          "refId": "D"
+        }
+      ],
+      "title": "Cache Load Owned Backend Wait Duration",
+      "type": "timeseries"
+    },
+    {
+      "type": "heatmap",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "id": 15,
+      "title": "Cache / Load Duration",
+      "description": "指标：`ucm:cache_load_duration_ms` 表示 Cache Load 任务端到端耗时；热力图使用 bucket 增速显示各耗时区间的任务速率。代码位置：`ucm/store/cache/cc/trans_manager.h` / `TransManager::Dispatch` / Load waiter 完成回调。",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 97
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (le) (rate(ucm:cache_load_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))",
+          "format": "heatmap",
+          "legendFormat": "{{le}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "calculate": false,
+        "yAxis": {
+          "axisPlacement": "left",
+          "unit": "ms",
+          "decimals": 0,
+          "reverse": false
+        },
+        "rowsFrame": {
+          "layout": "auto",
+          "value": "Request rate"
+        },
+        "color": {
+          "mode": "scheme",
+          "scheme": "Spectral",
+          "fill": "dark-orange",
+          "exponent": 0.5,
+          "steps": 64,
+          "reverse": false
+        },
+        "cellGap": 1,
+        "cellValues": {
+          "unit": "suffix: req/s"
+        },
+        "filterValues": {
+          "le": 1e-09
+        },
+        "tooltip": {
+          "show": true,
+          "yHistogram": true,
+          "mode": "single"
+        },
+        "legend": {
+          "show": true
+        },
+        "exemplars": {
+          "color": "rgba(255,0,255,0.7)"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          }
+        },
+        "overrides": []
+      },
+      "pluginVersion": "10.4.0"
+    },
+    {
+      "type": "heatmap",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "id": 16,
+      "title": "Cache / Load Bandwidth (per task)",
+      "description": "指标：`ucm:cache_load_bandwidth_gbps` 表示单个 Cache Load 任务的任务级带宽；热力图使用 bucket 增速显示各带宽区间的任务速率。代码位置：`ucm/store/cache/cc/trans_manager.h` / `TransManager::Dispatch` / Load waiter 完成回调。",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 97
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (le) (rate(ucm:cache_load_bandwidth_gbps_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))",
+          "format": "heatmap",
+          "legendFormat": "{{le}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "calculate": false,
+        "yAxis": {
+          "axisPlacement": "left",
+          "unit": "Bps",
+          "decimals": 0,
+          "reverse": false
+        },
+        "rowsFrame": {
+          "layout": "auto",
+          "value": "Request rate"
+        },
+        "color": {
+          "mode": "scheme",
+          "scheme": "Spectral",
+          "fill": "dark-orange",
+          "exponent": 0.5,
+          "steps": 64,
+          "reverse": false
+        },
+        "cellGap": 1,
+        "cellValues": {
+          "unit": "suffix: req/s"
+        },
+        "filterValues": {
+          "le": 1e-09
+        },
+        "tooltip": {
+          "show": true,
+          "yHistogram": true,
+          "mode": "single"
+        },
+        "legend": {
+          "show": true
+        },
+        "exemplars": {
+          "color": "rgba(255,0,255,0.7)"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          }
+        },
+        "overrides": []
+      },
+      "pluginVersion": "10.4.0"
+    },
+    {
+      "type": "heatmap",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "id": 17,
+      "title": "Cache / Dump Duration",
+      "description": "指标：`ucm:cache_dump_duration_ms` 表示 Cache Dump 任务端到端耗时；热力图使用 bucket 增速显示各耗时区间的任务速率。代码位置：`ucm/store/cache/cc/trans_manager.h` / `TransManager::Dispatch` / Dump waiter 完成回调。",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 105
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (le) (rate(ucm:cache_dump_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))",
+          "format": "heatmap",
+          "legendFormat": "{{le}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "calculate": false,
+        "yAxis": {
+          "axisPlacement": "left",
+          "unit": "ms",
+          "decimals": 0,
+          "reverse": false
+        },
+        "rowsFrame": {
+          "layout": "auto",
+          "value": "Request rate"
+        },
+        "color": {
+          "mode": "scheme",
+          "scheme": "Spectral",
+          "fill": "dark-orange",
+          "exponent": 0.5,
+          "steps": 64,
+          "reverse": false
+        },
+        "cellGap": 1,
+        "cellValues": {
+          "unit": "suffix: req/s"
+        },
+        "filterValues": {
+          "le": 1e-09
+        },
+        "tooltip": {
+          "show": true,
+          "yHistogram": true,
+          "mode": "single"
+        },
+        "legend": {
+          "show": true
+        },
+        "exemplars": {
+          "color": "rgba(255,0,255,0.7)"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          }
+        },
+        "overrides": []
+      },
+      "pluginVersion": "10.4.0"
+    },
+    {
+      "type": "heatmap",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "id": 18,
+      "title": "Cache / Dump Bandwidth (per task)",
+      "description": "指标：`ucm:cache_dump_bandwidth_gbps` 表示单个 Cache Dump 任务的任务级带宽；热力图使用 bucket 增速显示各带宽区间的任务速率。代码位置：`ucm/store/cache/cc/trans_manager.h` / `TransManager::Dispatch` / Dump waiter 完成回调。",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 105
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (le) (rate(ucm:cache_dump_bandwidth_gbps_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))",
+          "format": "heatmap",
+          "legendFormat": "{{le}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "calculate": false,
+        "yAxis": {
+          "axisPlacement": "left",
+          "unit": "Bps",
+          "decimals": 0,
+          "reverse": false
+        },
+        "rowsFrame": {
+          "layout": "auto",
+          "value": "Request rate"
+        },
+        "color": {
+          "mode": "scheme",
+          "scheme": "Spectral",
+          "fill": "dark-orange",
+          "exponent": 0.5,
+          "steps": 64,
+          "reverse": false
+        },
+        "cellGap": 1,
+        "cellValues": {
+          "unit": "suffix: req/s"
+        },
+        "filterValues": {
+          "le": 1e-09
+        },
+        "tooltip": {
+          "show": true,
+          "yHistogram": true,
+          "mode": "single"
+        },
+        "legend": {
+          "show": true
+        },
+        "exemplars": {
+          "color": "rgba(255,0,255,0.7)"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          }
+        },
+        "overrides": []
+      },
+      "pluginVersion": "10.4.0"
+    },
+    {
       "type": "row",
-      "collapsed": true,
+      "collapsed": false,
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
       "id": 14,
-      "title": "Cache Store -- Distributions",
+      "title": "Cache Store (Shard Level)",
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 97
+        "y": 113
       },
-      "panels": [
+      "panels": [],
+      "description": "Cache Store shard 级性能指标，默认展开。"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "指标：`ucm:cache_shard_backend_wait_ms` 表示单个 Cache Load shard 等待 buffer 或下层 Load 任务就绪的时间，本面板展示 p50、p90、p99 和平均值。代码位置：`ucm/store/cache/cc/load_queue.cc` / `LoadQueue::TransferOneTask` / `WaitBackendTaskReady` 返回后。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": 60000,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^p50.*"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "solid"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^p90.*"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    6
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^p99.*"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    4,
+                    4
+                  ]
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^avg.*"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "solid"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 5
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 114
+      },
+      "id": 72,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "maxHeight": "50%",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
         {
-          "type": "heatmap",
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "id": 15,
-          "title": "Cache / Load Duration",
-          "description": "指标：`ucm:cache_load_duration_ms` 表示 Cache Load 任务端到端耗时；热力图使用 bucket 增速显示各耗时区间的任务速率。代码位置：`ucm/store/cache/cc/trans_manager.h` / `TransManager::Dispatch` / Load waiter 完成回调。",
-          "gridPos": {
-            "h": 8,
-            "w": 12,
-            "x": 0,
-            "y": 98
-          },
-          "targets": [
-            {
-              "datasource": {
-                "type": "prometheus",
-                "uid": "${DS_PROMETHEUS}"
-              },
-              "editorMode": "code",
-              "expr": "sum by (le) (rate(ucm:cache_load_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))",
-              "format": "heatmap",
-              "legendFormat": "{{le}}",
-              "range": true,
-              "refId": "A"
-            }
-          ],
-          "options": {
-            "calculate": false,
-            "yAxis": {
-              "axisPlacement": "left",
-              "unit": "ms",
-              "decimals": 0,
-              "reverse": false
-            },
-            "rowsFrame": {
-              "layout": "auto",
-              "value": "Request rate"
-            },
-            "color": {
-              "mode": "scheme",
-              "scheme": "Spectral",
-              "fill": "dark-orange",
-              "exponent": 0.5,
-              "steps": 64,
-              "reverse": false
-            },
-            "cellGap": 1,
-            "cellValues": {
-              "unit": "suffix: req/s"
-            },
-            "filterValues": {
-              "le": 1e-09
-            },
-            "tooltip": {
-              "show": true,
-              "yHistogram": true,
-              "mode": "single"
-            },
-            "legend": {
-              "show": true
-            },
-            "exemplars": {
-              "color": "rgba(255,0,255,0.7)"
-            }
-          },
-          "fieldConfig": {
-            "defaults": {
-              "custom": {
-                "scaleDistribution": {
-                  "type": "linear"
-                },
-                "hideFrom": {
-                  "legend": false,
-                  "tooltip": false,
-                  "viz": false
-                }
-              }
-            },
-            "overrides": []
-          },
-          "pluginVersion": "10.4.0"
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le, ${perWorker:raw}) (rate(ucm:cache_shard_backend_wait_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{engine}} {{worker_rank}}",
+          "range": true,
+          "refId": "A"
         },
         {
-          "type": "heatmap",
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "id": 16,
-          "title": "Cache / Load Bandwidth (per task)",
-          "description": "指标：`ucm:cache_load_bandwidth_gbps` 表示单个 Cache Load 任务的任务级带宽；热力图使用 bucket 增速显示各带宽区间的任务速率。代码位置：`ucm/store/cache/cc/trans_manager.h` / `TransManager::Dispatch` / Load waiter 完成回调。",
-          "gridPos": {
-            "h": 8,
-            "w": 12,
-            "x": 12,
-            "y": 98
-          },
-          "targets": [
-            {
-              "datasource": {
-                "type": "prometheus",
-                "uid": "${DS_PROMETHEUS}"
-              },
-              "editorMode": "code",
-              "expr": "sum by (le) (rate(ucm:cache_load_bandwidth_gbps_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))",
-              "format": "heatmap",
-              "legendFormat": "{{le}}",
-              "range": true,
-              "refId": "A"
-            }
-          ],
-          "options": {
-            "calculate": false,
-            "yAxis": {
-              "axisPlacement": "left",
-              "unit": "Bps",
-              "decimals": 0,
-              "reverse": false
-            },
-            "rowsFrame": {
-              "layout": "auto",
-              "value": "Request rate"
-            },
-            "color": {
-              "mode": "scheme",
-              "scheme": "Spectral",
-              "fill": "dark-orange",
-              "exponent": 0.5,
-              "steps": 64,
-              "reverse": false
-            },
-            "cellGap": 1,
-            "cellValues": {
-              "unit": "suffix: req/s"
-            },
-            "filterValues": {
-              "le": 1e-09
-            },
-            "tooltip": {
-              "show": true,
-              "yHistogram": true,
-              "mode": "single"
-            },
-            "legend": {
-              "show": true
-            },
-            "exemplars": {
-              "color": "rgba(255,0,255,0.7)"
-            }
-          },
-          "fieldConfig": {
-            "defaults": {
-              "custom": {
-                "scaleDistribution": {
-                  "type": "linear"
-                },
-                "hideFrom": {
-                  "legend": false,
-                  "tooltip": false,
-                  "viz": false
-                }
-              }
-            },
-            "overrides": []
-          },
-          "pluginVersion": "10.4.0"
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.9, sum by (le, ${perWorker:raw}) (rate(ucm:cache_shard_backend_wait_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+          "legendFormat": "p90 {{engine}} {{worker_rank}}",
+          "range": true,
+          "refId": "B"
         },
         {
-          "type": "heatmap",
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "id": 17,
-          "title": "Cache / Dump Duration",
-          "description": "指标：`ucm:cache_dump_duration_ms` 表示 Cache Dump 任务端到端耗时；热力图使用 bucket 增速显示各耗时区间的任务速率。代码位置：`ucm/store/cache/cc/trans_manager.h` / `TransManager::Dispatch` / Dump waiter 完成回调。",
-          "gridPos": {
-            "h": 8,
-            "w": 12,
-            "x": 0,
-            "y": 106
-          },
-          "targets": [
-            {
-              "datasource": {
-                "type": "prometheus",
-                "uid": "${DS_PROMETHEUS}"
-              },
-              "editorMode": "code",
-              "expr": "sum by (le) (rate(ucm:cache_dump_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))",
-              "format": "heatmap",
-              "legendFormat": "{{le}}",
-              "range": true,
-              "refId": "A"
-            }
-          ],
-          "options": {
-            "calculate": false,
-            "yAxis": {
-              "axisPlacement": "left",
-              "unit": "ms",
-              "decimals": 0,
-              "reverse": false
-            },
-            "rowsFrame": {
-              "layout": "auto",
-              "value": "Request rate"
-            },
-            "color": {
-              "mode": "scheme",
-              "scheme": "Spectral",
-              "fill": "dark-orange",
-              "exponent": 0.5,
-              "steps": 64,
-              "reverse": false
-            },
-            "cellGap": 1,
-            "cellValues": {
-              "unit": "suffix: req/s"
-            },
-            "filterValues": {
-              "le": 1e-09
-            },
-            "tooltip": {
-              "show": true,
-              "yHistogram": true,
-              "mode": "single"
-            },
-            "legend": {
-              "show": true
-            },
-            "exemplars": {
-              "color": "rgba(255,0,255,0.7)"
-            }
-          },
-          "fieldConfig": {
-            "defaults": {
-              "custom": {
-                "scaleDistribution": {
-                  "type": "linear"
-                },
-                "hideFrom": {
-                  "legend": false,
-                  "tooltip": false,
-                  "viz": false
-                }
-              }
-            },
-            "overrides": []
-          },
-          "pluginVersion": "10.4.0"
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le, ${perWorker:raw}) (rate(ucm:cache_shard_backend_wait_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+          "legendFormat": "p99 {{engine}} {{worker_rank}}",
+          "range": true,
+          "refId": "C"
         },
         {
-          "type": "heatmap",
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "id": 18,
-          "title": "Cache / Dump Bandwidth (per task)",
-          "description": "指标：`ucm:cache_dump_bandwidth_gbps` 表示单个 Cache Dump 任务的任务级带宽；热力图使用 bucket 增速显示各带宽区间的任务速率。代码位置：`ucm/store/cache/cc/trans_manager.h` / `TransManager::Dispatch` / Dump waiter 完成回调。",
-          "gridPos": {
-            "h": 8,
-            "w": 12,
-            "x": 12,
-            "y": 106
-          },
-          "targets": [
-            {
-              "datasource": {
-                "type": "prometheus",
-                "uid": "${DS_PROMETHEUS}"
-              },
-              "editorMode": "code",
-              "expr": "sum by (le) (rate(ucm:cache_dump_bandwidth_gbps_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))",
-              "format": "heatmap",
-              "legendFormat": "{{le}}",
-              "range": true,
-              "refId": "A"
-            }
-          ],
-          "options": {
-            "calculate": false,
-            "yAxis": {
-              "axisPlacement": "left",
-              "unit": "Bps",
-              "decimals": 0,
-              "reverse": false
-            },
-            "rowsFrame": {
-              "layout": "auto",
-              "value": "Request rate"
-            },
-            "color": {
-              "mode": "scheme",
-              "scheme": "Spectral",
-              "fill": "dark-orange",
-              "exponent": 0.5,
-              "steps": 64,
-              "reverse": false
-            },
-            "cellGap": 1,
-            "cellValues": {
-              "unit": "suffix: req/s"
-            },
-            "filterValues": {
-              "le": 1e-09
-            },
-            "tooltip": {
-              "show": true,
-              "yHistogram": true,
-              "mode": "single"
-            },
-            "legend": {
-              "show": true
-            },
-            "exemplars": {
-              "color": "rgba(255,0,255,0.7)"
-            }
-          },
-          "fieldConfig": {
-            "defaults": {
-              "custom": {
-                "scaleDistribution": {
-                  "type": "linear"
-                },
-                "hideFrom": {
-                  "legend": false,
-                  "tooltip": false,
-                  "viz": false
-                }
-              }
-            },
-            "overrides": []
-          },
-          "pluginVersion": "10.4.0"
+          "editorMode": "code",
+          "expr": "sum by (${perWorker:raw}) (rate(ucm:cache_shard_backend_wait_ms_sum{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))\n/\nsum by (${perWorker:raw}) (rate(ucm:cache_shard_backend_wait_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))",
+          "legendFormat": "avg {{engine}} {{worker_rank}}",
+          "range": true,
+          "refId": "D"
         }
       ],
-      "description": "Cache Store 耗时和任务带宽的分布热力图，默认折叠。"
+      "title": "Cache Shard Backend Wait Duration",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "指标：`ucm:cache_h2d_submit_ms` 表示单个 shard 在下层数据就绪后提交 H2D 异步拷贝的 CPU 耗时，不包含实际传输和 stream 同步时间。代码位置：`ucm/store/cache/cc/load_queue.cc` / `LoadQueue::TransferOneTask` / `HostToDeviceAsync` 返回后。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": 60000,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^p50.*"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "solid"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^p90.*"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    6
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^p99.*"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    4,
+                    4
+                  ]
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^avg.*"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "solid"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 5
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 114
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "maxHeight": "50%",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le, ${perWorker:raw}) (rate(ucm:cache_h2d_submit_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{engine}} {{worker_rank}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.9, sum by (le, ${perWorker:raw}) (rate(ucm:cache_h2d_submit_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+          "legendFormat": "p90 {{engine}} {{worker_rank}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le, ${perWorker:raw}) (rate(ucm:cache_h2d_submit_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+          "legendFormat": "p99 {{engine}} {{worker_rank}}",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (${perWorker:raw}) (rate(ucm:cache_h2d_submit_ms_sum{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))\n/\nsum by (${perWorker:raw}) (rate(ucm:cache_h2d_submit_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))",
+          "legendFormat": "avg {{engine}} {{worker_rank}}",
+          "range": true,
+          "refId": "D"
+        }
+      ],
+      "title": "Cache Load H2D Submit Cost",
+      "type": "timeseries"
     },
     {
       "collapsed": true,
@@ -4785,7 +5198,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 114
+        "y": 122
       },
       "id": 62,
       "panels": [
@@ -4805,7 +5218,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 115
+            "y": 123
           },
           "id": 63,
           "options": {
@@ -4858,7 +5271,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 115
+            "y": 123
           },
           "id": 64,
           "options": {
@@ -4933,7 +5346,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 123
+            "y": 131
           },
           "id": 65,
           "options": {
@@ -4997,7 +5410,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 123
+            "y": 131
           },
           "id": 66,
           "options": {
@@ -5061,7 +5474,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 131
+            "y": 139
           },
           "id": 67,
           "options": {
@@ -5180,7 +5593,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 131
+            "y": 139
           },
           "id": 68,
           "options": {
@@ -5299,7 +5712,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 139
+            "y": 147
           },
           "id": 69,
           "options": {
@@ -5385,7 +5798,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 139
+            "y": 147
           },
           "id": 70,
           "options": {
@@ -5488,7 +5901,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 147
+        "y": 155
       },
       "id": 38,
       "panels": [],
@@ -5558,7 +5971,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 148
+        "y": 156
       },
       "id": 51,
       "options": {
@@ -5654,7 +6067,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 148
+        "y": 156
       },
       "id": 52,
       "options": {
@@ -5827,7 +6240,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 156
+        "y": 164
       },
       "id": 31,
       "options": {
@@ -6034,7 +6447,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 156
+        "y": 164
       },
       "id": 32,
       "options": {
@@ -6164,7 +6577,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 164
+        "y": 172
       },
       "id": 41,
       "options": {
@@ -6272,7 +6685,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 164
+        "y": 172
       },
       "id": 42,
       "options": {
@@ -6380,7 +6793,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 172
+        "y": 180
       },
       "id": 25,
       "options": {
@@ -6477,7 +6890,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 172
+        "y": 180
       },
       "id": 26,
       "options": {
@@ -6651,7 +7064,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 180
+        "y": 188
       },
       "id": 36,
       "options": {
@@ -6858,7 +7271,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 180
+        "y": 188
       },
       "id": 46,
       "options": {
@@ -7065,7 +7478,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 188
+        "y": 196
       },
       "id": 10,
       "options": {
@@ -7272,7 +7685,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 188
+        "y": 196
       },
       "id": 11,
       "options": {
@@ -7353,7 +7766,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 196
+        "y": 204
       },
       "panels": [
         {
@@ -7369,7 +7782,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 197
+            "y": 205
           },
           "targets": [
             {
@@ -7454,7 +7867,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 197
+            "y": 205
           },
           "targets": [
             {
@@ -7539,7 +7952,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 205
+            "y": 213
           },
           "targets": [
             {
@@ -7624,7 +8037,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 205
+            "y": 213
           },
           "targets": [
             {

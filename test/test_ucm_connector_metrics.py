@@ -350,6 +350,7 @@ def _install_stubs():
         KVCacheConfig=type("KVCacheConfig", (), {}),
         KVCacheSpec=type("KVCacheSpec", (), {}),
         MambaSpec=type("MambaSpec", (), {}),
+        MLAAttentionSpec=type("MLAAttentionSpec", (), {}),
         SlidingWindowSpec=type("SlidingWindowSpec", (), {}),
         UniformTypeKVCacheSpecs=type("UniformTypeKVCacheSpecs", (), {}),
     )
@@ -1893,7 +1894,7 @@ def test_vllm_dashboard_uses_combined_prefix_cache_hit_rate_breakdown():
         "mode": "none",
     }
     assert panel["gridPos"] == {"h": 8, "w": 12, "x": 12, "y": 0}
-    assert len(panel["targets"]) == 6
+    assert len(panel["targets"]) == 7
 
     expected = {
         "HBM": {
@@ -1907,6 +1908,12 @@ def test_vllm_dashboard_uses_combined_prefix_cache_hit_rate_breakdown():
         },
         "YuanRong SSD": {
             "ucm:yuanrong_load_success_shards_total",
+            "ucm:yuanrong_local_ssd_load_hits_total",
+        },
+        "YuanRong Total": {
+            "ucm:yuanrong_load_success_shards_total",
+            "ucm:yuanrong_local_dram_load_hits_total",
+            "ucm:yuanrong_remote_load_hits_total",
             "ucm:yuanrong_local_ssd_load_hits_total",
         },
         "Cache": {
@@ -1948,6 +1955,16 @@ def test_vllm_dashboard_uses_combined_prefix_cache_hit_rate_breakdown():
         assert "and on()" in targets[legend]
         assert "ucm:yuanrong_load_success_shards_total" in targets[legend]
         assert targets[legend].endswith(") > 0)")
+    assert targets["YuanRong Total"].count("and on()") == 2
+    assert (
+        "count(rate(ucm:yuanrong_local_dram_load_hits_total"
+        in targets["YuanRong Total"]
+    )
+    assert "count(rate(ucm:yuanrong_remote_load_hits_total" in targets["YuanRong Total"]
+    assert (
+        "count(rate(ucm:yuanrong_local_ssd_load_hits_total" in targets["YuanRong Total"]
+    )
+    assert targets["YuanRong Total"].endswith(") < 3)")
     assert "and on()" in targets["Cache"]
     assert "ucm:cache_load_wait_shards_total" in targets["Cache"]
     assert targets["Cache"].endswith(") > 0)")
@@ -2447,7 +2464,7 @@ def test_fawa_records_submitted_save_bytes():
     assert fake_ucmmetrics.updated == [{"save_bytes_total": 140}]
 
 
-def test_cache_load_h2d_duration_records_stream_synchronize_only():
+def test_cache_load_h2d_sync_duration_records_stream_synchronize_only():
     header = (REPO_ROOT / "ucm" / "store" / "cache" / "cc" / "load_queue.h").read_text(
         encoding="utf-8"
     )
@@ -2466,6 +2483,28 @@ def test_cache_load_h2d_duration_records_stream_synchronize_only():
     assert "auto h2dSyncMs = (NowTime::Now() - tpH2dSyncStart) * 1e3;" in source
     assert "cache_h2d_bandwidth_gbps" not in source
     assert "auto h2dSyncMs = (NowTime::Now() - tpH2dSubmitted) * 1e3;" not in source
+
+
+def test_cache_load_records_task_and_owned_backend_wait_durations():
+    header = (REPO_ROOT / "ucm" / "store" / "cache" / "cc" / "load_queue.h").read_text(
+        encoding="utf-8"
+    )
+    source = (REPO_ROOT / "ucm" / "store" / "cache" / "cc" / "load_queue.cc").read_text(
+        encoding="utf-8"
+    )
+
+    assert "std::shared_ptr<BackendWaitStats> backendWaitStats" in header
+    assert "bool owned{false};" in header
+    assert "shardTask.owned = shardTask.bufferHandle.Owner();" in source
+    assert "task.backendWaitStats->totalMs += backendWaitMs;" in source
+    assert (
+        "if (task.owned) { task.backendWaitStats->ownedMs += backendWaitMs; }" in source
+    )
+    assert source.count('NAME_TO_METRIC_ID("cache_load_backend_wait_duration_ms")') == 1
+    assert (
+        source.count('NAME_TO_METRIC_ID("cache_load_owned_backend_wait_duration_ms")')
+        == 1
+    )
 
 
 def test_cache_store_uses_single_shard_counter_per_operation():
@@ -2672,7 +2711,20 @@ def test_pipeline_dashboard_orders_cache_bandwidth_rows():
         "x": 12,
         "y": 49,
     }
-    assert panels["Cache Load H2D Duration"]["gridPos"]["y"] == 57
+    assert panels["Cache Load H2D Sync Duration"]["gridPos"]["y"] == 57
+    assert panels["Cache Load Owned Backend Wait Duration"]["gridPos"]["y"] == 73
+    assert panels["Cache Shard Backend Wait Duration"]["gridPos"] == {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 114,
+    }
+    assert panels["Cache Load H2D Submit Cost"]["gridPos"] == {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 114,
+    }
     assert "Cache Dump D2H Duration (include wait compute)" in panels
     assert "Cache Dump D2H Duration" not in panels
     assert panels["Cache Lookup Duration"]["gridPos"] == {
@@ -2718,27 +2770,35 @@ def test_pipeline_dashboard_cache_load_breakdown_uses_backend_submit():
         "h2d submit & other",
     }
     assert "cache_load_backend_submit_duration_ms" in targets["backend submit"]["expr"]
-    assert "cache_shard_backend_wait_ms" in targets["backend wait"]["expr"]
+    assert "cache_load_backend_wait_duration_ms" in targets["backend wait"]["expr"]
+    assert (
+        "cache_load_backend_wait_duration_ms_count" in targets["backend wait"]["expr"]
+    )
+    assert "cache_shard_backend_wait_ms" not in targets["backend wait"]["expr"]
     residual = targets["h2d submit & other"]["expr"]
     for metric in (
         "cache_load_duration_ms",
         "cache_load_queue_wait_duration_ms",
         "cache_load_backend_submit_duration_ms",
-        "cache_shard_backend_wait_ms",
+        "cache_load_backend_wait_duration_ms",
         "cache_h2d_sync_ms",
     ):
         assert metric in residual
+    assert "cache_shard_backend_wait_ms" not in residual
     description = panel["description"]
     assert "`queue wait`：指标 `ucm:cache_load_queue_wait_duration_ms`；" in description
     assert (
         "`backend submit`：指标 `ucm:cache_load_backend_submit_duration_ms`；"
         in description
     )
-    assert "`backend wait`：指标 `ucm:cache_shard_backend_wait_ms`；" in description
+    assert (
+        "`backend wait`：指标 `ucm:cache_load_backend_wait_duration_ms`；"
+        in description
+    )
     assert "`H2D sync`：指标 `ucm:cache_h2d_sync_ms`；" in description
     assert (
         "`h2d submit & other`：计算方法 `Load 总耗时 - queue wait - "
-        "backend submit - backend wait - H2D sync`；" in description
+        "backend submit - task backend wait - H2D sync`；" in description
     )
 
 
@@ -2754,20 +2814,41 @@ def test_pipeline_dashboard_groups_performance_stores_in_order():
         panel["title"]
         for panel in panels
         if panel["title"]
-        in {"Cache Store", "YuanRong Store", "Mooncake Store", "Posix Store"}
+        in {
+            "Cache Store (Task Level)",
+            "Cache Store (Shard Level)",
+            "YuanRong Store",
+            "Mooncake Store",
+            "Posix Store",
+        }
     ]
 
     assert dashboard["title"] == "vLLM - UCM Store (vLLM Metrics)"
     assert store_titles == [
-        "Cache Store",
+        "Cache Store (Task Level)",
+        "Cache Store (Shard Level)",
         "Mooncake Store",
         "Posix Store",
     ]
-    assert rows["Cache Store"]["collapsed"] is False
+    assert rows["Cache Store (Task Level)"]["collapsed"] is False
+    assert rows["Cache Store (Shard Level)"]["collapsed"] is False
     assert rows["Posix Store"]["collapsed"] is False
     assert rows["Mooncake Store"]["collapsed"] is True
-    assert rows["Cache Store"]["panels"] == []
+    assert rows["Cache Store (Task Level)"]["panels"] == []
+    assert rows["Cache Store (Shard Level)"]["panels"] == []
     assert rows["Posix Store"]["panels"] == []
+
+    task_row_index = panels.index(rows["Cache Store (Task Level)"])
+    shard_row_index = panels.index(rows["Cache Store (Shard Level)"])
+    mooncake_row_index = panels.index(rows["Mooncake Store"])
+    task_section = panels[task_row_index + 1 : shard_row_index]
+    shard_section = panels[shard_row_index + 1 : mooncake_row_index]
+    assert "cache_shard_backend_wait_ms" not in json.dumps(task_section)
+    assert "cache_h2d_submit_ms" not in json.dumps(task_section)
+    assert {panel["title"] for panel in shard_section} == {
+        "Cache Shard Backend Wait Duration",
+        "Cache Load H2D Submit Cost",
+    }
 
     mooncake_children = rows["Mooncake Store"]["panels"]
     assert {panel["title"] for panel in mooncake_children} == {
