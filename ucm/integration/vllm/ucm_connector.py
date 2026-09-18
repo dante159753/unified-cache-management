@@ -35,6 +35,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import KVConnectorOutput
 
 from ucm.integration.vllm.device import create_device, get_current_device_id
+from ucm.integration.vllm.kv_cache_check import KVCacheCheck
 from ucm.integration.vllm.metrics import (
     UCM_HAS_PROM_METRICS,
     UCMConnectorStats,
@@ -3488,6 +3489,10 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
             dictionary of layer names, kv cache
         """
         self.connector.register_kv_caches(kv_caches)
+        if self.launch_config.get("enable_kv_cache_check", False) and isinstance(
+            self.connector, UCMDirectConnector
+        ):
+            self.connector._rank_consistency.kv_cache_check = KVCacheCheck(kv_caches)
 
     @_record_connector_interface_duration
     def build_connector_meta(

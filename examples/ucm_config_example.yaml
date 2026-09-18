@@ -9,6 +9,9 @@
 # Alternatively, you can still use kv_connector_extra_config in KVTransferConfig
 # for backward compatibility.
 
+# Debug only: compare HBM KV bytes against this worker's earlier dump MD5 records.
+enable_kv_cache_check: false
+
 ucm_connectors:
   - ucm_connector_name: "UcmPipelineStore"
     ucm_connector_config:

@@ -38,6 +38,16 @@
 
 ## 结果不符合预期时
 
+对 vLLM，可在 UCM YAML 配置中开启 worker 本地的 HBM 内容校验：
+
+```yaml
+enable_kv_cache_check: true
+```
+
+Connector 在每次提交 dump 前，对实际传输的 HBM 字节计算并记录 MD5。load 成功完成后，如果当前 worker 记录过相同 UCM block ID、store 和 shard，就对目标 HBM 字节重新计算并比较；没有记录的块跳过。不一致时，日志输出 `ucm_block_id`、`shard_index`、`store`、`expected_md5` 和 `actual_md5`，不会因此中断请求或触发重算。
+
+记录只保存在当前 worker 内存中，重启后丢失，因此需要在同一 worker 内先 dump，再触发外部加载。完全命中引擎内存的请求不会触发 load 校验。记录占用的内存随已 dump 的块数量增长。此选项默认 `false`；开启后增加同步 HBM 到 CPU 的拷贝和哈希计算开销，适合排查问题。校验用于字节不变的传输；有损压缩可能使 MD5 正常发生变化。
+
 没有外部命中时，先检查提示词 token、模型与布局、完整块范围和实际存储命名空间；命中但加载失败时，检查后端健康、文件可见性、传输错误和资源预算。详细入口见[故障排查](../../reference/troubleshooting.md)。
 
 复用正确后，再比较冷运行、外部缓存重放与内存热缓存。报告实际命中、读取路径、时延和吞吐，不用单次响应更快替代缓存验证。

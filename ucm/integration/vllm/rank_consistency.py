@@ -20,11 +20,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ucm.logger import init_logger
 from ucm.store.pipeline.errors import StoreNotFoundError, StoreUnhealthyError
 from ucm.store.ucmstore_v1 import UcmKVStoreBaseV1
+
+if TYPE_CHECKING:
+    from ucm.integration.vllm.kv_cache_check import KVCacheCheck, KVCacheLoadCheck
 
 logger = init_logger(__name__)
 
@@ -111,6 +114,8 @@ class RankConsistencyManager:
         ] = {}
         self._dump_blocks_by_request: dict[str, set[bytes]] = {}
         self._dump_failed_blocks_by_request: dict[str, set[bytes]] = {}
+        self.kv_cache_check: "KVCacheCheck | None" = None
+        self._load_checks: dict[int, list["KVCacheLoadCheck"]] = {}
 
     def lookup_on_prefix(self, store: UcmKVStoreBaseV1, block_ids: list[bytes]) -> int:
         """Exclude known-missing blocks before forwarding a prefix lookup."""
@@ -167,6 +172,11 @@ class RankConsistencyManager:
             if self.enabled
             else {}
         )
+        checks = (
+            self.kv_cache_check.prepare_load(store, block_ids, shard_indices, ptrs)
+            if self.kv_cache_check is not None
+            else []
+        )
         try:
             task = store.load_data(block_ids, shard_indices, ptrs)
         except Exception as error:
@@ -174,6 +184,8 @@ class RankConsistencyManager:
                 self._mark_load_context_missing(request_context)
             raise
         self._load_task_contexts[id(task)] = (store, request_context)
+        if checks:
+            self._load_checks[id(task)] = checks
         return task
 
     def wait_load(self, task: Any) -> None:
@@ -182,12 +194,15 @@ class RankConsistencyManager:
         if task_key not in self._load_task_contexts:
             raise RuntimeError("Load task was not submitted through submit_load().")
         store, request_context = self._load_task_contexts.pop(task_key)
+        checks = self._load_checks.pop(task_key, [])
         try:
             store.wait(task)
         except Exception as error:
             if self.enabled and isinstance(error, StoreNotFoundError):
                 self._mark_load_context_missing(request_context)
             raise
+        if checks and self.kv_cache_check is not None:
+            self.kv_cache_check.verify_load(checks)
 
     def check_load(self, task: Any) -> bool:
         """Poll a load task without blocking and retain its wait context.
@@ -204,6 +219,7 @@ class RankConsistencyManager:
             return store.check(task)
         except Exception as error:
             self._load_task_contexts.pop(task_key, None)
+            self._load_checks.pop(task_key, None)
             if self.enabled and isinstance(error, StoreNotFoundError):
                 self._mark_load_context_missing(request_context)
             raise
@@ -231,6 +247,8 @@ class RankConsistencyManager:
                 request_block_ids
             )
         try:
+            if self.kv_cache_check is not None:
+                self.kv_cache_check.record_dump(store, block_ids, shard_indices, ptrs)
             task = store.dump_data(block_ids, shard_indices, ptrs, event_handle)
         except Exception:
             self._record_dump_failure(request_context)

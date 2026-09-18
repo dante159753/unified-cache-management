@@ -38,6 +38,16 @@ For sharing, replay on another instance with the same store and a compatible lay
 
 ## Investigate unexpected results
 
+For vLLM, enable worker-local HBM content checks in the UCM YAML configuration:
+
+```yaml
+enable_kv_cache_check: true
+```
+
+The connector records an MD5 of the actual HBM bytes before submitting each dump. After a successful load finishes, it compares the destination HBM bytes with an earlier record for the same UCM block ID, store and shard. Unknown blocks are skipped. A mismatch logs `ucm_block_id`, `shard_index`, `store`, `expected_md5` and `actual_md5`; it does not fail the request or trigger recomputation.
+
+Records live only in the current worker and are lost on restart, so use this check with dump and external reload in the same worker. A block served entirely from engine memory does not exercise the load check. Record memory grows with the number of dumped blocks. This option defaults to `false`: enabling it adds synchronous HBM-to-CPU copies and hashing overhead. It checks byte-preserving transfers; lossy compression can intentionally change the checksum.
+
 For no external hits, check prompt tokens, model/layout compatibility, complete blocks and the actual namespace. For hits followed by failed loads, check health, visibility, transfer errors and resource budgets. Continue with [troubleshooting](../../reference/troubleshooting.md).
 
 Once reuse is correct, compare cold runs, external replay and warm engine cache separately. Report actual hits, read paths, latency and throughput rather than treating one faster response as cache verification.

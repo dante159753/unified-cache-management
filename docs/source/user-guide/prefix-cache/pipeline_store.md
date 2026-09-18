@@ -168,6 +168,17 @@ Top-level parameters (outside `ucm_connector_config`):
   Each hash_id takes 32 bytes. Enable only when needed,  
   and configure `UCM_LOG_MAX_FILES` and `UCM_LOG_MAX_SIZE` accordingly.
 
+* **enable_kv_cache_check** *(optional, default: false)*
+  Debug-only HBM content checking in the vLLM connector. Before each dump,
+  records an MD5 for each UCM block and shard, separately for each Store.
+  After a successful load wait, compares the destination HBM bytes with the
+  worker's locally recorded digest. Unknown blocks are skipped; mismatches log
+  `ucm_block_id`, `shard_index`, `store`, `expected_md5`, and `actual_md5` without
+  triggering recomputation. Records are kept in worker memory until restart,
+  and grow with the number of dumped blocks. The check copies transferred tensor
+  bytes to CPU and synchronizes execution, so it is intended for debugging only.
+  It checks byte-preserving transfers, not equivalence after lossy compression.
+
 * **use_lite** *(optional, default: false)*  
   Whether to use the UCM Lite Connector.  
   UCM Lite Connector works with Fake Store to skip actual KV dump/load operations,  
