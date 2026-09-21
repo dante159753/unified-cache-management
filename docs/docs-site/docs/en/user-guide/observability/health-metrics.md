@@ -8,9 +8,17 @@ correct, or that a deployment meets its latency target.
 ## What happens when a backend fails
 
 Pipeline wraps each loaded stage in a `HealthBreakerStore` when health checking
-is enabled. The wrapper starts enabled and records a rolling window of probe
-results. With the defaults, two failures in the window block the stage; recovery
-requires a full window of eight successful results.
+is enabled. The wrapper starts enabled and keeps two independent windows. By
+default, two failures among eight active probes block the stage. Passive detection
+uses 60 one-second buckets and blocks when the window contains at least 10
+eligible task results and their failure ratio is strictly greater than 1%.
+
+Only active probes can restore service. After a trip, a fresh full window must
+contain only successes, and a successful probe must start after the cooldown
+expires. The initial cooldown is 60 seconds. A new trip within 3600 seconds of
+recovery doubles the previous cooldown, up to 3600 seconds. At least 3600 seconds of
+healthy uptime resets it to 60 seconds on the next trip. Probes continue during
+cooldown; failures while blocked do not extend the current deadline.
 
 | Operation while blocked | Result |
 | --- | --- |
@@ -25,8 +33,31 @@ miss leads to recomputation or an error is decided by the integration and reques
 path; the breaker itself does not retry inference requests.
 
 The base `StoreV1.CheckHealth()` returns success. Posix and Mooncake override it
-with backend operations. An enabled wrapper around a stage without such an
-override is therefore not an independent check of that stage's storage service.
+with backend operations. Pipeline assembly enables passive detection only for
+Posix and Mooncake. Cache and other stages do not participate; downstream failures
+are handled by the downstream stage's breaker.
+
+Passive detection counts only the first `Wait` result of each accepted task.
+`Load` / `Dump` submission results and `Check` polling do not enter either count
+or the passive failure metrics. `NotFound` (including misses and short reads),
+`StoreUnhealthy`, `InvalidParam`, `DuplicateKey`, and `Unsupported` enter
+neither numerator nor denominator. Other failures, including `Retry`, timeouts,
+and I/O errors, count as failed tasks. The ratio is total failures divided by total
+eligible results across live buckets. Results enter buckets when observed using
+a monotonic clock, with one-second boundary precision. Probe I/O is excluded.
+Recovery clears passive history. Results from a `Wait` or probe that spans a
+breaker state transition are ignored. Tasks are not tracked at submission;
+a `Wait` started after recovery belongs to the current window. Existing tasks
+still need to be waited on and released.
+
+Bucket counters atomically update their timestamp and count. Bucket reuse needs
+no rotation lock and ignores older updates. Recovery resets can still overlap
+in-flight updates, so counts near recovery are approximate.
+
+With passive detection enabled, eligible failed `Wait` results are returned as
+`StoreUnhealthy` after local accounting, even before the breaker reaches its trip
+threshold. The returned message includes the original status. An outer breaker
+excludes this status from its own window if intermediate stores preserve it.
 
 ## Set the probe policy
 
@@ -45,6 +76,14 @@ ucm_connectors:
         health_check_timeout_s: 3
         health_window_size: 8
         failure_threshold: 2
+        passive_enabled: true
+        passive_window_s: 60
+        passive_min_samples: 10
+        passive_failure_ratio: 0.01
+        initial_cooldown_s: 60
+        max_cooldown_s: 3600
+        backoff_factor: 2
+        stable_reset_after_s: 3600
 enable_metrics: true
 ```
 
@@ -58,9 +97,18 @@ Keep the model, mount and cache settings appropriate to your deployment; see
 | `health_check_timeout_s` | Probe execution deadline; default 3 seconds |
 | `health_window_size` | Number of recent results retained; default 8 |
 | `failure_threshold` | Failures needed to block new operations; default 2 |
+| `passive_enabled` | Enable passive detection for Posix and Mooncake; default `true`; excludes Cache and other stages |
+| `passive_window_s` | Positive integer number of one-second buckets; default 60 |
+| `passive_min_samples` | Positive minimum eligible task count before evaluating the ratio; default 10 |
+| `passive_failure_ratio` | Strict trip threshold in `[0, 1)`; default 0.01 |
+| `initial_cooldown_s` / `max_cooldown_s` | Initial / maximum cooldown; defaults 60 / 3600 seconds |
+| `backoff_factor` | Cooldown multiplier after an early repeat trip, at least 1; default 2 |
+| `stable_reset_after_s` | Healthy uptime after recovery that resets backoff; default 3600 seconds |
 
-Numeric values must be positive, the failure threshold cannot exceed the window,
-and the timeout must be shorter than the interval. The first probe is delayed by
+Windows, probe interval, probe timeout, and stable uptime must be
+positive. The active failure threshold cannot exceed its window, and probe timeout
+must be shorter than the interval. Cooldowns can be zero; the maximum cannot be
+less than the initial cooldown. The first probe is delayed by
 one interval plus random jitter of up to another interval. The initial enabled
 state is published before that first probe; it is not evidence of a successful I/O.
 
@@ -96,6 +144,12 @@ The Gauge is 1 while the wrapper accepts work and 0 while it is blocked. Counter
 record probe outcomes, including timeouts, rather than breaker transitions.
 A single successful probe need not change a blocked Gauge back to 1.
 
+`ucm:posix_passive_failures_total` and `ucm:mooncake_passive_failures_total` count
+eligible failures observed by passive detection, including late failures from
+older tasks. They are separate from active probe counters and do not represent
+the current passive window. A passive trip immediately updates the native health
+Gauge; export still depends on connector statistics collection.
+
 Start with individual series and their labels:
 
 ```promql
@@ -121,18 +175,26 @@ a repeated value or a missing series as the current backend state.
 
 ## Investigate and confirm recovery
 
+On each `health_check_interval_s` cycle (10 seconds by default), the background
+thread logs `Store passive health window` only if the current window has failures.
+It includes the stage, window duration, eligible result count, failure count,
+failure ratio, minimum samples, and threshold, even below the minimum sample count.
+Expired buckets are excluded using the current time, including during idle periods.
+Logging stops when failures expire or recovery clears the window.
+
 1. Check the scrape target and identify the affected process from the labels.
 2. Find `Store health check` failures and `transitioned to UNHEALTHY` in its log;
-   the log includes the pipeline stage identifier and probe result window.
+   transition logs include the stage identifier, `source=active_probe` or
+   `source=passive_io`, cooldown in milliseconds, and breaker generation.
 3. For Posix, inspect that process's mount, permissions, available capacity and
    read/write/remove errors. For Mooncake, inspect its configured client and
    metadata/master connectivity and the reported operation error.
-4. Restore the failed dependency, then watch successful probes replace the failing
-   window. Confirm `transitioned to HEALTHY` and the corresponding Gauge update.
+4. Restore the failed dependency, then wait for a full active success window and
+   the cooldown. Confirm `transitioned to HEALTHY` and the corresponding Gauge update.
 5. Separately repeat the [external-cache verification](../quick_start/index.md#vllm-verify-the-service-and-external-cache).
    Recovery of a probe does not prove recovery of a particular request's cache.
 
 For metric units and export paths, see [Metrics reference](metrics-reference.md).
 The policy and operation behavior are defined in
-[`StoreHealthConfig`](https://github.com/ModelEngine-Group/unified-cache-management/blob/a336d69bc03a550d44bee3df9da7664e9edfe3a7/ucm/store/pipeline/cc/store_health_config.h)
-and [`HealthBreakerStore`](https://github.com/ModelEngine-Group/unified-cache-management/blob/a336d69bc03a550d44bee3df9da7664e9edfe3a7/ucm/store/pipeline/cc/health_breaker_store.cc).
+[`StoreHealthConfig`](https://github.com/ModelEngine-Group/unified-cache-management/blob/develop/ucm/store/pipeline/cc/store_health_config.h)
+and [`HealthBreakerStore`](https://github.com/ModelEngine-Group/unified-cache-management/blob/develop/ucm/store/pipeline/cc/health_breaker_store.cc).

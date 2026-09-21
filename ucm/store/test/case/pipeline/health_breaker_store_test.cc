@@ -23,6 +23,7 @@
  */
 #include "health_breaker_store.h"
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
@@ -61,6 +62,8 @@ StoreHealthConfig TestConfig()
     config.healthWindowSize = 5;
     config.failureThreshold = 3;
     config.healthCheckInterval = std::chrono::hours(1);
+    config.initialCooldown = std::chrono::milliseconds(0);
+    config.passiveMinSamples = 1;
     return config;
 }
 
@@ -70,7 +73,7 @@ Status SetupBreaker(HealthBreakerStore& breaker, StoreV1* store, const std::stri
     return breaker.Setup(store, storeId, config);
 }
 
-void Trip(HealthBreakerStore& breaker, Detail::MockStore& store)
+void ToUnhealthy(HealthBreakerStore& breaker, Detail::MockStore& store)
 {
     EXPECT_CALL(store, CheckHealth()).Times(3).WillRepeatedly(Return(Status::Error()));
     EXPECT_TRUE(breaker.CheckHealth().Failure());
@@ -164,9 +167,9 @@ TEST(UCHealthBreakerStoreTest, TripsEarlyAndRecoversAfterFullSuccessWindow)
     HealthBreakerStore breaker;
     ASSERT_TRUE(SetupBreaker(breaker, &store, "cache-0", TestConfig()).Success());
 
-    Trip(breaker, store);
-    EXPECT_EQ(breaker.FailureCount(), 3);
-    EXPECT_EQ(breaker.SampleCount(), 3);
+    ToUnhealthy(breaker, store);
+    EXPECT_EQ(breaker.FailureCount(), 0);
+    EXPECT_EQ(breaker.SampleCount(), 0);
 
     EXPECT_CALL(store, CheckHealth()).Times(5).WillRepeatedly(Return(Status::OK()));
     for (size_t i = 0; i < 4; ++i) {
@@ -179,7 +182,7 @@ TEST(UCHealthBreakerStoreTest, TripsEarlyAndRecoversAfterFullSuccessWindow)
     EXPECT_EQ(breaker.SampleCount(), 5);
 }
 
-TEST(UCHealthBreakerStoreTest, LogsWindowOnEveryStateTransition)
+TEST(UCHealthBreakerStoreTest, LogsCauseAndCooldownOnEveryStateTransition)
 {
     StrictMock<Detail::MockStore> store;
     auto config = TestConfig();
@@ -203,9 +206,9 @@ TEST(UCHealthBreakerStoreTest, LogsWindowOnEveryStateTransition)
     const auto output = testing::internal::GetCapturedStdout();
 
     EXPECT_THAT(output, testing::HasSubstr("transitioned to UNHEALTHY"));
-    EXPECT_THAT(output, testing::HasSubstr("window=[failure, failure]"));
+    EXPECT_THAT(output, testing::HasSubstr("source=active_probe"));
     EXPECT_THAT(output, testing::HasSubstr("transitioned to HEALTHY"));
-    EXPECT_THAT(output, testing::HasSubstr("window=[success, success, success]"));
+    EXPECT_THAT(output, testing::HasSubstr("cooldown_ms=0"));
 }
 
 TEST(UCHealthBreakerStoreTest, SlidingWindowEvictsOldFailure)
@@ -346,7 +349,7 @@ TEST(UCHealthBreakerStoreTest, UnhealthyOperationMatrix)
     StrictMock<Detail::MockStore> store;
     HealthBreakerStore breaker;
     ASSERT_TRUE(SetupBreaker(breaker, &store, "posix-0", TestConfig()).Success());
-    Trip(breaker, store);
+    ToUnhealthy(breaker, store);
 
     std::array<UC::Detail::BlockId, 2> blocks{};
     auto lookup = breaker.Lookup(blocks.data(), blocks.size());
@@ -403,6 +406,313 @@ TEST(UCHealthBreakerStoreTest, StoreHealthConfigDefaults)
     EXPECT_TRUE(config.enabled);
     EXPECT_EQ(config.healthCheckInterval, std::chrono::seconds(10));
     EXPECT_EQ(config.healthCheckTimeout, std::chrono::seconds(3));
+    EXPECT_EQ(config.passiveMinSamples, 10);
+}
+
+TEST(UCHealthBreakerStoreTest, CountsFinalResultsOnceAndSeparatelyFromProbes)
+{
+    StrictMock<Detail::MockStore> store;
+    auto config = TestConfig();
+    config.passiveFailureRatio = 0.4;
+    HealthBreakerStore breaker;
+    ASSERT_TRUE(breaker.Setup(&store, "posix-0", config).Success());
+
+    EXPECT_CALL(store, Load(testing::_)).WillOnce(Return(21));
+    EXPECT_CALL(store, Check(21)).Times(3).WillRepeatedly(Invoke([] {
+        return Expected<bool>{true};
+    }));
+    EXPECT_CALL(store, Wait(21))
+        .WillOnce(Return(Status::OK()))
+        .WillOnce(Return(Status::NotFound()));
+    ASSERT_EQ(breaker.Load({}).Value(), 21);
+    for (size_t i = 0; i < 3; ++i) { EXPECT_TRUE(breaker.Check(21).Value()); }
+    EXPECT_TRUE(breaker.Wait(21).Success());
+    EXPECT_EQ(breaker.Wait(21), Status::NotFound());
+    EXPECT_TRUE(breaker.Enabled());
+
+    EXPECT_CALL(store, CheckHealth()).Times(10).WillRepeatedly(Return(Status::OK()));
+    for (size_t i = 0; i < 10; ++i) { EXPECT_TRUE(breaker.CheckHealth().Success()); }
+    EXPECT_CALL(store, Dump(testing::_)).WillOnce(Return(22));
+    EXPECT_CALL(store, Wait(22)).WillOnce(Return(Status::Timeout()));
+    ASSERT_EQ(breaker.Dump({}).Value(), 22);
+    EXPECT_TRUE(breaker.Enabled());
+    EXPECT_EQ(breaker.Wait(22), Status::StoreUnhealthy());
+    EXPECT_FALSE(breaker.Enabled());
+    EXPECT_EQ(breaker.Load({}).Error(), Status::StoreUnhealthy());
+}
+
+TEST(UCHealthBreakerStoreTest, SubmissionFailuresDoNotAffectPassiveWindowOrMetrics)
+{
+    UC::Metrics::SetUp();
+    UC::Metrics::CreateStats("posix_passive_failures_total", "counter");
+    UC::Metrics::GetAllStatsAndClear();
+    StrictMock<Detail::MockStore> store;
+    auto config = TestConfig();
+    config.passiveMinSamples = 2;
+    config.passiveFailureRatio = 0.4;
+    HealthBreakerStore breaker;
+    ASSERT_TRUE(breaker.Setup(&store, "pipeline/0:PosixStore", config).Success());
+    EXPECT_CALL(store, Load(testing::_)).WillOnce(Return(21));
+    EXPECT_CALL(store, Wait(21)).WillOnce(Return(Status::OK()));
+    ASSERT_EQ(breaker.Load({}).Value(), 21);
+    EXPECT_TRUE(breaker.Wait(21).Success());
+
+    for (auto status : {Status::Error(), Status::Timeout(), Status::OsApiError()}) {
+        EXPECT_CALL(store, Load(testing::_)).WillOnce(Return(status));
+        EXPECT_CALL(store, Dump(testing::_)).WillOnce(Return(status));
+        EXPECT_EQ(breaker.Load({}).Error(), status);
+        EXPECT_EQ(breaker.Dump({}).Error(), status);
+        EXPECT_TRUE(breaker.Enabled());
+    }
+    const auto before = UC::Metrics::GetAllStatsAndClear();
+    const auto& counters = std::get<0>(before);
+    const auto failures = counters.find("posix_passive_failures_total");
+    EXPECT_TRUE(failures == counters.end() || failures->second == 0);
+
+    EXPECT_CALL(store, Dump(testing::_)).WillOnce(Return(22));
+    EXPECT_CALL(store, Wait(22)).WillOnce(Return(Status::Error()));
+    ASSERT_EQ(breaker.Dump({}).Value(), 22);
+    EXPECT_TRUE(breaker.Enabled());
+    EXPECT_EQ(breaker.Wait(22), Status::StoreUnhealthy());
+    EXPECT_FALSE(breaker.Enabled());
+    const auto after = UC::Metrics::GetAllStatsAndClear();
+    EXPECT_EQ(std::get<0>(after).at("posix_passive_failures_total"), 1);
+}
+
+TEST(UCHealthBreakerStoreTest, ExcludesMissesAndNonIoErrorsFromBothCounts)
+{
+    StrictMock<Detail::MockStore> store;
+    auto config = TestConfig();
+    config.passiveFailureRatio = 0.4;
+    HealthBreakerStore breaker;
+    ASSERT_TRUE(breaker.Setup(&store, "posix-0", config).Success());
+
+    for (auto status : {Status::NotFound(), Status::StoreUnhealthy(), Status::InvalidParam(),
+                        Status::DuplicateKey(), Status::Unsupported()}) {
+        EXPECT_CALL(store, Dump(testing::_)).WillOnce(Return(21));
+        EXPECT_CALL(store, Wait(21)).WillOnce(Return(status));
+        ASSERT_EQ(breaker.Dump({}).Value(), 21);
+        EXPECT_EQ(breaker.Wait(21), status);
+    }
+    EXPECT_CALL(store, Dump(testing::_)).WillOnce(Return(22));
+    EXPECT_CALL(store, Wait(22)).WillOnce(Return(Status::Retry()));
+    ASSERT_EQ(breaker.Dump({}).Value(), 22);
+    EXPECT_EQ(breaker.Wait(22), Status::StoreUnhealthy());
+    EXPECT_FALSE(breaker.Enabled());
+}
+
+TEST(UCHealthBreakerStoreTest, HandledFailuresDoNotTripOuterBreaker)
+{
+    StrictMock<Detail::MockStore> store;
+    auto config = TestConfig();
+    config.passiveMinSamples = 10;
+    HealthBreakerStore inner;
+    ASSERT_TRUE(inner.Setup(&store, "posix-0", config).Success());
+    config.passiveMinSamples = 1;
+    HealthBreakerStore outer;
+    ASSERT_TRUE(outer.Setup(&inner, "outer", config).Success());
+
+    const std::array errors{Status::Timeout(), Status::Retry(), Status::OsApiError(),
+                            Status::Error()};
+    for (size_t i = 0; i < 10; ++i) {
+        const auto original = errors[i % errors.size()];
+        EXPECT_CALL(store, Load(testing::_)).WillOnce(Return(i + 1));
+        EXPECT_CALL(store, Wait(i + 1)).WillOnce(Return(original));
+        auto task = outer.Load({});
+        ASSERT_TRUE(task);
+        auto result = outer.Wait(task.Value());
+        EXPECT_EQ(result, Status::StoreUnhealthy());
+        EXPECT_THAT(result.ToString(), testing::HasSubstr("posix-0: " + original.ToString()));
+        EXPECT_EQ(inner.Enabled(), i + 1 < 10);
+        EXPECT_TRUE(outer.Enabled());
+    }
+}
+
+TEST(UCHealthBreakerStoreTest, PassiveDetectionCanBeDisabled)
+{
+    StrictMock<Detail::MockStore> store;
+    auto config = TestConfig();
+    config.passiveEnabled = false;
+    HealthBreakerStore breaker;
+    ASSERT_TRUE(breaker.Setup(&store, "cache-0", config).Success());
+    EXPECT_CALL(store, Load(testing::_)).WillOnce(Return(Status::Error()));
+    EXPECT_EQ(breaker.Load({}).Error(), Status::Error());
+    EXPECT_CALL(store, Dump(testing::_)).WillOnce(Return(21));
+    EXPECT_CALL(store, Wait(21)).WillOnce(Return(Status::Timeout()));
+    ASSERT_EQ(breaker.Dump({}).Value(), 21);
+    EXPECT_EQ(breaker.Wait(21), Status::Timeout());
+    EXPECT_TRUE(breaker.Enabled());
+}
+
+TEST(UCHealthBreakerStoreTest, WaitSpanningRecoveryCannotTripRecoveredStore)
+{
+    StrictMock<Detail::MockStore> store;
+    auto config = TestConfig();
+    config.healthWindowSize = 1;
+    config.failureThreshold = 1;
+    HealthBreakerStore breaker;
+    ASSERT_TRUE(breaker.Setup(&store, "posix-0", config).Success());
+    EXPECT_CALL(store, Load(testing::_)).WillOnce(Return(21));
+    ASSERT_EQ(breaker.Load({}).Value(), 21);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool entered = false;
+    bool release = false;
+    EXPECT_CALL(store, Wait(21)).WillOnce(Invoke([&] {
+        std::unique_lock<std::mutex> lock(mutex);
+        entered = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release; });
+        return Status::Timeout();
+    }));
+    std::thread waiter([&] { EXPECT_EQ(breaker.Wait(21), Status::StoreUnhealthy()); });
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        EXPECT_TRUE(cv.wait_for(lock, std::chrono::seconds(2), [&] { return entered; }));
+    }
+    EXPECT_CALL(store, Dump(testing::_)).WillOnce(Return(22));
+    EXPECT_CALL(store, Wait(22)).WillOnce(Return(Status::Error()));
+    ASSERT_EQ(breaker.Dump({}).Value(), 22);
+    EXPECT_EQ(breaker.Wait(22), Status::StoreUnhealthy());
+    EXPECT_FALSE(breaker.Enabled());
+    EXPECT_CALL(store, CheckHealth()).WillOnce(Return(Status::OK()));
+    EXPECT_TRUE(breaker.CheckHealth().Success());
+    EXPECT_TRUE(breaker.Enabled());
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        release = true;
+    }
+    cv.notify_all();
+    waiter.join();
+    EXPECT_TRUE(breaker.Enabled());
+    EXPECT_CALL(store, Dump(testing::_)).WillOnce(Return(22));
+    EXPECT_CALL(store, Wait(22)).WillOnce(Return(Status::Error()));
+    ASSERT_EQ(breaker.Dump({}).Value(), 22);
+    EXPECT_EQ(breaker.Wait(22), Status::StoreUnhealthy());
+    EXPECT_FALSE(breaker.Enabled());
+}
+
+TEST(UCHealthBreakerStoreTest, PassiveTripUpdatesGaugeWithoutProbe)
+{
+    UC::Metrics::SetUp();
+    UC::Metrics::CreateStats("posix_passive_failures_total", "counter");
+    UC::Metrics::CreateStats("posix_store_health", "gauge");
+    UC::Metrics::GetAllStatsAndClear();
+    StrictMock<Detail::MockStore> store;
+    auto config = TestConfig();
+    HealthBreakerStore breaker;
+    ASSERT_TRUE(breaker.Setup(&store, "pipeline/0:PosixStore", config).Success());
+    EXPECT_CALL(store, Dump(testing::_)).WillOnce(Return(22));
+    EXPECT_CALL(store, Wait(22)).WillOnce(Return(Status::Error()));
+    ASSERT_EQ(breaker.Dump({}).Value(), 22);
+    EXPECT_EQ(breaker.Wait(22), Status::StoreUnhealthy());
+    const auto stats = UC::Metrics::GetAllStatsAndClear();
+    EXPECT_EQ(std::get<0>(stats).at("posix_passive_failures_total"), 1);
+    EXPECT_EQ(std::get<0>(stats).count("posix_unhealthy_count_total"), 0);
+    EXPECT_EQ(std::get<1>(stats).at("posix_store_health"), 0);
+}
+
+TEST(UCHealthBreakerStoreTest, LogsPassiveWindowPeriodicallyOnlyWhenFailuresPresent)
+{
+    StrictMock<Detail::MockStore> store;
+    auto config = TestConfig();
+    config.passiveMinSamples = 10;
+    config.healthCheckInterval = std::chrono::milliseconds(50);
+    config.healthCheckTimeout = std::chrono::milliseconds(40);
+    HealthBreakerStore breaker;
+    ASSERT_TRUE(breaker.Setup(&store, "posix-window-log", config).Success());
+    EXPECT_CALL(store, Load(testing::_)).WillOnce(Return(21));
+    EXPECT_CALL(store, Wait(21)).WillOnce(Return(Status::OK()));
+    ASSERT_EQ(breaker.Load({}).Value(), 21);
+    EXPECT_TRUE(breaker.Wait(21).Success());
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    size_t probes = 0;
+    EXPECT_CALL(store, CheckHealth()).WillRepeatedly(Invoke([&] {
+        std::lock_guard<std::mutex> lock(mutex);
+        ++probes;
+        cv.notify_all();
+        return Status::OK();
+    }));
+    auto waitForProbes = [&](size_t count) {
+        std::unique_lock<std::mutex> lock(mutex);
+        return cv.wait_for(lock, std::chrono::seconds(2), [&] { return probes >= count; });
+    };
+
+    testing::internal::CaptureStdout();
+    EXPECT_TRUE(breaker.Start().Success());
+    EXPECT_TRUE(waitForProbes(2));
+    UC::Logger::Flush();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    auto output = testing::internal::GetCapturedStdout();
+    EXPECT_EQ(CountSubstring(output, "Store passive health window(posix-window-log)"), 0);
+
+    testing::internal::CaptureStdout();
+    EXPECT_CALL(store, Dump(testing::_)).WillOnce(Return(22));
+    EXPECT_CALL(store, Wait(22)).WillOnce(Return(Status::OsApiError()));
+    ASSERT_EQ(breaker.Dump({}).Value(), 22);
+    EXPECT_EQ(breaker.Wait(22), Status::StoreUnhealthy());
+    size_t target;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        target = probes + 3;
+    }
+    EXPECT_TRUE(waitForProbes(target));
+    breaker.Stop();
+    UC::Logger::Flush();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    output = testing::internal::GetCapturedStdout();
+    EXPECT_GE(CountSubstring(output, "Store passive health window(posix-window-log)"), 2);
+    EXPECT_THAT(output, testing::HasSubstr("window_s=60, samples=2, failures=1"));
+    EXPECT_THAT(output,
+                testing::HasSubstr("failure_ratio=0.500000, min_samples=10, threshold=0.01"));
+    EXPECT_TRUE(breaker.Enabled());
+}
+
+TEST(UCHealthBreakerStoreTest, ConcurrentHotPathsCountEachTaskOnce)
+{
+    StrictMock<Detail::MockStore> store;
+    HealthBreakerStore breaker;
+    auto config = TestConfig();
+    config.passiveMinSamples = 2049;
+    config.passiveFailureRatio = 0;
+    ASSERT_TRUE(SetupBreaker(breaker, &store, "concurrent", config).Success());
+    std::atomic<size_t> next{1};
+    auto submit = [&](UC::Detail::TaskDesc) -> Expected<UC::Detail::TaskHandle> {
+        return next.fetch_add(1);
+    };
+    EXPECT_CALL(store, Load(testing::_)).Times(1024).WillRepeatedly(Invoke(submit));
+    EXPECT_CALL(store, Dump(testing::_)).Times(1024).WillRepeatedly(Invoke(submit));
+    EXPECT_CALL(store, Check(testing::_)).Times(4096).WillRepeatedly(Return(Expected<bool>{true}));
+    EXPECT_CALL(store, Wait(testing::_)).Times(2048).WillRepeatedly(Return(Status::OK()));
+    std::atomic<size_t> ready{0};
+    std::vector<std::thread> workers;
+    for (size_t i = 0; i < 8; ++i) {
+        workers.emplace_back([&] {
+            std::vector<UC::Detail::TaskHandle> handles;
+            for (size_t j = 0; j < 256; ++j) {
+                auto task = j % 2 == 0 ? breaker.Load({}) : breaker.Dump({});
+                EXPECT_TRUE(task);
+                if (task) { handles.push_back(task.Value()); }
+            }
+            ready.fetch_add(1);
+            while (ready.load() != 8) { std::this_thread::yield(); }
+            for (auto handle : handles) {
+                EXPECT_TRUE(breaker.Check(handle).Value());
+                EXPECT_TRUE(breaker.Check(handle).Value());
+                EXPECT_TRUE(breaker.Wait(handle).Success());
+            }
+        });
+    }
+    for (auto& worker : workers) { worker.join(); }
+    EXPECT_TRUE(breaker.Enabled());
+    EXPECT_CALL(store, Load(testing::_)).WillOnce(Return(2049));
+    EXPECT_CALL(store, Wait(2049)).WillOnce(Return(Status::Error()));
+    ASSERT_EQ(breaker.Load({}).Value(), 2049);
+    EXPECT_EQ(breaker.Wait(2049), Status::StoreUnhealthy());
+    EXPECT_FALSE(breaker.Enabled());
 }
 
 }  // namespace UC::Test

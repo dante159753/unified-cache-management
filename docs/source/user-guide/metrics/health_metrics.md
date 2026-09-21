@@ -23,18 +23,79 @@ The probe therefore validates the actual I/O path rather than only checking whet
 
 A Mooncake health probe uses a dedicated temporary key to perform a small Put, Get, content verification, and Remove sequence. The probe fails when the client is unavailable, an operation fails, or the returned content does not match.
 
+### 1.3 Passive detection and recovery
+
+Active probes and passive I/O results use independent windows. Active detection
+retains eight probes and trips after two failures by default. Passive detection
+uses 60 one-second buckets and trips when the window contains at least 10 eligible
+results and total failures / total results is strictly greater than 1%.
+Passive detection is enabled only
+for Posix and Mooncake during Pipeline assembly. Cache and other stages do not
+participate in passive detection.
+
+Accepted tasks count once at their first `Wait`. `Load` / `Dump` submission results,
+`Check` polling, and active probe I/O are excluded from passive statistics and
+failure metrics. `NotFound`,
+`StoreUnhealthy`, `InvalidParam`, `DuplicateKey`, and `Unsupported` enter
+neither numerator nor denominator. Other failures, including `Retry`, count as
+failed tasks. Buckets use the time a result is observed,
+not when its task was submitted. Recovery clears passive history and excludes
+results from a `Wait` or probe that spans a breaker state transition. Tasks are
+not tracked at submission; a `Wait` started after recovery belongs to the current
+window.
+
+Bucket counters atomically update their timestamp and count. Bucket reuse needs
+no rotation lock and ignores older updates. Recovery resets can still overlap
+in-flight updates, so counts near recovery are approximate.
+
+With passive detection enabled, eligible failed `Wait` results become
+`StoreUnhealthy` after local accounting, even below the trip threshold. The
+returned message includes the original status. An outer breaker excludes this
+status if intermediate stores preserve it.
+
+Only active probes restore service: a fresh full success window is required,
+and the restoring probe must start after cooldown. First cooldown is 60 seconds.
+A trip within 3600 seconds of recovery doubles the previous cooldown, capped at
+3600 seconds; longer healthy uptime resets it to the initial duration. Failures
+while blocked do not extend the current cooldown.
+
+Configure under `ucm_connector_config.store_health`:
+
+```yaml
+passive_enabled: true
+passive_window_s: 60
+passive_min_samples: 10
+passive_failure_ratio: 0.01
+initial_cooldown_s: 60
+max_cooldown_s: 3600
+backoff_factor: 2
+stable_reset_after_s: 3600
+```
+
 ## 2. Health Metrics
 
-The default configuration contains six health metrics:
+The background thread logs `Store passive health window` on each active probe
+cycle (default 10 seconds) only when the live passive window has failures, even
+below the minimum sample count. The log includes the stage, window duration,
+eligible result count, failures, failure ratio, minimum samples, and threshold.
+Expired buckets are excluded even without new I/O. Recovery clears the window.
+
+The default configuration contains eight health metrics:
 
 | Metric | Type | Meaning | Update |
 | --- | --- | --- | --- |
 | `ucm:posix_healthy_count_total` | Counter | Successful Posix health probes | Incremented by 1 after a successful Posix probe |
 | `ucm:posix_unhealthy_count_total` | Counter | Failed or timed-out Posix health probes | Incremented by 1 after a failed Posix probe |
-| `ucm:posix_store_health` | Gauge | Effective Posix circuit-breaker state: 1 is available and 0 is fused | Updated at startup and after every Posix probe |
+| `ucm:posix_store_health` | Gauge | Effective Posix circuit-breaker state: 1 is available and 0 is fused | Updated at startup, after probes, and on passive trips |
+| `ucm:posix_passive_failures_total` | Counter | Eligible failed Posix I/O tasks | Incremented once per observed task failure |
 | `ucm:mooncake_healthy_count_total` | Counter | Successful Mooncake health probes | Incremented by 1 after a successful Mooncake probe |
 | `ucm:mooncake_unhealthy_count_total` | Counter | Failed or timed-out Mooncake health probes | Incremented by 1 after a failed Mooncake probe |
-| `ucm:mooncake_store_health` | Gauge | Effective Mooncake circuit-breaker state: 1 is available and 0 is fused | Updated at startup and after every Mooncake probe |
+| `ucm:mooncake_store_health` | Gauge | Effective Mooncake circuit-breaker state: 1 is available and 0 is fused | Updated at startup, after probes, and on passive trips |
+| `ucm:mooncake_passive_failures_total` | Counter | Eligible failed Mooncake I/O tasks | Incremented once per observed task failure |
+
+Passive counters include late failures from older tasks, even when those results
+are excluded from the current breaker window. They are separate from active
+probe counters and do not represent the current window's failure count.
 
 Use the Gauge to determine whether a Store is currently fused. Use both the success and failure Counters to analyze probe quality over time. There is currently no dedicated Counter for fuse or recovery transitions.
 

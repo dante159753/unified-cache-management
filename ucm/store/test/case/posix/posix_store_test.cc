@@ -30,11 +30,14 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <sys/syscall.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 #include "detail/data_generator.h"
 #include "detail/path_base.h"
 #include "detail/types_helper.h"
+#include "health_breaker_store.h"
 #include "metrics_api.h"
 
 class UCPosixStoreTest : public UC::Test::Detail::PathBase {};
@@ -365,6 +368,49 @@ TEST_F(UCPosixStoreTest, AioMissingLoadReturnsNotFound)
     auto handle = store.Load(MakeDumpDesc("AioMissingLoad", block, buffer.get()));
     ASSERT_TRUE(handle.HasValue());
     EXPECT_EQ(store.Wait(handle.Value()), UC::Status::NotFound());
+}
+
+TEST_F(UCPosixStoreTest, PassiveBreakerHandlesMissingLoadIoFailureAndRecovery)
+{
+    using namespace UC::PosixStore;
+    PosixStore store;
+    ASSERT_EQ(store.Setup(MakeAioConfig(Path(), 1000)), UC::Status::OK());
+    UC::PipelineStore::StoreHealthConfig config;
+    config.passiveMinSamples = 1;
+    config.healthWindowSize = 1;
+    config.failureThreshold = 1;
+    config.initialCooldown = std::chrono::milliseconds(0);
+    UC::PipelineStore::HealthBreakerStore breaker;
+    ASSERT_EQ(breaker.Setup(&store, "pipeline/0:PosixStore", config), UC::Status::OK());
+
+    auto block = UC::Test::Detail::TypesHelper::MakeBlockIdRandomly();
+    auto buffer = MakeAlignedBuffer(42);
+    ASSERT_NE(buffer, nullptr);
+    auto missing = breaker.Load(MakeDumpDesc("MissingLoad", block, buffer.get()));
+    ASSERT_TRUE(missing);
+    EXPECT_EQ(breaker.Wait(missing.Value()), UC::Status::NotFound());
+    EXPECT_TRUE(breaker.Enabled());
+
+    {
+        struct ClearHook {
+            ~ClearHook() { TestHooks::ClearOpenHook(); }
+        } cleanup;
+        TestHooks::SetOpenHook([](const std::string&, int32_t, mode_t) {
+            errno = EIO;
+            return -1;
+        });
+        auto failed = breaker.Dump(MakeDumpDesc("FailedDump", block, buffer.get()));
+        ASSERT_TRUE(failed);
+        EXPECT_TRUE(breaker.Wait(failed.Value()).Failure());
+        EXPECT_FALSE(breaker.Enabled());
+        EXPECT_EQ(breaker.Dump({}).Error(), UC::Status::StoreUnhealthy());
+    }
+    ASSERT_EQ(breaker.CheckHealth(), UC::Status::OK());
+    EXPECT_TRUE(breaker.Enabled());
+    auto recovered = breaker.Dump(MakeDumpDesc("RecoveredDump", block, buffer.get()));
+    ASSERT_TRUE(recovered);
+    EXPECT_EQ(breaker.Wait(recovered.Value()), UC::Status::OK());
+    EXPECT_TRUE(breaker.Enabled());
 }
 
 TEST_F(UCPosixStoreTest, PsyncTruncatedLoadReturnsNotFound)
@@ -698,3 +744,96 @@ TEST_F(UCPosixStoreTest, AioTimedOutMultiShardDumpDoesNotCommitAfterLateOpen)
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
 }
+
+class UCPosixPassiveHealthTest : public UCPosixStoreTest,
+                                 public testing::WithParamInterface<bool> {};
+
+TEST_P(UCPosixPassiveHealthTest, HealthyProbesCannotPreventRepeatedPassiveTrips)
+{
+    using namespace UC::PosixStore;
+    using namespace std::chrono_literals;
+    const bool load = GetParam();
+    PosixStore store;
+    auto ioConfig = MakeAioConfig(Path(), 3000);
+    ioConfig.Set("io_direct", true);
+    ASSERT_EQ(store.Setup(ioConfig), UC::Status::OK());
+    UC::PipelineStore::StoreHealthConfig config;
+    config.initialCooldown = 100ms;
+    config.maxCooldown = 800ms;
+    UC::PipelineStore::HealthBreakerStore breaker;
+    ASSERT_EQ(breaker.Setup(&store, "pipeline/0:PosixStore", config), UC::Status::OK());
+
+    auto block = UC::Test::Detail::TypesHelper::MakeBlockIdRandomly();
+    auto source = MakeAlignedBuffer(42);
+    auto target = MakeAlignedBuffer(0);
+    ASSERT_NE(source, nullptr);
+    ASSERT_NE(target, nullptr);
+    auto seed = store.Dump(MakeDumpDesc("Seed", block, source.get()));
+    ASSERT_TRUE(seed);
+    ASSERT_EQ(store.Wait(seed.Value()), UC::Status::OK());
+    ASSERT_EQ(breaker.CheckHealth(), UC::Status::OK());
+
+    std::atomic<size_t> injected{0};
+    ScopedAioHooks hooks;
+    TestHooks::SetAioSubmitHook([&](aio_context_t ctx, int64_t nr, iocb** ios) {
+        const auto opcode = load ? IOCB_CMD_PREAD : IOCB_CMD_PWRITE;
+        if (nr > 0 && ios[0]->aio_lio_opcode == opcode) {
+            injected.fetch_add(1);
+            errno = EIO;
+            return int32_t{-1};
+        }
+        return static_cast<int32_t>(syscall(SYS_io_submit, ctx, nr, ios));
+    });
+
+    size_t probes = 1;
+    auto cooldown = config.initialCooldown;
+    for (size_t cycle = 0; cycle < 6; ++cycle) {
+        for (size_t i = 0; i < config.passiveMinSamples; ++i) {
+            auto task = load ? breaker.Load(MakeDumpDesc("FaultLoad", block, target.get()))
+                             : breaker.Dump(MakeDumpDesc("FaultDump", block, source.get()));
+            ASSERT_TRUE(task);
+            EXPECT_TRUE(breaker.Check(task.Value()));
+            ASSERT_EQ(breaker.Wait(task.Value()), UC::Status::StoreUnhealthy());
+            ASSERT_EQ(breaker.Enabled(), i + 1 < config.passiveMinSamples);
+            if (breaker.Enabled()) {
+                ASSERT_EQ(breaker.CheckHealth(), UC::Status::OK());
+                ++probes;
+            }
+        }
+        const auto unhealthyAt = std::chrono::steady_clock::now();
+        const auto deadline = unhealthyAt + cooldown + 5s;
+        auto recoveringProbeStarted = unhealthyAt;
+        while (!breaker.Enabled() && std::chrono::steady_clock::now() < deadline) {
+            EXPECT_EQ(breaker.Load({}).Error(), UC::Status::StoreUnhealthy());
+            EXPECT_EQ(breaker.Dump({}).Error(), UC::Status::StoreUnhealthy());
+            recoveringProbeStarted = std::chrono::steady_clock::now();
+            ASSERT_EQ(breaker.CheckHealth(), UC::Status::OK());
+            ++probes;
+            EXPECT_EQ(breaker.FailureCount(), 0);
+            if (!breaker.Enabled()) { std::this_thread::sleep_for(5ms); }
+        }
+        ASSERT_TRUE(breaker.Enabled());
+        EXPECT_GE(recoveringProbeStarted - unhealthyAt, cooldown - 20ms);
+        UC_INFO_UNLIMITED(
+            "Passive I/O regression: operation={}, cycle={}, injected={}, healthy_probes={}, "
+            "probe_failures=0, cooldown_ms={}, recovery_ms={}.",
+            load ? "load" : "dump", cycle + 1, injected.load(), probes, cooldown.count(),
+            std::chrono::duration_cast<std::chrono::milliseconds>(recoveringProbeStarted -
+                                                                  unhealthyAt)
+                .count());
+        cooldown = std::min(cooldown * 2, config.maxCooldown);
+    }
+    EXPECT_EQ(injected.load(), 6 * config.passiveMinSamples);
+    TestHooks::ClearAioHooks();
+    auto recovered = load ? breaker.Load(MakeDumpDesc("RecoveredLoad", block, target.get()))
+                          : breaker.Dump(MakeDumpDesc("RecoveredDump", block, source.get()));
+    ASSERT_TRUE(recovered);
+    EXPECT_EQ(breaker.Wait(recovered.Value()), UC::Status::OK());
+    EXPECT_TRUE(breaker.Enabled());
+    if (load) { EXPECT_EQ(std::memcmp(source.get(), target.get(), AIO_TEST_DATA_SIZE), 0); }
+}
+
+INSTANTIATE_TEST_SUITE_P(RealAio, UCPosixPassiveHealthTest, testing::Values(true, false),
+                         [](const testing::TestParamInfo<bool>& param) {
+                             return param.param ? "Load" : "Dump";
+                         });
