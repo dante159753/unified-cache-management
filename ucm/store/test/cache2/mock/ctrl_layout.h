@@ -23,42 +23,30 @@
  * */
 #pragma once
 
+#include <atomic>
 #include <cstddef>
-#include <cstdint>
-#include <memory>
-#include "ctrl_layout.h"
-
-namespace UC::Trans {
-class HalHostBuffers;
-}
+#include <gmock/gmock.h>
+#include <limits>
+#include "status/status.h"
 
 namespace UC::Cache2 {
 
-class DataStrategy {
-    size_t slotSize_{};
-    size_t nSlotsPerRank_{};
-#if UCM_RUNTIME_ASCEND_HAL
-    std::unique_ptr<Trans::HalHostBuffers> hostBuffers_;
-#endif
-
-    void LocalSetup(int32_t deviceId, size_t dataBytes, size_t nRanks, size_t rank);
-    void CrossRankSetup(CtrlLayout& ctrl, size_t timeoutMs);
-
+class CtrlLayout {
 public:
-    DataStrategy();
-    ~DataStrategy();
-    DataStrategy(const DataStrategy&) = delete;
-    DataStrategy& operator=(const DataStrategy&) = delete;
+    struct RankDataDesc {
+        std::atomic<size_t> handle{std::numeric_limits<size_t>::max()};
+        RankDataDesc() = default;
+        RankDataDesc(const RankDataDesc& other) : handle(other.handle.load()) {}
+        RankDataDesc& operator=(const RankDataDesc& other)
+        {
+            handle.store(other.handle.load());
+            return *this;
+        }
+    };
 
-    // Throws on failure after releasing resources acquired by this call.
-    // All peer handles share timeoutMs; zero allows one read attempt per peer.
-    void Setup(CtrlLayout& ctrl, int32_t deviceId, size_t slotSize, size_t nSlotsPerRank,
-               size_t rank, size_t timeoutMs = 1800 * 1000);
-
-    // Only locally allocated slots have a CPU/IO-accessible address.
-    void* DataAt(size_t slotIdx);
-    // Only peer slots have a Device mapping; local slots use DataAt with H2D/D2H.
-    void* DeviceDataAt(size_t slotIdx);
+    MOCK_METHOD(size_t, SlotCount, (), (const));
+    MOCK_METHOD(Status, SetRankDesc, (size_t rank, const RankDataDesc& desc));
+    MOCK_METHOD(Expected<RankDataDesc>, GetRankDesc, (size_t rank), (const));
 };
 
 }  // namespace UC::Cache2

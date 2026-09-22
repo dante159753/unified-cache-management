@@ -1,5 +1,6 @@
 if(BUILD_UNIT_TESTS)
     include(GoogleTest)
+    add_subdirectory(cache2)
     file(GLOB_RECURSE UCMSTORE_TEST_SOURCE_FILES "./case/*.cc")
     if(NOT BUILD_UCM_ASU)
         list(FILTER UCMSTORE_TEST_SOURCE_FILES EXCLUDE REGEX ".*[/\\\\]asu[/\\\\].*")
