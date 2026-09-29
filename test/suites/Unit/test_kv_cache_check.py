@@ -142,14 +142,54 @@ def test_corrupt_load_logs_block_and_both_md5_values(transfer, caplog):
     manager.submit_dump(store, {}, [block_id], [5], source, 0)
     original = kv[0].view(torch.uint8).numpy().tobytes()
     store.corrupt = True
-    task = manager.submit_load(store, {}, [block_id], [5], destination)
+    task = manager.submit_load(
+        store, {"load-request": [b"rank-zero-block"]}, [block_id], [5], destination
+    )
     assert "MD5 mismatch" not in caplog.text
     manager.wait_load(task)
     assert block_id.hex() in caplog.text
     assert "shard_index=5" in caplog.text
+    assert "request_ids=['load-request']" in caplog.text
     assert f"expected_md5={hashlib.md5(original).hexdigest()}" in caplog.text
     changed = bytes([original[0] ^ 1]) + original[1:]
     assert f"actual_md5={hashlib.md5(changed).hexdigest()}" in caplog.text
+
+
+def test_shared_block_loads_keep_their_request_ids_until_completion(transfer, caplog):
+    kv, _, manager, store = transfer
+    block_id = b"shared-block"
+    source = np.array([[kv[0].data_ptr()]], dtype=np.uint64)
+    manager.submit_dump(store, {"dump-request": {block_id}}, [block_id], [2], source, 0)
+    requests = {"first-load": [block_id]}
+    first_task = manager.submit_load(
+        store,
+        requests,
+        [block_id],
+        [2],
+        np.array([[kv[1].data_ptr()]], dtype=np.uint64),
+    )
+    requests.clear()
+    requests["second-load"] = [block_id]
+    second_task = manager.submit_load(
+        store,
+        requests,
+        [block_id],
+        [2],
+        np.array([[kv[2].data_ptr()]], dtype=np.uint64),
+    )
+    requests.clear()
+
+    store.corrupt = True
+    manager.wait_load(second_task)
+    store.corrupt = False
+    manager.wait_load(first_task)
+    errors = [
+        record.message for record in caplog.records if "MD5 mismatch" in record.message
+    ]
+    assert len(errors) == 1
+    assert "request_ids=['second-load']" in errors[0]
+    assert "first-load" not in errors[0]
+    assert "dump-request" not in errors[0]
 
 
 def test_unknown_blocks_skip_hbm_checksum(transfer, caplog):
@@ -175,7 +215,11 @@ def test_store_and_shard_records_are_independent(transfer, caplog):
     ):
         ptrs = np.array([[kv[index].data_ptr()]], dtype=np.uint64)
         checker.record_dump(target_store, [block_id], [shard], ptrs)
-        checks.extend(checker.prepare_load(target_store, [block_id], [shard], ptrs))
+        checks.extend(
+            checker.prepare_load(
+                target_store, [block_id], [shard], ptrs, request_ids=("load-request",)
+            )
+        )
     checker.verify_load(checks)
     assert "MD5 mismatch" not in caplog.text
     kv[1, 0] = -1
@@ -199,7 +243,9 @@ def test_offsets_multiple_tensors_and_null_slots_hash_only_transferred_bytes(
         dtype=np.uint64,
     )
     checker.record_dump(store, [b"e" * 16], [3], ptrs)
-    checks = checker.prepare_load(store, [b"e" * 16], [3], ptrs)
+    checks = checker.prepare_load(
+        store, [b"e" * 16], [3], ptrs, request_ids=("load-request",)
+    )
     expected = bytes(range(12, 16)) + bytes(range(75, 81))
     assert checks[0].expected_md5 == hashlib.md5(expected).hexdigest()
     backing[11] = 255
@@ -241,10 +287,16 @@ def test_load_keeps_expected_digest_when_later_dump_replaces_record(transfer, ca
     first = np.array([[kv[0].data_ptr()]], dtype=np.uint64)
     second = np.array([[kv[1].data_ptr()]], dtype=np.uint64)
     checker.record_dump(store, [block_id], [0], first)
-    checks = checker.prepare_load(store, [block_id], [0], first)
+    checks = checker.prepare_load(
+        store, [block_id], [0], first, request_ids=("first-load",)
+    )
     checker.record_dump(store, [block_id], [0], second)
     checker.verify_load(checks)
-    checker.verify_load(checker.prepare_load(store, [block_id], [0], second))
+    checker.verify_load(
+        checker.prepare_load(
+            store, [block_id], [0], second, request_ids=("second-load",)
+        )
+    )
     assert "MD5 mismatch" not in caplog.text
 
 

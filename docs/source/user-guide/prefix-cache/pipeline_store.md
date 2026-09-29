@@ -173,8 +173,9 @@ Top-level parameters (outside `ucm_connector_config`):
   records an MD5 for each UCM block and shard, separately for each Store.
   After a successful load wait, compares the destination HBM bytes with the
   worker's locally recorded digest. Unknown blocks are skipped; mismatches log
-  `ucm_block_id`, `shard_index`, `store`, `expected_md5`, and `actual_md5` without
-  triggering recomputation. Records are kept in worker memory until restart,
+  `ucm_block_id`, `shard_index`, `store`, `request_ids`, `expected_md5`, and
+  `actual_md5` without triggering recomputation. `request_ids` identifies the
+  requests associated with the load task. Records are kept in worker memory until restart,
   and grow with the number of dumped blocks. The check copies transferred tensor
   bytes to CPU and synchronizes execution, so it is intended for debugging only.
   It checks byte-preserving transfers, not equivalence after lossy compression.

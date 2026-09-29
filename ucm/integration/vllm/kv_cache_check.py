@@ -24,6 +24,7 @@ class KVCacheLoadCheck:
     ptrs: tuple[int, ...]
     tensor_sizes: tuple[int, ...]
     expected_md5: str
+    request_ids: tuple[str, ...]
 
 
 class KVCacheCheck:
@@ -100,8 +101,10 @@ class KVCacheCheck:
         block_ids: list[bytes],
         shard_indices: list[int],
         ptrs: np.ndarray,
+        *,
+        request_ids: tuple[str, ...],
     ) -> list[KVCacheLoadCheck]:
-        """Snapshot known dump digests and destination addresses without reading HBM."""
+        """Snapshot dump digests, destinations and load task request IDs."""
         checks = []
         tensor_sizes = tuple(int(size) for size in store.config["tensor_size_list"])
         store_name = str(store.config.get("unique_id", type(store).__name__))
@@ -118,6 +121,7 @@ class KVCacheCheck:
                         tuple(int(ptr) for ptr in row),
                         tensor_sizes,
                         expected_md5,
+                        request_ids,
                     )
                 )
         return checks
@@ -129,10 +133,11 @@ class KVCacheCheck:
             if actual_md5 != check.expected_md5:
                 logger.error(
                     "KV cache MD5 mismatch: ucm_block_id=%s shard_index=%d "
-                    "store=%s expected_md5=%s actual_md5=%s",
+                    "store=%s request_ids=%s expected_md5=%s actual_md5=%s",
                     check.block_id.hex(),
                     check.shard_index,
                     check.store_name,
+                    list(check.request_ids),
                     check.expected_md5,
                     actual_md5,
                 )

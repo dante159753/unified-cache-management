@@ -173,7 +173,13 @@ class RankConsistencyManager:
             else {}
         )
         checks = (
-            self.kv_cache_check.prepare_load(store, block_ids, shard_indices, ptrs)
+            self.kv_cache_check.prepare_load(
+                store,
+                block_ids,
+                shard_indices,
+                ptrs,
+                request_ids=tuple(block_ids_by_request),
+            )
             if self.kv_cache_check is not None
             else []
         )

@@ -44,7 +44,7 @@ For vLLM, enable worker-local HBM content checks in the UCM YAML configuration:
 enable_kv_cache_check: true
 ```
 
-The connector records an MD5 of the actual HBM bytes before submitting each dump. After a successful load finishes, it compares the destination HBM bytes with an earlier record for the same UCM block ID, store and shard. Unknown blocks are skipped. A mismatch logs `ucm_block_id`, `shard_index`, `store`, `expected_md5` and `actual_md5`; it does not fail the request or trigger recomputation.
+The connector records an MD5 of the actual HBM bytes before submitting each dump. After a successful load finishes, it compares the destination HBM bytes with an earlier record for the same UCM block ID, store and shard. Unknown blocks are skipped. A mismatch logs `ucm_block_id`, `shard_index`, `store`, `request_ids`, `expected_md5` and `actual_md5`; it does not fail the request or trigger recomputation. `request_ids` identifies the requests associated with the load task, rather than the earlier dump.
 
 Records live only in the current worker and are lost on restart, so use this check with dump and external reload in the same worker. A block served entirely from engine memory does not exercise the load check. Record memory grows with the number of dumped blocks. This option defaults to `false`: enabling it adds synchronous HBM-to-CPU copies and hashing overhead. It checks byte-preserving transfers; lossy compression can intentionally change the checksum.
 
