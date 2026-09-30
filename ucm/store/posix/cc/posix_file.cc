@@ -58,8 +58,10 @@ Status PosixFile::RmDir()
 
 Status PosixFile::Rename(const std::string& newName)
 {
+    IoTraceSpan span(trace_, IoTraceOp::RENAME);
     auto ret = rename(path_.c_str(), newName.c_str());
     auto eno = errno;
+    span.Finish(ret, ret < 0 ? eno : 0);
     if (ret != 0) [[unlikely]] {
         if (eno == ENOENT) { return Status::NotFound(); }
         return Status::OsApiError(std::to_string(eno));
@@ -80,8 +82,10 @@ Status PosixFile::Access(const int32_t mode)
 
 Status PosixFile::Open(const uint32_t flags)
 {
+    IoTraceSpan span(trace_, IoTraceOp::OPEN);
     handle_ = open(path_.c_str(), flags, NewFilePerm);
     auto eno = errno;
+    span.Finish(handle_, handle_ < 0 ? eno : 0);
     if (handle_ < 0) [[unlikely]] {
         if (eno == EEXIST) { return Status::DuplicateKey(); }
         if (eno == ENOENT) { return Status::NotFound(); }
@@ -92,20 +96,23 @@ Status PosixFile::Open(const uint32_t flags)
 
 void PosixFile::Close()
 {
-    close(handle_);
+    CloseTraced(handle_, trace_);
     handle_ = -1;
 }
 
 Status PosixFile::Remove()
 {
+    IoTraceSpan span(trace_, IoTraceOp::REMOVE);
     auto ret = remove(path_.c_str());
     auto eno = errno;
+    span.Finish(ret, ret < 0 ? eno : 0);
     if (ret == 0 || eno == ENOENT) { return Status::OK(); }
     return Status::OsApiError(std::to_string(eno));
 }
 
 Status PosixFile::Read(void* buffer, size_t size, off64_t offset)
 {
+    IoTraceSpan span(trace_, IoTraceOp::READ, offset, size);
     ssize_t nBytes = -1;
     if (offset != -1) {
         nBytes = pread(handle_, buffer, size, offset);
@@ -113,6 +120,7 @@ Status PosixFile::Read(void* buffer, size_t size, off64_t offset)
         nBytes = read(handle_, buffer, size);
     }
     auto eno = errno;
+    span.Finish(nBytes, nBytes < 0 ? eno : 0);
     if (nBytes < 0) [[unlikely]] { return Status::OsApiError(std::to_string(eno)); }
     if (nBytes != static_cast<ssize_t>(size)) [[unlikely]] { return Status::NotFound(); }
     return Status::OK();
@@ -120,6 +128,7 @@ Status PosixFile::Read(void* buffer, size_t size, off64_t offset)
 
 Status PosixFile::Write(const void* buffer, size_t size, off64_t offset)
 {
+    IoTraceSpan span(trace_, IoTraceOp::WRITE, offset, size);
     ssize_t nBytes = -1;
     if (offset != -1) {
         nBytes = pwrite(handle_, buffer, size, offset);
@@ -127,6 +136,7 @@ Status PosixFile::Write(const void* buffer, size_t size, off64_t offset)
         nBytes = write(handle_, buffer, size);
     }
     auto eno = errno;
+    span.Finish(nBytes, nBytes < 0 ? eno : 0);
     if (nBytes != static_cast<ssize_t>(size)) [[unlikely]] {
         return Status::OsApiError(std::to_string(eno));
     }
@@ -135,8 +145,10 @@ Status PosixFile::Write(const void* buffer, size_t size, off64_t offset)
 
 Status PosixFile::Sync()
 {
+    IoTraceSpan span(trace_, IoTraceOp::SYNC);
     auto ret = fsync(handle_);
     auto eno = errno;
+    span.Finish(ret, ret < 0 ? eno : 0);
     if (ret != 0) [[unlikely]] { return Status::OsApiError(std::to_string(eno)); }
     return Status::OK();
 }

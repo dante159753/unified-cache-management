@@ -97,13 +97,14 @@ private:
         static UC::Metrics::CachedMetric ioErrors{"posix_io_errors_total"};
         UC::Metrics::UpdateStats(ioErrors, 1.0);
     }
-    void CommitBlock(Detail::BlockId id, bool success)
+    void CommitBlock(Detail::BlockId id, bool success, uint64_t taskId)
     {
-        blockOperator_.Submit(BlockOperator::CommitTask{std::move(id), success});
+        blockOperator_.Submit(BlockOperator::CommitTask{std::move(id), success, taskId});
     }
     template <bool dump>
     void OnIoCallback(const TaskPtr& task, WaiterPtr w, int32_t fd, bool last,
-                      const Detail::BlockId& id, const AioImpl::Result& result)
+                      const Detail::BlockId& id, const IoTraceContext& trace,
+                      const AioImpl::Result& result)
     {
         const auto tid = task->id;
         const auto shortIo = result.error == 0 && result.nBytes != static_cast<ssize_t>(shardSize_);
@@ -114,9 +115,9 @@ private:
             task->Fail(!dump && shortIo ? Status::NotFound() : Status::Error());
             failureSet_.Insert(tid);
         }
-        ::close(fd);
+        CloseTraced(fd, trace);
         if constexpr (dump) {
-            if (last) { CommitBlock(id, !failureSet_.Contains(tid)); }
+            if (last) { CommitBlock(id, !failureSet_.Contains(tid), tid); }
         }
         w->Done();
     }
@@ -127,12 +128,13 @@ private:
         const auto tid = task->id;
         const auto last = shard.index + 1 == nShardPerBlock_;
         const auto& id = shard.owner;
-        auto handleFailure = [this, task, tid, w, last, id](int32_t fd, Status status) {
+        const auto trace = layout_->TraceContext(id, tid, shard.index, dump ? TRACE_TMP : 0);
+        auto handleFailure = [this, task, tid, w, last, id, trace](int32_t fd, Status status) {
             task->Fail(status);
             failureSet_.Insert(tid);
-            if (fd >= 0) { ::close(fd); }
+            if (fd >= 0) { CloseTraced(fd, trace); }
             if constexpr (dump) {
-                if (last) { CommitBlock(id, false); }
+                if (last) { CommitBlock(id, false, tid); }
             }
             w->Done();
         };
@@ -144,9 +146,9 @@ private:
             return;
         }
         if (failureSet_.Contains(tid)) {
-            if (result.fd >= 0) { ::close(result.fd); }
+            if (result.fd >= 0) { CloseTraced(result.fd, trace); }
             if constexpr (dump) {
-                if (last) { CommitBlock(id, false); }
+                if (last) { CommitBlock(id, false, tid); }
             }
             w->Done();
             return;
@@ -157,8 +159,10 @@ private:
         io.length = shardSize_;
         io.buffer = shard.addrs.front();
         io.tag = tid;
-        io.callback = [this, task, w, fd = result.fd, last, id](AioImpl::Result ioResult) {
-            OnIoCallback<dump>(task, w, fd, last, id, ioResult);
+        io.trace = trace;
+        io.trace.flags |= TRACE_ASYNC;
+        io.callback = [this, task, w, fd = result.fd, last, id, trace](AioImpl::Result ioResult) {
+            OnIoCallback<dump>(task, w, fd, last, id, trace, ioResult);
         };
         auto status = dump ? aio_.WriteAsync(std::move(io)) : aio_.ReadAsync(std::move(io));
         if (status.Failure()) {
@@ -184,6 +188,7 @@ private:
             task.activated = dump;
             task.flags = flags;
             task.tag = t->id;
+            task.shard = shard.index;
             task.callback = [this, t, w, i](BlockOperator::OpenResult result) {
                 OnOpenCallback<dump>(t, w, t->desc[i], result);
             };
@@ -284,6 +289,7 @@ private:
     {
         auto pending = w ? w->Pending() : 0;
         UC_WARN("AIO task({}) force-completing; pending latch count before abort={}.", id, pending);
+        IoTraceSpan(layout_->TraceContext({}, id), IoTraceOp::TIMEOUT).Finish(-1, ETIMEDOUT);
         failureSet_.Insert(id);
         aio_.CancelTask(id);
         blockOperator_.CancelQueued(id);

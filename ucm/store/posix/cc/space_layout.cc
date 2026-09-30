@@ -78,6 +78,10 @@ Status SpaceLayout::Setup(const Config& config)
         if ((status = AddStorageBackend(path)).Failure()) { return status; }
     }
     shards_ = RelativeRoots();
+    if (config.ioTraceEnable) {
+        trace_ = std::make_unique<IoTrace>();
+        return trace_->Setup(config, storageBackends_);
+    }
     return status;
 }
 
@@ -106,21 +110,31 @@ std::string SpaceLayout::DataFilePath(const std::string& backend, const Detail::
     return fmt::format("{}{}/{}{}", backend, shard, file, ACTIVATED_FILE_EXTENSION);
 }
 
-Status SpaceLayout::CommitFile(const Detail::BlockId& blockId, bool success) const
+IoTraceContext SpaceLayout::TraceContext(const Detail::BlockId& blockId, uint64_t taskId,
+                                         uint64_t shard, uint16_t flags) const
+{
+    if (!trace_) { return {}; }
+    const auto backend = Detail::BlockIdHasher{}(blockId) % storageBackends_.size();
+    return {trace_.get(), blockId, taskId, shard, static_cast<uint32_t>(backend), flags};
+}
+
+Status SpaceLayout::CommitFile(const Detail::BlockId& blockId, bool success, uint64_t taskId) const
 {
     const auto& activated = DataFilePath(blockId, true);
+    const auto trace = TraceContext(blockId, taskId, UINT64_MAX, TRACE_TMP);
     auto s = Status::OK();
     if (success) {
         const auto& archived = DataFilePath(blockId, false);
-        s = PosixFile{activated}.Rename(archived);
+        s = PosixFile{activated, trace}.Rename(archived);
     }
-    if (!success || s.Failure()) { PosixFile{activated}.Remove(); }
+    if (!success || s.Failure()) { PosixFile{activated, trace}.Remove(); }
     return s;
 }
 
 Status SpaceLayout::RemoveFile(const Detail::BlockId& blockId) const
 {
-    PosixFile{DataFilePath(blockId, false)}.Remove();
+    PosixFile{DataFilePath(blockId, false), TraceContext(blockId, 0, UINT64_MAX, TRACE_GC)}
+        .Remove();
     return Status::OK();
 }
 

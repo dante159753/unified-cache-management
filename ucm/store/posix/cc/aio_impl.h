@@ -32,6 +32,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include "io_trace.h"
 #include "status/status.h"
 
 namespace UC::PosixStore {
@@ -60,6 +61,7 @@ public:
         void* buffer;
         Callback callback;
         uint64_t tag{0};
+        IoTraceContext trace;
     };
     using SweepFn = std::function<void()>;
 
@@ -74,7 +76,7 @@ private:
     void CompletionLoop();
     void MaybeSweep();
     void HarvestCompletions(std::vector<io_event>& events);
-    Status SubmitIo(struct iocb* cb);
+    Status SubmitIo(struct iocb* cb, int32_t& error);
     void Track(uint64_t tag, struct iocb* cb);
     void Untrack(struct iocb* cb);
 

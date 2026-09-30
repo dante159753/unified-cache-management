@@ -25,6 +25,7 @@
 #define UNIFIEDCACHE_POSIX_STORE_CC_POSIX_FILE_H
 
 #include <fcntl.h>
+#include "io_trace.h"
 #include "status/status.h"
 
 namespace UC::PosixStore {
@@ -50,9 +51,13 @@ public:
 private:
     std::string path_{};
     int32_t handle_{-1};
+    IoTraceContext trace_;
 
 public:
-    explicit PosixFile(std::string path) : path_{std::move(path)} {}
+    explicit PosixFile(std::string path, IoTraceContext trace = {})
+        : path_{std::move(path)}, trace_(trace)
+    {
+    }
     ~PosixFile();
     const std::string& Path() const { return path_; }
     Status MkDir();

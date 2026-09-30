@@ -86,10 +86,12 @@ public:
         int32_t flags;
         OpenCallback callback;
         uint64_t tag{0};
+        uint64_t shard{UINT64_MAX};
     };
     struct CommitTask {
         Detail::BlockId id;
         bool success;
+        uint64_t tag{0};
     };
 
     ~BlockOperator()
@@ -149,6 +151,10 @@ public:
             UC_WARN("AIO task({}) cancelled {} queued open task(s).", tag, purged.size());
         }
         for (auto& task : purged) {
+            IoTraceSpan(layout_->TraceContext(task.id, task.tag, task.shard,
+                                              task.activated ? TRACE_TMP : 0),
+                        IoTraceOp::OPEN)
+                .Finish(-1, ECANCELED, TRACE_NOT_STARTED);
             if (task.callback) { task.callback(OpenResult{-1, ECANCELED}); }
         }
     }
@@ -172,6 +178,9 @@ private:
                 openQueue_.queue.pop_front();
             }
             const auto path = layout_->DataFilePath(task.id, task.activated);
+            IoTraceSpan span(layout_->TraceContext(task.id, task.tag, task.shard,
+                                                   task.activated ? TRACE_TMP : 0),
+                             IoTraceOp::OPEN);
 #ifdef UCM_ENABLE_TEST_HOOKS
             auto hook = TestHooks::GetOpenHook();
             auto fd = hook ? hook(path, task.flags, mode) : ::open(path.c_str(), task.flags, mode);
@@ -179,6 +188,7 @@ private:
             auto fd = ::open(path.c_str(), task.flags, mode);
 #endif
             auto err = (fd < 0) ? errno : 0;
+            span.Finish(fd, err);
             if (task.callback) { task.callback(OpenResult{fd, err}); }
         }
     }
@@ -198,7 +208,7 @@ private:
                 task = std::move(commitQueue_.queue.front());
                 commitQueue_.queue.pop_front();
             }
-            layout_->CommitFile(task.id, task.success);
+            layout_->CommitFile(task.id, task.success, task.tag);
         }
     }
 

@@ -61,6 +61,9 @@ Status TransQueue::Setup(const Config& config, TaskIdSet* failureSet, const Spac
 
 void TransQueue::OnIoUnitTimeout(IoUnit& ios)
 {
+    IoTraceSpan(layout_->TraceContext(ios.shard.owner, ios.task->id, ios.shard.index),
+                IoTraceOp::TIMEOUT)
+        .Finish(-1, ETIMEDOUT);
     UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("posix_io_timeout_total"), 1.0);
     ios.task->Fail(Status::Timeout());
     if (!failureSet_->Contains(ios.task->id)) { failureSet_->Insert(ios.task->id); }
@@ -128,7 +131,7 @@ void TransQueue::DumpWorker(IoUnit& ios)
     }
     auto s = H2S(ios);
     if (ios.shard.index + 1 == nShardPerBlock_) {
-        layout_->CommitFile(ios.shard.owner, s.Success());
+        layout_->CommitFile(ios.shard.owner, s.Success(), ios.task->id);
     }
     if (s.Failure()) [[unlikely]] {
         ios.task->Fail(s);
@@ -140,7 +143,8 @@ void TransQueue::DumpWorker(IoUnit& ios)
 Status TransQueue::H2S(IoUnit& ios)
 {
     const auto& path = layout_->DataFilePath(ios.shard.owner, true);
-    PosixFile file{path};
+    PosixFile file{
+        path, layout_->TraceContext(ios.shard.owner, ios.task->id, ios.shard.index, TRACE_TMP)};
     auto flags = PosixFile::OpenFlag::CREATE | PosixFile::OpenFlag::WRITE_ONLY;
     if (ioDirect_) { flags |= PosixFile::OpenFlag::DIRECT; }
     auto s = file.Open(flags);
@@ -165,7 +169,7 @@ Status TransQueue::H2S(IoUnit& ios)
 Status TransQueue::S2H(IoUnit& ios)
 {
     const auto& path = layout_->DataFilePath(ios.shard.owner, false);
-    PosixFile file{path};
+    PosixFile file{path, layout_->TraceContext(ios.shard.owner, ios.task->id, ios.shard.index, 0)};
     auto flags = PosixFile::OpenFlag::READ_ONLY;
     if (ioDirect_) { flags |= PosixFile::OpenFlag::DIRECT; }
     auto s = file.Open(flags);

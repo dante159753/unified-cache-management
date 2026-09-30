@@ -44,13 +44,16 @@ class PosixStore : public StoreV1 {
     bool ioDirect_{false};
     const Detail::BlockId healthBlockId_{Detail::RandomBlockId()};
 
-    Status CheckPathHealth(const std::string& path)
+    Status CheckPathHealth(const std::string& path, uint32_t backend)
     {
         alignas(kHealthIoSize) std::array<uint8_t, kHealthIoSize> expected{};
         alignas(kHealthIoSize) std::array<uint8_t, kHealthIoSize> actual{};
         expected.fill(0x5a);
 
-        PosixFile file{path};
+        auto trace = spaceMgr_.GetLayout()->TraceContext(healthBlockId_, 0, UINT64_MAX,
+                                                         TRACE_HEALTH | TRACE_TMP);
+        trace.backend = backend;
+        PosixFile file{path, trace};
         auto flags = PosixFile::OpenFlag::CREATE | PosixFile::OpenFlag::READ_WRITE;
         if (ioDirect_) { flags |= PosixFile::OpenFlag::DIRECT; }
         auto status = file.Open(flags);
@@ -129,8 +132,9 @@ public:
     Status CheckHealth() override
     {
         auto result = Status::OK();
+        uint32_t backend = 0;
         for (const auto& path : spaceMgr_.GetLayout()->HealthCheckPaths(healthBlockId_, true)) {
-            auto status = CheckPathHealth(path);
+            auto status = CheckPathHealth(path, backend++);
             if (result.Success() && status.Failure()) { result = status; }
         }
         return result;
@@ -189,6 +193,10 @@ private:
         inConfig.GetNumber("block_size", config.blockSize);
         inConfig.Get("posix_io_engine", config.ioEngine);
         inConfig.Get("io_direct", config.ioDirect);
+        inConfig.Get("posix_io_trace_enable", config.ioTraceEnable);
+        inConfig.Get("posix_io_trace_dir", config.ioTraceDir);
+        inConfig.GetNumber("posix_io_trace_buffer_mb", config.ioTraceBufferMb);
+        inConfig.GetNumber("posix_io_trace_flush_ms", config.ioTraceFlushMs);
         inConfig.Get("cpu_affinity_cores", config.cpuAffinityCores);
         inConfig.GetNumber("posix_data_trans_concurrency", config.dataTransConcurrency);
         inConfig.GetNumber("posix_lookup_concurrency", config.lookupConcurrency);

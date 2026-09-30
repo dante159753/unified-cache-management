@@ -26,6 +26,7 @@
 
 #include <ctime>
 #include "global_config.h"
+#include "io_trace.h"
 #include "status/status.h"
 #include "type/types.h"
 
@@ -38,6 +39,7 @@ struct FileInfo {
 
 class SpaceLayout {
 private:
+    std::unique_ptr<IoTrace> trace_;
     std::vector<std::string> storageBackends_;
     std::vector<std::string> shards_;
     bool dataDirShard_;
@@ -47,7 +49,9 @@ public:
     Status Setup(const Config& config);
     std::string DataFilePath(const Detail::BlockId& blockId, bool activated) const;
     std::vector<std::string> HealthCheckPaths(const Detail::BlockId& blockId, bool activated) const;
-    Status CommitFile(const Detail::BlockId& blockId, bool success) const;
+    IoTraceContext TraceContext(const Detail::BlockId& blockId, uint64_t taskId = 0,
+                                uint64_t shard = UINT64_MAX, uint16_t flags = 0) const;
+    Status CommitFile(const Detail::BlockId& blockId, bool success, uint64_t taskId = 0) const;
     Status RemoveFile(const Detail::BlockId& blockId) const;
     std::vector<std::string> SampleShards(double sampleRatio) const;
     size_t CountFilesInShard(const std::string& shard) const;

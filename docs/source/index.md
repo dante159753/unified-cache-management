@@ -64,6 +64,7 @@ user-guide/pd-disaggregation/index
 user-guide/metrics/metrics
 user-guide/rerope/rerope
 user-guide/trace_mode
+user-guide/posix_io_trace
 :::
 
 :::{toctree}

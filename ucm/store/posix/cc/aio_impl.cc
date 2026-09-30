@@ -238,12 +238,22 @@ Status AioImpl::Setup(size_t timeoutMs)
 Status AioImpl::ReadAsync(Io&& io)
 {
     auto cb = std::make_unique<struct iocb>();
-    auto data = std::make_unique<Callback>(std::move(io.callback));
+    IoTraceSpan span(io.trace, IoTraceOp::READ, io.offset, io.length);
+    auto callback = std::move(io.callback);
+    if (io.trace.trace) {
+        callback = [span, original = std::move(callback)](Result result) {
+            span.Finish(result.nBytes, result.error);
+            original(result);
+        };
+    }
+    auto data = std::make_unique<Callback>(std::move(callback));
     AioPrepareRead(cb.get(), io.fd, io.buffer, io.length, io.offset);
     cb->aio_data = (uintptr_t)(void*)data.get();
     Track(io.tag, cb.get());
-    auto status = SubmitIo(cb.get());
+    int32_t error = 0;
+    auto status = SubmitIo(cb.get(), error);
     if (status.Failure()) {
+        span.Finish(-1, error, TRACE_SUBMIT_FAILED);
         Untrack(cb.get());
         UC_ERROR("Failed({}) to submit read io.", status);
         return status;
@@ -255,12 +265,22 @@ Status AioImpl::ReadAsync(Io&& io)
 Status AioImpl::WriteAsync(Io&& io)
 {
     auto cb = std::make_unique<struct iocb>();
-    auto data = std::make_unique<Callback>(std::move(io.callback));
+    IoTraceSpan span(io.trace, IoTraceOp::WRITE, io.offset, io.length);
+    auto callback = std::move(io.callback);
+    if (io.trace.trace) {
+        callback = [span, original = std::move(callback)](Result result) {
+            span.Finish(result.nBytes, result.error);
+            original(result);
+        };
+    }
+    auto data = std::make_unique<Callback>(std::move(callback));
     AioPrepareWrite(cb.get(), io.fd, io.buffer, io.length, io.offset);
     cb->aio_data = (uintptr_t)(void*)data.get();
     Track(io.tag, cb.get());
-    auto status = SubmitIo(cb.get());
+    int32_t error = 0;
+    auto status = SubmitIo(cb.get(), error);
     if (status.Failure()) {
+        span.Finish(-1, error, TRACE_SUBMIT_FAILED);
         Untrack(cb.get());
         UC_ERROR("Failed({}) to submit write io.", status);
         return status;
@@ -394,7 +414,7 @@ void AioImpl::CancelTask(uint64_t tag)
     }
 }
 
-Status AioImpl::SubmitIo(iocb* cb)
+Status AioImpl::SubmitIo(iocb* cb, int32_t& error)
 {
     AioSetEventFd(cb, eventFd_);
     const auto deadline = NowTime::Now() + static_cast<double>(submitTimeoutMs_) / 1000.0;
@@ -406,12 +426,14 @@ Status AioImpl::SubmitIo(iocb* cb)
             if (submitTimeoutMs_ > 0 && NowTime::Now() >= deadline) {
                 UC_ERROR("io_submit EAGAIN for {}ms (in-flight queue saturated); giving up.",
                          submitTimeoutMs_);
+                error = ETIMEDOUT;
                 return Status::Timeout();
             }
             std::this_thread::sleep_for(std::chrono::microseconds(200));
             continue;
         }
-        return Status::Error(std::string(strerror(eno)));
+        error = ret < 0 ? eno : EIO;
+        return Status::Error(std::string(strerror(error)));
     }
 }
 
