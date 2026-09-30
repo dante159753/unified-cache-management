@@ -18,17 +18,17 @@ logger = init_logger(__name__)
 
 @dataclass(frozen=True)
 class KVCacheLoadCheck:
+    store: UcmKVStoreBaseV1
     block_id: bytes
     shard_index: int
     store_name: str
     ptrs: tuple[int, ...]
     tensor_sizes: tuple[int, ...]
-    expected_md5: str
     request_ids: tuple[str, ...]
 
 
 class KVCacheCheck:
-    """Keep worker-local MD5 records of the HBM bytes submitted for dumping."""
+    """Compare loaded HBM bytes with worker-local pre-dump MD5 history."""
 
     def __init__(
         self,
@@ -36,7 +36,7 @@ class KVCacheCheck:
             str, torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor]
         ],
     ) -> None:
-        self._dump_md5: dict[tuple[UcmKVStoreBaseV1, bytes, int], str] = {}
+        self._dump_md5: dict[tuple[UcmKVStoreBaseV1, bytes, int], set[str]] = {}
         self._buffers: dict[int, torch.Tensor] = {}
         tensors = list(kv_caches.values())
         while tensors:
@@ -84,16 +84,32 @@ class KVCacheCheck:
         block_ids: list[bytes],
         shard_indices: list[int],
         ptrs: np.ndarray,
+        *,
+        request_ids: tuple[str, ...],
     ) -> None:
-        """Hash the source bytes before submitting a dump, replacing older records."""
+        """Record source digests before submission, regardless of dump outcome."""
         tensor_sizes = tuple(int(size) for size in store.config["tensor_size_list"])
         for block_id, shard_index, row in zip(
             block_ids, shard_indices, ptrs, strict=True
         ):
             addresses = tuple(int(ptr) for ptr in row)
-            self._dump_md5[store, block_id, shard_index] = self._md5(
-                addresses, tensor_sizes
+            md5 = self._md5(addresses, tensor_sizes)
+            candidates = self._dump_md5.setdefault(
+                (store, block_id, shard_index), set()
             )
+            if candidates and md5 not in candidates:
+                logger.warning(
+                    "KV cache MD5 differs between dumps: ucm_block_id=%s "
+                    "shard_index=%d store=%s request_ids=%s recorded_md5=%s "
+                    "new_md5=%s; Store may retain an earlier copy after deduplication",
+                    block_id.hex(),
+                    shard_index,
+                    store.config.get("unique_id", type(store).__name__),
+                    list(request_ids),
+                    ",".join(sorted(candidates)),
+                    md5,
+                )
+            candidates.add(md5)
 
     def prepare_load(
         self,
@@ -104,23 +120,23 @@ class KVCacheCheck:
         *,
         request_ids: tuple[str, ...],
     ) -> list[KVCacheLoadCheck]:
-        """Snapshot dump digests, destinations and load task request IDs."""
+        """Snapshot destinations and request IDs for locally recorded blocks."""
         checks = []
         tensor_sizes = tuple(int(size) for size in store.config["tensor_size_list"])
         store_name = str(store.config.get("unique_id", type(store).__name__))
         for block_id, shard_index, row in zip(
             block_ids, shard_indices, ptrs, strict=True
         ):
-            expected_md5 = self._dump_md5.get((store, block_id, shard_index))
-            if expected_md5 is not None:
+            key = (store, block_id, shard_index)
+            if key in self._dump_md5:
                 checks.append(
                     KVCacheLoadCheck(
+                        store,
                         block_id,
                         shard_index,
                         store_name,
                         tuple(int(ptr) for ptr in row),
                         tensor_sizes,
-                        expected_md5,
                         request_ids,
                     )
                 )
@@ -129,8 +145,11 @@ class KVCacheCheck:
     def verify_load(self, checks: list[KVCacheLoadCheck]) -> None:
         """Read completed load destinations and log content mismatches."""
         for check in checks:
+            key = (check.store, check.block_id, check.shard_index)
+            # Include dump sources recorded while this load was in flight.
+            candidates = self._dump_md5[key]
             actual_md5 = self._md5(check.ptrs, check.tensor_sizes)
-            if actual_md5 != check.expected_md5:
+            if actual_md5 not in candidates:
                 logger.error(
                     "KV cache MD5 mismatch: ucm_block_id=%s shard_index=%d "
                     "store=%s request_ids=%s expected_md5=%s actual_md5=%s",
@@ -138,6 +157,6 @@ class KVCacheCheck:
                     check.shard_index,
                     check.store_name,
                     list(check.request_ids),
-                    check.expected_md5,
+                    ",".join(sorted(candidates)),
                     actual_md5,
                 )

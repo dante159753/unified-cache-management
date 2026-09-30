@@ -170,14 +170,25 @@ Top-level parameters (outside `ucm_connector_config`):
 
 * **enable_kv_cache_check** *(optional, default: false)*
   Debug-only HBM content checking in the vLLM connector. Before each dump,
-  records an MD5 for each UCM block and shard, separately for each Store.
-  After a successful load wait, compares the destination HBM bytes with the
-  worker's locally recorded digest. Unknown blocks are skipped; mismatches log
+  records an MD5 for each UCM block and shard, separately for each Store,
+  regardless of whether the dump succeeds. Repeated dumps retain all distinct
+  digests because a Store may deduplicate a dump and keep an earlier copy. Different source
+  bytes produce a `KV cache MD5 differs between dumps` warning with dump
+  `request_ids`, `recorded_md5` and `new_md5`.
+  After a successful load wait, compares the destination HBM bytes with these
+  candidates, including sources recorded while the load was pending. Unknown
+  blocks are skipped. Every load with a local record is checked, without waiting
+  for dump completion. An unmatched digest logs `KV cache MD5 mismatch` with
   `ucm_block_id`, `shard_index`, `store`, `request_ids`, `expected_md5`, and
   `actual_md5` without triggering recomputation. `request_ids` identifies the
-  requests associated with the load task. Records are kept in worker memory until restart,
-  and grow with the number of dumped blocks. The check copies transferred tensor
-  bytes to CPU and synchronizes execution, so it is intended for debugging only.
+  requests associated with the load task. `expected_md5` lists the candidates,
+  separated by commas. A match establishes that the bytes match a locally observed
+  pre-dump source; it does not establish a successful write or which version the
+  Store retained. Copies from earlier
+  processes or other writers may be absent from the candidates; use an isolated
+  empty namespace for diagnosis. Records are kept in worker memory until restart,
+  and grow with the number of distinct block/shard digests. The check copies
+  transferred tensor bytes to CPU and synchronizes execution, so it is intended for debugging only.
   It checks byte-preserving transfers, not equivalence after lossy compression.
 
 * **use_lite** *(optional, default: false)*  

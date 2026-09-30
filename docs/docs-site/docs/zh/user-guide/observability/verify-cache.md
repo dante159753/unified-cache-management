@@ -44,9 +44,13 @@
 enable_kv_cache_check: true
 ```
 
-Connector 在每次提交 dump 前，对实际传输的 HBM 字节计算并记录 MD5。load 成功完成后，如果当前 worker 记录过相同 UCM block ID、store 和 shard，就对目标 HBM 字节重新计算并比较；没有记录的块跳过。不一致时，日志输出 `ucm_block_id`、`shard_index`、`store`、`request_ids`、`expected_md5` 和 `actual_md5`，不会因此中断请求或触发重算。`request_ids` 表示本次 load 任务所属的请求。
+Connector 在每次提交 dump 前，对实际传输的 HBM 字节计算并立即记录 MD5，不区分 dump 成功或失败。同一 UCM block ID、store 和 shard 保留不同的历史 MD5，重复值去重，因为 Store 可能保留较早的副本。内容变化时输出 `KV cache MD5 differs between dumps`，包含此次 dump 的 `request_ids`、历史 `recorded_md5` 和本次 `new_md5`。
 
-记录只保存在当前 worker 内存中，重启后丢失，因此需要在同一 worker 内先 dump，再触发外部加载。完全命中引擎内存的请求不会触发 load 校验。记录占用的内存随已 dump 的块数量增长。此选项默认 `false`；开启后增加同步 HBM 到 CPU 的拷贝和哈希计算开销，适合排查问题。校验用于字节不变的传输；有损压缩可能使 MD5 正常发生变化。
+每次 load 成功完成后，只要本地有记录，就对目标 HBM 字节重新计算 MD5，与历史值比较，也包含 load 等待期间新记录的 dump 源。匹配任一历史值即通过，否则输出 `KV cache MD5 mismatch`，包含 `ucm_block_id`、`shard_index`、`store`、`request_ids`、`expected_md5` 和 `actual_md5`。校验不等待 dump 完成，不会因此中断请求或触发重算；没有本地记录的块跳过。这里的 `request_ids` 表示 load 任务所属请求，`expected_md5` 是以逗号分隔的历史值。
+
+匹配只证明加载内容与本 worker 某次 dump 前的 HBM 字节一致，不证明那次 dump 写入成功，也不能确认 Store 采用了哪个版本。其他进程写入或启动前已有的副本可能不在历史记录内，建议使用独立的空缓存命名空间排查。
+
+记录只保存在当前 worker 内存中，重启后丢失，因此需要在同一 worker 内先 dump，再触发外部加载。完全命中引擎内存的请求不会触发 load 校验。记录占用的内存随不同 block/shard 的 MD5 数量增长。此选项默认 `false`；开启后增加同步 HBM 到 CPU 的拷贝和哈希计算开销，适合排查问题。校验用于字节不变的传输；有损压缩可能使 MD5 正常发生变化。
 
 没有外部命中时，先检查提示词 token、模型与布局、完整块范围和实际存储命名空间；命中但加载失败时，检查后端健康、文件可见性、传输错误和资源预算。详细入口见[故障排查](../../reference/troubleshooting.md)。
 

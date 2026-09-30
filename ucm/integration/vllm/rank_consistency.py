@@ -254,7 +254,13 @@ class RankConsistencyManager:
             )
         try:
             if self.kv_cache_check is not None:
-                self.kv_cache_check.record_dump(store, block_ids, shard_indices, ptrs)
+                self.kv_cache_check.record_dump(
+                    store,
+                    block_ids,
+                    shard_indices,
+                    ptrs,
+                    request_ids=tuple(block_ids_by_request),
+                )
             task = store.dump_data(block_ids, shard_indices, ptrs, event_handle)
         except Exception:
             self._record_dump_failure(request_context)

@@ -44,9 +44,13 @@ For vLLM, enable worker-local HBM content checks in the UCM YAML configuration:
 enable_kv_cache_check: true
 ```
 
-The connector records an MD5 of the actual HBM bytes before submitting each dump. After a successful load finishes, it compares the destination HBM bytes with an earlier record for the same UCM block ID, store and shard. Unknown blocks are skipped. A mismatch logs `ucm_block_id`, `shard_index`, `store`, `request_ids`, `expected_md5` and `actual_md5`; it does not fail the request or trigger recomputation. `request_ids` identifies the requests associated with the load task, rather than the earlier dump.
+The connector hashes the actual HBM bytes before submitting each dump and records the digest immediately, regardless of whether the dump succeeds. It retains distinct digests for the same UCM block ID, store and shard because a Store may keep an earlier copy. Changed source bytes produce a `KV cache MD5 differs between dumps` warning with the dump's `request_ids`, the historical `recorded_md5` values and `new_md5`.
 
-Records live only in the current worker and are lost on restart, so use this check with dump and external reload in the same worker. A block served entirely from engine memory does not exercise the load check. Record memory grows with the number of dumped blocks. This option defaults to `false`: enabling it adds synchronous HBM-to-CPU copies and hashing overhead. It checks byte-preserving transfers; lossy compression can intentionally change the checksum.
+After every successful load, the connector compares the destination HBM bytes with its local history, including sources recorded while the load was pending. Any historical match passes; otherwise it logs `KV cache MD5 mismatch` with `ucm_block_id`, `shard_index`, `store`, `request_ids`, `expected_md5` and `actual_md5`. Checking does not wait for dump completion, fail the request or trigger recomputation. Unknown blocks are skipped. Here `request_ids` identifies the load requests, and `expected_md5` contains comma-separated historical digests.
+
+A match establishes that the bytes match a locally observed pre-dump source; it does not establish a successful write or which version the Store retained. Copies from earlier processes or other writers may be absent from the history; use an isolated empty namespace for diagnosis.
+
+Records live only in the current worker and are lost on restart, so use this check with dump and external reload in the same worker. A block served entirely from engine memory does not exercise the load check. Record memory grows with the number of distinct block/shard digests. This option defaults to `false`: enabling it adds synchronous HBM-to-CPU copies and hashing overhead. It checks byte-preserving transfers; lossy compression can intentionally change the checksum.
 
 For no external hits, check prompt tokens, model/layout compatibility, complete blocks and the actual namespace. For hits followed by failed loads, check health, visibility, transfer errors and resource budgets. Continue with [troubleshooting](../../reference/troubleshooting.md).
 
