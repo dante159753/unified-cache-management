@@ -362,7 +362,31 @@ def test_reconcile_healthy_run_with_stale_error_returns_zero(capsys, configured_
         configured_cli.run(["reconcile", "--config", str(configured_cli.config_path)])
         == 0
     )
-    assert json.loads(capsys.readouterr().out)["last_error"] == "historical failure"
+    output = json.loads(capsys.readouterr().out)
+    assert output["last_error"] == "historical failure"
+    assert output["outcome"] == {"failed": False, "error": None}
+
+
+def test_reconcile_reports_current_failure_without_mutating_state(
+    capsys, configured_cli
+):
+    result = SchedulerState(phase=Phase.WHOLE)
+    configured_cli.reconciler_factory = lambda *args: CheckpointingReconciler(
+        args[1],
+        args[5],
+        outcome=ReconcileOutcome.failed_run("GitHub HTTP 502 {}".format(TOKEN)),
+        result=result,
+    )
+    assert (
+        configured_cli.run(["reconcile", "--config", str(configured_cli.config_path)])
+        == 1
+    )
+    output = capsys.readouterr().out
+    assert TOKEN not in output
+    document = json.loads(output)
+    assert document["last_error"] is None
+    assert document["outcome"]["failed"] is True
+    assert "GitHub HTTP 502" in document["outcome"]["error"]
 
 
 def test_status_error_redacts_token_and_token_path(capsys, configured_cli):

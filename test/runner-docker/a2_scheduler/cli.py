@@ -307,7 +307,12 @@ class SchedulerCli:
             self.dependencies.clock,
         )
         result = reconciler.reconcile(self.dependencies.clock())
-        self._print_json(self._state_document(result, "reconcile"))
+        document = self._state_document(result, "reconcile")
+        document["outcome"] = {
+            "failed": reconciler.outcome.failed,
+            "error": reconciler.outcome.error,
+        }
+        self._print_json(document)
         return 1 if reconciler.outcome.failed else 0
 
     def _observe(self, command: str, config: SchedulerConfig) -> int:

@@ -1,5 +1,6 @@
 import json
 import socket
+import time
 from http.client import HTTPException
 from typing import FrozenSet, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
@@ -12,6 +13,8 @@ _API_URL = "https://api.github.com"
 _ACTIONS_PATH = "/repos/ModelEngine-Group/unified-cache-management/actions/"
 _DEFAULT_REQUIRED_LABELS = frozenset(("self-hosted", "npu", "a2"))
 _TIMEOUT_SECONDS = 30
+_MAX_REQUEST_ATTEMPTS = 3
+_RETRYABLE_HTTP_CODES = frozenset((500, 502, 503, 504))
 
 
 class GitHubUnavailable(RuntimeError):
@@ -56,7 +59,7 @@ class GitHubClient:
             jobs = []
             for run_id in sorted(run_ids):
                 for job in self._pages(
-                    "/repos/{}/actions/runs/{}/jobs?per_page=100".format(
+                    "/repos/{}/actions/runs/{}/jobs?per_page=30".format(
                         self._repository, run_id
                     ),
                     "jobs",
@@ -94,7 +97,7 @@ class GitHubClient:
             ):
                 raise ValueError("invalid GitHub response")
             items.extend(page_items)
-            url = self._next_url(link)
+            url = self._next_url(link, url)
         return items
 
     def _request_json(self, url: str) -> Tuple[dict, Optional[str]]:
@@ -107,10 +110,32 @@ class GitHubClient:
                 "X-GitHub-Api-Version": "2022-11-28",
             },
         )
-        with self._opener.open(request, timeout=_TIMEOUT_SECONDS) as response:
-            body = response.read()
-            headers = getattr(response, "headers", None)
-            link = headers.get("Link") if headers is not None else None
+        for attempt in range(1, _MAX_REQUEST_ATTEMPTS + 1):
+            try:
+                with self._opener.open(request, timeout=_TIMEOUT_SECONDS) as response:
+                    body = response.read()
+                    headers = getattr(response, "headers", None)
+                    link = headers.get("Link") if headers is not None else None
+                break
+            except HTTPError as error:
+                error.close()
+                if (
+                    error.code not in _RETRYABLE_HTTP_CODES
+                    or attempt == _MAX_REQUEST_ATTEMPTS
+                ):
+                    raise GitHubUnavailable(
+                        "GitHub API HTTP {} at {} after {} attempt(s)".format(
+                            error.code, urlparse(url).path, attempt
+                        )
+                    ) from error
+            except (HTTPException, URLError, OSError) as error:
+                if attempt == _MAX_REQUEST_ATTEMPTS:
+                    raise GitHubUnavailable(
+                        "GitHub API {} at {} after {} attempt(s)".format(
+                            type(error).__name__, urlparse(url).path, attempt
+                        )
+                    ) from error
+            time.sleep(attempt)
         document = json.loads(body.decode("utf-8"))
         if not isinstance(document, dict):
             raise ValueError("invalid GitHub response")
@@ -140,7 +165,7 @@ class GitHubClient:
         return value
 
     @staticmethod
-    def _next_url(link: Optional[str]) -> Optional[str]:
+    def _next_url(link: Optional[str], current_url: str) -> Optional[str]:
         if link is None:
             return None
         if not isinstance(link, str):
@@ -156,11 +181,24 @@ class GitHubClient:
             if 'rel="next"' in fields[1:]:
                 next_url = urljoin(_API_URL, fields[0][1:-1])
                 parsed_url = urlparse(next_url)
+                current_path = urlparse(current_url).path
+                path_parts = parsed_url.path.split("/", 3)
+                # GitHub emits numeric repository URLs; retain the original endpoint.
+                if (
+                    len(path_parts) == 4
+                    and path_parts[1] == "repositories"
+                    and path_parts[2].isascii()
+                    and path_parts[2].isdigit()
+                    and path_parts[3]
+                    == "actions/" + current_path.split("/actions/", 1)[-1]
+                ):
+                    parsed_url = parsed_url._replace(path=current_path)
                 if (
                     parsed_url.scheme != "https"
-                    or parsed_url.hostname != "api.github.com"
+                    or parsed_url.netloc != "api.github.com"
                     or not parsed_url.path.startswith(_ACTIONS_PATH)
+                    or parsed_url.path != current_path
                 ):
                     raise ValueError("unsafe pagination link")
-                return next_url
+                return parsed_url.geturl()
         return None
