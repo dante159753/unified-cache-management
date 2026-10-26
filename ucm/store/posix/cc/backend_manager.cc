@@ -120,8 +120,9 @@ Status BackendManager::Setup(const Config& config, const SpaceLayout* layout)
             },
             config.timeoutMs);
         if (status.Failure()) { return startupError(status); }
-        backendHealth_.emplace_back("PosixBackend", fmt::format("{}:{}", index, normalizedPath),
-                                    config.backendHealth);
+        backendHealth_.emplace_back(
+            "PosixBackend", fmt::format("device{} {}:{}", config.deviceId, index, normalizedPath),
+            config.backendHealth);
     }
     // The thread pool checks for stuck workers once a second, so it may take up to 1s more to
     // notice a timed-out worker and finish its task. Leave that 1s out of each backend's share,
@@ -209,7 +210,7 @@ Status BackendManager::CheckHealth() const
 
 void BackendManager::ProbeBackends(const Detail::StoreHealthConfig& config)
 {
-    auto status = CpuAffinity::SetCurrentThreadName("ucm_health_backend_probe");
+    auto status = CpuAffinity::SetCurrentThreadName("ucm_health_be");
     if (status.Failure()) { UC_WARN("Failed to name backend health monitor: {}.", status); }
     Detail::HealthCheckExecutor executor(std::chrono::milliseconds{ioTimeoutMs_}, 8);
     std::unique_lock<std::mutex> stopLock(stopMutex_);

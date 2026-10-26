@@ -193,7 +193,7 @@ public:
                                                 Time now = Clock::now())
     {
         if (result.Failure()) {
-            UC_WARN("[{}] Store health check({}) failed({}).", module_, name_, result);
+            UC_WARN("[{}] Active store health check({}) failed({}).", module_, name_, result);
         }
         std::lock_guard<std::mutex> lock(mutex_);
         if (generation != generation_.load()) { return std::nullopt; }

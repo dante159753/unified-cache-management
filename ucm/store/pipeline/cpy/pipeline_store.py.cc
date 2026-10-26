@@ -186,8 +186,11 @@ public:
         stores_.push_back(std::move(store));
         entry_ = stores_.back().get();
         if (healthConfig.enabled) {
-            const auto storeId =
-                "pipeline/" + std::to_string(stores_.size() - 1) + ":" + stores_.back()->Readme();
+            int32_t deviceId = -1;
+            config.GetNumber("device_id", deviceId);
+            const auto storeId = "device" + std::to_string(deviceId) + " pipeline/" +
+                                 std::to_string(stores_.size() - 1) + ":" +
+                                 stores_.back()->Readme();
             auto breakerConfig = healthConfig;
             // Posix counts I/O failures per backend itself. Its store breaker only probes, so one
             // bad backend cannot trip the whole store.
