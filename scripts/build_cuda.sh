@@ -54,9 +54,6 @@ function build_wheels()
     cd ${PACKAGE_DIR}
     rm -f *.whl
 
-    # switch off DOWNLOAD_DEPENDENCE
-    # sed -i '/DOWNLOAD_DEPENDENCE/s/ON/OFF/' ${KVCACHE_PROJECT_ROOT}/CMakeLists.txt
-
     cd ${KVCACHE_PROJECT_ROOT}
     export ENABLE_SPARSE=${ENABLE_SPARSE:-TRUE}
     python3 -m build --no-isolation --wheel

@@ -851,7 +851,7 @@ ctest --test-dir build        # 157 个用例
 ```
 
 - `UCM_MAJOR_VERSION=2`：仅构建 v2（为空走 legacy 流程）；
-- `UCM_DOWNLOAD_DEPENDENCE=ON`（默认）：经 FetchContent 拉取 fmt 11.2.0 / pybind11 v3.0.1 / googletest，支持 gitcode 镜像自动回退（`v2/vendor/helper.cmake`）；
+- 第三方依赖 fmt 11.2.0 / pybind11 v3.0.1 / googletest v1.15.2 从仓库内的源码包 `ucm/shared/vendor/archives/` 解压构建，编译过程不访问网络；
 - 产物：`ucm_proxy.cpython-*.so`（Python 模块）、`libucm_store_cache.so`、`libucm_store_posix.so`（插件）。
 
 ### 10.2 扩展点总览

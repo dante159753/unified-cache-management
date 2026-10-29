@@ -60,8 +60,8 @@ if(BUILD_NUMA)
     set(NUMA_INSTALL_DIR ${CMAKE_CURRENT_BINARY_DIR}/numa_install)
     FetchContent_Declare(
         numactl
-        URL https://github.com/numactl/numactl/releases/download/v2.0.16/numactl-2.0.16.tar.gz
-        TLS_VERIFY OFF
+        URL ${UCM_VENDOR_ARCHIVE_DIR}/numactl-2.0.16.tar.gz
+        URL_HASH SHA256=1b242f893af977a1d31af6ce9d6b8dafdd2d8ec3dc9207f7c2dc0d3446e7c7c8
     )
     FetchContent_MakeAvailable(numactl)
     if(NOT EXISTS "${NUMA_INSTALL_DIR}/lib/libnuma.so")
