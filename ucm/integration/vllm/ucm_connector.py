@@ -86,6 +86,7 @@ if TYPE_CHECKING:
         PromMetricT,
     )
     from vllm.forward_context import ForwardContext
+    from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
@@ -1612,6 +1613,8 @@ class UCMWorkerMetadata(KVConnectorWorkerMetadata):
     missing_reqs: set[str] = field(default_factory=set)
     missing_blocks: set[bytes] = field(default_factory=set)
     dump_succeeded_blocks: set[bytes] = field(default_factory=set)
+    # Pin batch id -> number of workers whose dumps of that batch finished.
+    dump_pin_releases: dict[int, int] = field(default_factory=dict)
 
     def mark_failed(self, req_id: str) -> None:
         """Record a failed load request from this worker."""
@@ -1628,6 +1631,10 @@ class UCMWorkerMetadata(KVConnectorWorkerMetadata):
         self.load_failed_reqs.update(other.load_failed_reqs)
         self.missing_reqs.update(other.missing_reqs)
         self.missing_blocks.update(other.missing_blocks)
+        for batch_id, count in other.dump_pin_releases.items():
+            self.dump_pin_releases[batch_id] = (
+                self.dump_pin_releases.get(batch_id, 0) + count
+            )
         # TODO: Support PP-aware Dump success aggregation.
         # for mla, blocks can only be dumped by 1 rank, for FAWA, the dump is distributed across ranks
         # for non-mla, blocks should be dumped by all ranks
@@ -2770,6 +2777,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
         if (
             not self._rank_consistency.enabled
             and not self._connector_worker_meta.load_failed_reqs
+            and not self._connector_worker_meta.dump_pin_releases
         ):
             return None
         self._rank_consistency.update_worker_meta(self._connector_worker_meta)
@@ -4059,6 +4067,9 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
     @_record_connector_interface_duration
     def update_connector_output(self, connector_output: KVConnectorOutput):
         return self.connector.update_connector_output(connector_output)
+
+    def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
+        self.connector.bind_gpu_block_pool(gpu_block_pool)
 
     @_record_connector_interface_duration
     def clear_connector_metadata(self) -> None:

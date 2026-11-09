@@ -1482,7 +1482,7 @@ class UCMV41CompatibilityTest(unittest.TestCase):
                         lookup_on_prefix=lambda _store, keys: len(keys) - 1
                     ),
                     _get_connector_metadata=lambda: types.SimpleNamespace(
-                        request_meta={"req": request}
+                        request_meta={"req": request}, dump_pin_batch_id=None
                     ),
                     _poll_completed_dump_tasks=lambda: None,
                     _get_mla_dump_slice=lambda start, rank=rank, size=tp_size: slice(
@@ -1513,8 +1513,12 @@ class UCMV41CompatibilityTest(unittest.TestCase):
                 "_slice_group_block_ids",
             }
         )
-        methods["UCMFAWAConnectorMetadata"] = lambda requests, preempted: (
-            types.SimpleNamespace(request_meta=requests, preempted_req_ids=preempted)
+        methods["UCMFAWAConnectorMetadata"] = (
+            lambda requests, preempted, dump_pin_batch_id=None: types.SimpleNamespace(
+                request_meta=requests,
+                preempted_req_ids=preempted,
+                dump_pin_batch_id=dump_pin_batch_id,
+            )
         )
         request = types.SimpleNamespace(
             ucm_block_ids=[bytes([i]) for i in range(8)],
@@ -1528,6 +1532,7 @@ class UCMV41CompatibilityTest(unittest.TestCase):
             prefix_replay_tokens=128,
             _pending_async_load_dispatches={},
             _async_load_req_ids=set(),
+            _gpu_block_pool=None,
             hash_block_size=64,
             transient_group_ids={1},
             window_group_ids=[],
@@ -1579,8 +1584,12 @@ class UCMV41CompatibilityTest(unittest.TestCase):
                 "_slice_group_block_ids",
             }
         )
-        methods["UCMFAWAConnectorMetadata"] = lambda requests, preempted: (
-            types.SimpleNamespace(request_meta=requests, preempted_req_ids=preempted)
+        methods["UCMFAWAConnectorMetadata"] = (
+            lambda requests, preempted, dump_pin_batch_id=None: types.SimpleNamespace(
+                request_meta=requests,
+                preempted_req_ids=preempted,
+                dump_pin_batch_id=dump_pin_batch_id,
+            )
         )
         for block_wise in (False, True):
             with self.subTest(block_wise=block_wise):
@@ -1597,6 +1606,7 @@ class UCMV41CompatibilityTest(unittest.TestCase):
                     prefix_replay_tokens=0,
                     _pending_async_load_dispatches={},
                     _async_load_req_ids=set(),
+                    _gpu_block_pool=None,
                     hash_block_size=64,
                     transient_group_ids=set(),
                     window_group_ids=[1],

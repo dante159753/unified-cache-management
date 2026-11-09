@@ -28,6 +28,7 @@ from ucm.integration.vllm.ucm_connector import (
     KVConnectorTransferResults,
     UCMDirectConnector,
     UCMLiteConnector,
+    UCMWorkerMetadata,
     _check_shm_capacity,
     _get_store_gc_block_size,
     _scheduler_read_block_size,
@@ -44,8 +45,11 @@ from ucm.store.ucmstore_v1 import Task, UcmKVStoreBaseV1
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.forward_context import ForwardContext
+    from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.core.kv_cache_utils import KVCacheBlock
     from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -762,6 +766,9 @@ class UCMFAWAConnectorMetadata(KVConnectorMetadata):
 
     request_meta: dict[str, FAWARequestDispatchMeta] = field(default_factory=dict)
     preempted_req_ids: set[str] = field(default_factory=set)
+    # Set when the scheduler holds a block-pool reference on every block this
+    # step dumps. Workers must report the batch once all its dumps finish.
+    dump_pin_batch_id: Optional[int] = None
 
 
 @dataclass
@@ -795,6 +802,7 @@ class FAWADumpTask:
     task: Task
     key_count: int
     event_handle: int
+    pin_batch_id: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -877,6 +885,16 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         self.requests_meta: dict[str, FAWARequestMeta] = {}
         self.tp_dump_tasks: dict[tuple, list[FAWADumpTask]] = {}
         self.wa_dump_block_wise = self.launch_config.get("wa_dump_block_wise", True)
+        # Scheduler side: blocks pinned for in-flight dumps, keyed by batch id.
+        self._gpu_block_pool: Optional["BlockPool"] = None
+        self._next_dump_pin_batch_id = 0
+        self._dump_pinned_blocks: dict[int, list["KVCacheBlock"]] = {}
+        self._dump_pin_release_counts: dict[int, int] = {}
+        self._num_dump_pin_reporters = vllm_config.parallel_config.world_size
+        # Worker side: unfinished dump tasks per pin batch, and finished
+        # requests whose dump accounting waits for pinned dumps.
+        self._inflight_dump_pin_tasks: dict[int, int] = {}
+        self._deferred_finish_dump_req_ids: set[str] = set()
 
         # If the number of external hit blocks is small, it's possible that the load overhead is larger than the compute of a few blocks.
         # In that case, we can skip loading and directly compute the missed blocks, which can be faster.
@@ -2181,8 +2199,53 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         requests_dispatch_meta.update(self._pending_async_load_dispatches)
         self._pending_async_load_dispatches = {}
 
+        # Hold a reference on every dump source so sliding-window recycling,
+        # preemption or request finish cannot hand the block to another
+        # request before the workers have read it.
+        dump_pin_batch_id = None
+        if self._gpu_block_pool is not None:
+            dump_block_ids = {
+                block_id
+                for dispatch_meta in requests_dispatch_meta.values()
+                for group_block_ids in dispatch_meta.dump_vllm_block_ids
+                for block_id in group_block_ids
+            }
+            pinned_blocks = [
+                self._gpu_block_pool.blocks[block_id]
+                for block_id in sorted(dump_block_ids)
+                if not self._gpu_block_pool.blocks[block_id].is_null
+            ]
+            if pinned_blocks:
+                self._gpu_block_pool.touch(pinned_blocks)
+                dump_pin_batch_id = self._next_dump_pin_batch_id
+                self._next_dump_pin_batch_id += 1
+                self._dump_pinned_blocks[dump_pin_batch_id] = pinned_blocks
+
         preempted_req_ids = set(scheduler_output.preempted_req_ids or ())
-        return UCMFAWAConnectorMetadata(requests_dispatch_meta, preempted_req_ids)
+        return UCMFAWAConnectorMetadata(
+            requests_dispatch_meta,
+            preempted_req_ids,
+            dump_pin_batch_id=dump_pin_batch_id,
+        )
+
+    def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
+        # Scheduler side method
+        self._gpu_block_pool = gpu_block_pool
+
+    def update_connector_output(self, connector_output: "KVConnectorOutput"):
+        # Scheduler side method
+        super().update_connector_output(connector_output)
+        meta = getattr(connector_output, "kv_connector_worker_meta", None)
+        if isinstance(meta, UCMWorkerMetadata):
+            for batch_id, count in meta.dump_pin_releases.items():
+                total = self._dump_pin_release_counts.get(batch_id, 0) + count
+                if total < self._num_dump_pin_reporters:
+                    self._dump_pin_release_counts[batch_id] = total
+                else:
+                    self._dump_pin_release_counts.pop(batch_id, None)
+                    self._gpu_block_pool.free_blocks(
+                        self._dump_pinned_blocks.pop(batch_id)
+                    )
 
     def _submit_load_task(
         self,
@@ -2660,6 +2723,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                         )
                     )
 
+        submitted_dump_tasks: list[FAWADumpTask] = []
         if fa_dump_keys:
             event_handle = self._get_dump_event_handle()
             fa_ptrs = np.vstack(fa_ptr_rows)
@@ -2672,6 +2736,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                     event_handle,
                     fa_dump_blocks_by_request,
                 )
+                submitted_dump_tasks.append(fa_dump_task)
                 self.tp_dump_tasks.setdefault(dump_request_ids, []).append(fa_dump_task)
                 save_bytes += fa_dump_task.key_count * self.file_size["FA"]
             except Exception as e:
@@ -2690,6 +2755,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                     event_handle,
                     wa_dump_blocks_by_request,
                 )
+                submitted_dump_tasks.append(wa_dump_task)
                 self.tp_dump_tasks.setdefault(dump_request_ids, []).append(wa_dump_task)
                 save_bytes += wa_dump_task.key_count * self.file_size["WA"]
             except Exception as e:
@@ -2699,36 +2765,37 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         if fa_dump_keys or wa_dump_keys:
             ucmmetrics.update_stats({"save_bytes_total": save_bytes})
 
+        # Every worker reports every pin batch, including a rank whose TP slice
+        # submitted nothing, because the scheduler counts one report per worker.
+        pin_batch_id = metadata.dump_pin_batch_id
+        if pin_batch_id is not None:
+            for dump_task in submitted_dump_tasks:
+                dump_task.pin_batch_id = pin_batch_id
+            if submitted_dump_tasks:
+                self._inflight_dump_pin_tasks[pin_batch_id] = len(submitted_dump_tasks)
+            else:
+                self._connector_worker_meta.dump_pin_releases[pin_batch_id] = 1
+
     def _poll_completed_dump_tasks(self) -> None:
         """Reap completed FAWA dump tasks without waiting for in-flight tasks."""
 
         for request_ids, dump_tasks in list(self.tp_dump_tasks.items()):
             in_flight_tasks = []
             for dump_task in dump_tasks:
-                task_finished = False
-
                 try:
                     task_finished = dump_task.store.check(dump_task.task)
                 except Exception as e:
+                    # A pinned task is never drained, so a failed check must
+                    # end the task here or its blocks would stay pinned.
                     logger.error(
                         "Check FAWA dump task failed; external cache may miss. "
                         f"label={dump_task.label}, keys={dump_task.key_count}, "
                         f"{type(e).__name__}: {e}"
                     )
-                    in_flight_tasks.append(dump_task)
-                    continue
+                    task_finished = True
 
                 if task_finished:
-                    try:
-                        self._rank_consistency.wait_dump(dump_task.task)
-                    except Exception as e:
-                        logger.error(
-                            "Best-effort FAWA dump task failed; external cache may miss. "
-                            f"label={dump_task.label}, keys={dump_task.key_count}, "
-                            f"{type(e).__name__}: {e}"
-                        )
-                    finally:
-                        self.device.destroy_event_handle(dump_task.event_handle)
+                    self._finish_dump_task(dump_task)
                 else:
                     in_flight_tasks.append(dump_task)
 
@@ -2737,45 +2804,65 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             else:
                 self.tp_dump_tasks.pop(request_ids, None)
 
+    def _finish_dump_task(self, dump_task: FAWADumpTask) -> None:
+        """Wait a dump task, release its event and report its pin batch.
+
+        Dump failures only mean the external cache may miss later, so they are
+        logged and counted instead of raised.
+        """
+        try:
+            self._rank_consistency.wait_dump(dump_task.task)
+        except Exception as e:
+            logger.error(
+                "Best-effort FAWA dump task failed; external cache may miss. "
+                f"label={dump_task.label}, keys={dump_task.key_count}, "
+                f"{type(e).__name__}: {e}"
+            )
+            self._record_counter("connector_dump_wait_errors_total")
+        finally:
+            self.device.destroy_event_handle(dump_task.event_handle)
+
+        batch_id = dump_task.pin_batch_id
+        if batch_id is not None:
+            remaining = self._inflight_dump_pin_tasks[batch_id] - 1
+            if remaining:
+                self._inflight_dump_pin_tasks[batch_id] = remaining
+            else:
+                del self._inflight_dump_pin_tasks[batch_id]
+                self._connector_worker_meta.dump_pin_releases[batch_id] = 1
+
     def _drain_best_effort_dump_tasks(
         self, request_ids: Optional[set[str]] = None
     ) -> None:
-        """Best-effort wait for FAWA dump tasks.
+        """Host-wait unpinned FAWA dump tasks.
 
-        Dump failures only mean the external cache may miss later. They must not
-        block vLLM from releasing HBM blocks, so failed tasks are logged and then
-        removed from tracking. If ``request_ids`` is None, drain every pending
-        task; otherwise drain only task batches containing one of those requests.
+        Unpinned dumps rely on this wait to keep their source blocks from being
+        reused. Pinned dumps are left to ``_poll_completed_dump_tasks``. If
+        ``request_ids`` is None, drain every pending task; otherwise drain only
+        task batches containing one of those requests.
         """
         if request_ids is not None and not request_ids:
             return
 
-        finished_chunk_req_ids = []
-        for chunk_request_ids, dump_tasks in self.tp_dump_tasks.items():
+        for chunk_request_ids, dump_tasks in list(self.tp_dump_tasks.items()):
             if request_ids is None or request_ids.intersection(chunk_request_ids):
-                finished_chunk_req_ids.append(chunk_request_ids)
+                pinned_tasks = []
                 for dump_task in dump_tasks:
-                    try:
-                        self._rank_consistency.wait_dump(dump_task.task)
-                    except Exception as e:
-                        logger.error(
-                            "Best-effort FAWA dump task failed; external cache may miss. "
-                            f"label={dump_task.label}, keys={dump_task.key_count}, "
-                            f"{type(e).__name__}: {e}"
-                        )
-                        self._record_counter("connector_dump_wait_errors_total")
-                    finally:
-                        self.device.destroy_event_handle(dump_task.event_handle)
-
-        for request_ids in finished_chunk_req_ids:
-            self.tp_dump_tasks.pop(request_ids, None)
+                    if dump_task.pin_batch_id is None:
+                        self._finish_dump_task(dump_task)
+                    else:
+                        pinned_tasks.append(dump_task)
+                if pinned_tasks:
+                    self.tp_dump_tasks[chunk_request_ids] = pinned_tasks
+                else:
+                    self.tp_dump_tasks.pop(chunk_request_ids, None)
 
     def handle_preemptions(self, kv_connector_metadata: UCMFAWAConnectorMetadata):
         # Worker side method
         # This hook runs before the next load/forward can overwrite cache data.
-        # Drain all previous-step dumps, not only explicitly preempted requests:
-        # a running request's sliding-window blocks may also be recycled by the
-        # next allocate_slots() call.
+        # Without block pinning (vLLM < 0.22, or a wrapper that does not forward
+        # bind_gpu_block_pool), drain all previous-step dumps: preemption and
+        # sliding-window recycling free blocks without telling the worker.
         self._drain_best_effort_dump_tasks()
 
     def get_finished(
@@ -2800,7 +2887,19 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 f"{sorted(self._failed_fawa_loads)}"
             )
         self._drain_best_effort_dump_tasks(finished_req_ids)
-        self._rank_consistency.finish_dump(finished_req_ids)
+        self._poll_completed_dump_tasks()
+        # Pinned dumps of a finished request may still be running. Their blocks
+        # stay pinned, so the request can be released now, but finish_dump()
+        # must wait until those dumps report success or failure.
+        self._deferred_finish_dump_req_ids.update(finished_req_ids)
+        dumping_req_ids = {
+            request_id
+            for chunk_request_ids in self.tp_dump_tasks
+            for request_id in chunk_request_ids
+        }
+        dump_done_req_ids = self._deferred_finish_dump_req_ids - dumping_req_ids
+        self._deferred_finish_dump_req_ids -= dump_done_req_ids
+        self._rank_consistency.finish_dump(dump_done_req_ids)
         finished_sending = set(finished_req_ids)
         finished_sending.difference_update(pending_async_loads)
         finished_sending.difference_update(finished_recving)

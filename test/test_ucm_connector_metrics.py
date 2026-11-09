@@ -3024,6 +3024,8 @@ def _async_fawa_worker(has_window=True):
     connector._invalid_block_ids = set()
     connector._connector_worker_meta = SimpleNamespace(mark_failed=Mock())
     connector._drain_best_effort_dump_tasks = Mock()
+    connector.tp_dump_tasks = {}
+    connector._deferred_finish_dump_req_ids = set()
     connector._extract_fa_ptr = Mock(return_value=[])
     connector._extract_wa_ptr = Mock(return_value=[])
     # IDs deliberately overlap between groups: they cannot identify failures.
@@ -3278,6 +3280,251 @@ def test_fawa_records_submitted_save_bytes():
     connector.wait_for_save()
 
     assert fake_ucmmetrics.updated == [{"save_bytes_total": 140}]
+
+
+class _FakeBlock:
+    def __init__(self, block_id):
+        self.block_id = block_id
+        self.ref_cnt = 0
+        self.is_null = block_id == 0
+
+
+class _FakeBlockPool:
+    def __init__(self, num_blocks):
+        self.blocks = [_FakeBlock(i) for i in range(num_blocks)]
+
+    def touch(self, blocks):
+        for block in blocks:
+            block.ref_cnt += 1
+
+    def free_blocks(self, blocks):
+        for block in blocks:
+            block.ref_cnt -= 1
+
+
+def _fawa_pin_scheduler(pool, num_workers):
+    from ucm.integration.vllm.hma_connector import UCMFAWAConnector
+    from ucm.integration.vllm.rank_consistency import RankConsistencyManager
+
+    connector = object.__new__(UCMFAWAConnector)
+    connector._pending_async_load_dispatches = {}
+    connector._async_load_req_ids = set()
+    connector.requests_meta = {}
+    connector._rank_consistency = RankConsistencyManager(
+        is_scheduler=True, use_consistency_manager=False
+    )
+    connector._gpu_block_pool = None
+    connector._next_dump_pin_batch_id = 0
+    connector._dump_pinned_blocks = {}
+    connector._dump_pin_release_counts = {}
+    connector._num_dump_pin_reporters = num_workers
+    outer = object.__new__(UCMConnector)
+    outer.connector = connector
+    outer.bind_gpu_block_pool(pool)
+    return connector
+
+
+def _fawa_pin_step(connector, dump_vllm_block_ids):
+    from ucm.integration.vllm.hma_connector import FAWARequestDispatchMeta
+
+    connector._pending_async_load_dispatches = {
+        "req": FAWARequestDispatchMeta(
+            dump_keys=[b"key"], dump_vllm_block_ids=dump_vllm_block_ids
+        )
+    }
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+        finished_req_ids=set(),
+        preempted_req_ids=set(),
+    )
+    return connector.build_connector_meta(scheduler_output)
+
+
+def test_fawa_scheduler_pins_dump_blocks_until_every_worker_reports():
+    from ucm.integration.vllm.ucm_connector import UCMWorkerMetadata
+
+    pool = _FakeBlockPool(8)
+    connector = _fawa_pin_scheduler(pool, num_workers=2)
+    # FA and WA rows share block 5; the null block is never pinned.
+    metadata = _fawa_pin_step(connector, ([0, 3, 5], [5, 7]))
+
+    assert metadata.dump_pin_batch_id == 0
+    assert [block.ref_cnt for block in pool.blocks] == [0, 0, 0, 1, 0, 1, 0, 1]
+
+    def report(batch_id):
+        output = SimpleNamespace(
+            kv_connector_worker_meta=UCMWorkerMetadata(
+                dump_pin_releases={batch_id: 1}
+            )
+        )
+        connector.update_connector_output(output)
+
+    report(0)
+    assert [block.ref_cnt for block in pool.blocks] == [0, 0, 0, 1, 0, 1, 0, 1]
+    report(0)
+    assert [block.ref_cnt for block in pool.blocks] == [0] * 8
+    assert connector._dump_pinned_blocks == {}
+    assert connector._dump_pin_release_counts == {}
+
+    # A step without dump sources does not open a pin batch.
+    assert _fawa_pin_step(connector, ([0], [])).dump_pin_batch_id is None
+
+
+def test_fawa_scheduler_without_block_pool_does_not_pin():
+    connector = _fawa_pin_scheduler(None, num_workers=1)
+    assert _fawa_pin_step(connector, ([3], [5])).dump_pin_batch_id is None
+
+
+def test_worker_metadata_sums_pin_releases_across_workers():
+    from ucm.integration.vllm.ucm_connector import UCMWorkerMetadata
+
+    merged = UCMWorkerMetadata(dump_pin_releases={1: 1, 2: 1})
+    merged.aggregate(UCMWorkerMetadata(dump_pin_releases={1: 1, 3: 1}))
+    assert merged.dump_pin_releases == {1: 2, 2: 1, 3: 1}
+
+
+def _fawa_pin_worker():
+    from ucm.integration.vllm.hma_connector import UCMFAWAConnector
+    from ucm.integration.vllm.ucm_connector import UCMWorkerMetadata
+
+    connector = object.__new__(UCMFAWAConnector)
+    connector.tp_dump_tasks = {}
+    connector._inflight_dump_pin_tasks = {}
+    connector._deferred_finish_dump_req_ids = set()
+    connector._connector_worker_meta = UCMWorkerMetadata()
+    connector._rank_consistency = SimpleNamespace(
+        enabled=False,
+        wait_dump=Mock(),
+        finish_dump=Mock(),
+        update_worker_meta=Mock(),
+    )
+    connector.device = SimpleNamespace(destroy_event_handle=Mock())
+    connector._pending_fawa_loads = {}
+    connector._failed_fawa_loads = set()
+    connector._poll_pending_fawa_loads = lambda: set()
+    return connector
+
+
+def _dump_task(label, done, pin_batch_id=None):
+    from ucm.integration.vllm.hma_connector import FAWADumpTask
+
+    store = SimpleNamespace(check=lambda task: done[label])
+    return FAWADumpTask(label, store, label, 1, 7, pin_batch_id)
+
+
+def test_fawa_worker_reports_pin_batch_without_host_wait():
+    connector = _fawa_pin_worker()
+    done = {"FA": False, "WA": False}
+    connector.tp_dump_tasks = {
+        ("req",): [_dump_task("FA", done, 4), _dump_task("WA", done, 4)]
+    }
+    connector._inflight_dump_pin_tasks = {4: 2}
+
+    connector.handle_preemptions(None)
+    connector._rank_consistency.wait_dump.assert_not_called()
+
+    # The request finishes while its pinned dumps still run: release it now,
+    # but defer dump accounting until the dumps end.
+    assert connector.get_finished({"req"}) == ({"req"}, None)
+    connector._rank_consistency.finish_dump.assert_called_with(set())
+    assert connector._connector_worker_meta.dump_pin_releases == {}
+
+    done["FA"] = True
+    connector.get_finished(set())
+    assert connector._connector_worker_meta.dump_pin_releases == {}
+    assert connector._inflight_dump_pin_tasks == {4: 1}
+
+    done["WA"] = True
+    connector.get_finished(set())
+    connector._rank_consistency.finish_dump.assert_called_with({"req"})
+    assert connector.tp_dump_tasks == {}
+    assert connector._inflight_dump_pin_tasks == {}
+
+    meta = connector.build_connector_worker_meta()
+    assert meta.dump_pin_releases == {4: 1}
+    assert connector.build_connector_worker_meta() is None
+
+
+def test_fawa_worker_ends_pinned_task_when_check_fails():
+    connector = _fawa_pin_worker()
+    connector._record_counter = Mock()
+    task = _dump_task("FA", {"FA": False}, 9)
+    task.store.check = Mock(side_effect=RuntimeError("check failed"))
+    connector._rank_consistency.wait_dump.side_effect = RuntimeError("wait failed")
+    connector.tp_dump_tasks = {("req",): [task]}
+    connector._inflight_dump_pin_tasks = {9: 1}
+
+    connector._poll_completed_dump_tasks()
+
+    assert connector.tp_dump_tasks == {}
+    assert connector._connector_worker_meta.dump_pin_releases == {9: 1}
+    connector.device.destroy_event_handle.assert_called_once_with(7)
+    connector._record_counter.assert_called_once_with(
+        "connector_dump_wait_errors_total"
+    )
+
+
+def test_fawa_worker_still_drains_unpinned_dumps():
+    connector = _fawa_pin_worker()
+    done = {"FA": False}
+    connector.tp_dump_tasks = {("req",): [_dump_task("FA", done)]}
+
+    connector.handle_preemptions(None)
+
+    connector._rank_consistency.wait_dump.assert_called_once_with("FA")
+    assert connector.tp_dump_tasks == {}
+    assert connector._connector_worker_meta.dump_pin_releases == {}
+
+
+@pytest.mark.parametrize("num_tasks", [0, 2])
+def test_fawa_wait_for_save_tags_dumps_with_pin_batch(num_tasks):
+    _reset_fakes()
+    from ucm.integration.vllm.hma_connector import (
+        FAWADumpTask,
+        UCMFAWAConnectorMetadata,
+    )
+
+    connector = _fawa_pin_worker()
+    # A TP rank whose key slice is empty submits nothing for the batch.
+    dump_keys = [b"key"] if num_tasks else []
+    request = SimpleNamespace(
+        dump_keys=dump_keys,
+        dump_hash_start=0,
+        dump_hash_end=len(dump_keys),
+        dump_vllm_block_ids=([1],),
+    )
+    metadata = UCMFAWAConnectorMetadata(
+        request_meta={"req": request}, dump_pin_batch_id=3
+    )
+    connector._get_connector_metadata = lambda: metadata
+    connector.fa_store = object()
+    connector.wa_store = object()
+    connector.window_group_ids = [1]
+    connector._poll_completed_dump_tasks = lambda: None
+    connector.tp_size = 1
+    connector.tp_rank = 0
+    connector.wa_dump_block_wise = False
+    connector.file_size = {"FA": 100, "WA": 40}
+    connector._extract_fa_ptr = lambda *args: [[0]]
+    connector._extract_wa_ptr = lambda *args: [[0]]
+    connector._get_dump_event_handle = lambda: 7
+    connector._submit_dump_task = (
+        lambda label, store, keys, ptrs, event_handle, block_ids_by_request: (
+            FAWADumpTask(label, store, object(), len(keys), event_handle)
+        )
+    )
+
+    connector.wait_for_save()
+
+    tasks = [task for tasks in connector.tp_dump_tasks.values() for task in tasks]
+    assert [task.pin_batch_id for task in tasks] == [3] * num_tasks
+    if num_tasks:
+        assert connector._inflight_dump_pin_tasks == {3: num_tasks}
+        assert connector._connector_worker_meta.dump_pin_releases == {}
+    else:
+        assert connector._inflight_dump_pin_tasks == {}
+        assert connector._connector_worker_meta.dump_pin_releases == {3: 1}
 
 
 def test_cache_load_h2d_duration_records_stream_synchronize_only():
