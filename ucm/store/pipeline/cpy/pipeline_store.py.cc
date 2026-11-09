@@ -26,9 +26,9 @@
 #include <pybind11/stl.h>
 #include <stdexcept>
 #include "config_parser.h"
+#include "detail/store_health_config.h"
 #include "health_breaker_store.h"
 #include "library_loader.h"
-#include "store_health_config.h"
 #include "ucmstore_v1.h"
 
 namespace py = pybind11;
@@ -94,9 +94,9 @@ class PipelineStore {
         if (s.Success()) { return; }
         ThrowError(s);
     }
-    static StoreHealthConfig ParseHealthConfig(const py::dict& config)
+    static Detail::StoreHealthConfig ParseHealthConfig(const py::dict& config)
     {
-        StoreHealthConfig result;
+        Detail::StoreHealthConfig result;
         auto readSeconds = [&config](const char* name, auto defaultValue) {
             if (!config.contains(name)) { return defaultValue; }
             auto seconds = py::cast<double>(config[name]);
@@ -113,6 +113,22 @@ class PipelineStore {
         }
         if (config.contains("failure_threshold")) {
             result.failureThreshold = py::cast<size_t>(config["failure_threshold"]);
+        }
+        if (config.contains("passive_enabled")) {
+            result.passiveEnabled = py::cast<bool>(config["passive_enabled"]);
+        }
+        if (config.contains("passive_window_s")) {
+            result.passiveWindow =
+                std::chrono::seconds{py::cast<int64_t>(config["passive_window_s"])};
+        }
+        if (config.contains("passive_failure_threshold")) {
+            result.passiveFailureThreshold = py::cast<size_t>(config["passive_failure_threshold"]);
+        }
+        result.initialCooldown = readSeconds("initial_cooldown_s", result.initialCooldown);
+        result.maxCooldown = readSeconds("max_cooldown_s", result.maxCooldown);
+        result.stableResetAfter = readSeconds("stable_reset_after_s", result.stableResetAfter);
+        if (config.contains("backoff_factor")) {
+            result.backoffFactor = py::cast<double>(config["backoff_factor"]);
         }
         ThrowIfFailed(result.Validate());
         return result;
@@ -160,9 +176,11 @@ public:
         if (storeDict.contains("store_health")) {
             healthDict = py::cast<py::dict>(storeDict["store_health"]);
         }
-        const auto healthConfig = ParseHealthConfig(healthDict);
+        auto healthConfig = ParseHealthConfig(healthDict);
+        if (name != "Posix" && name != "Mooncake") { healthConfig.passiveEnabled = false; }
         Detail::Dictionary config;
         ThrowIfFailed(ConfigParser::Parse(config, storeDict));
+        config.Set("store_health", healthConfig);
         config.Set<StoreV1*>("store_backend", StoreBack());
         StoreLoader loader{path, "Make" + name + "Store"};
         ThrowIfFailed(loader.LoadLibrary());
@@ -172,7 +190,9 @@ public:
         loaders_.push_back(std::move(loader));
         stores_.push_back(std::move(store));
         entry_ = stores_.back().get();
-        if (healthConfig.enabled) {
+        // Posix tracks the health of each backend itself and fails fast when none is healthy,
+        // so it does not need a store breaker.
+        if (healthConfig.enabled && name != "Posix") {
             const auto storeId =
                 "pipeline/" + std::to_string(stores_.size() - 1) + ":" + stores_.back()->Readme();
             auto healthBreakerStore = std::make_shared<HealthBreakerStore>();
@@ -186,7 +206,12 @@ public:
     pybind11::bytes Lookup(const pybind11::buffer& ids)
     {
         BufferArrayView<Detail::BlockId> idArr{ids};
-        auto res = StoreBack()->Lookup(idArr.data, idArr.num);
+        // Read Python buffers and build Python results with the GIL held;
+        // native storage waits must not block other Python threads.
+        auto res = [&] {
+            pybind11::gil_scoped_release release;
+            return StoreBack()->Lookup(idArr.data, idArr.num);
+        }();
         if (res) {
             auto& v = res.Value();
             return pybind11::bytes(reinterpret_cast<const char*>(v.data()), v.size());
@@ -196,14 +221,20 @@ public:
     ssize_t LookupOnPrefix(const pybind11::buffer& ids)
     {
         BufferArrayView<Detail::BlockId> idArr{ids};
-        auto res = StoreBack()->LookupOnPrefix(idArr.data, idArr.num);
+        auto res = [&] {
+            pybind11::gil_scoped_release release;
+            return StoreBack()->LookupOnPrefix(idArr.data, idArr.num);
+        }();
         if (res) { return res.Value(); }
         ThrowError(res.Error());
     }
     ssize_t LookupOnReverse(const pybind11::buffer& ids)
     {
         BufferArrayView<Detail::BlockId> idArr{ids};
-        auto res = StoreBack()->LookupOnReverse(idArr.data, idArr.num);
+        auto res = [&] {
+            pybind11::gil_scoped_release release;
+            return StoreBack()->LookupOnReverse(idArr.data, idArr.num);
+        }();
         if (res) { return res.Value(); }
         ThrowError(res.Error());
     }
@@ -213,20 +244,27 @@ public:
         StoreBack()->Prefetch(idArr.data, idArr.num);
     }
     Detail::TaskHandle Load(const pybind11::buffer& ids, const pybind11::buffer& indexes,
-                            const pybind11::buffer& addrs)
+                            const pybind11::buffer& addrs, uintptr_t prerequisite_handle = 0,
+                            bool distribute_backend_load = false,
+                            std::vector<uint32_t> owner_ranks = {})
     {
         auto desc = MakeTaskDesc(ids, indexes, addrs);
         desc.brief = "Load";
+        desc.prerequisiteHandle = prerequisite_handle;
+        desc.distributeBackendLoad = distribute_backend_load;
+        desc.ownerRanks = std::move(owner_ranks);
         auto res = StoreBack()->Load(std::move(desc));
         if (res) { return res.Value(); }
         ThrowError(res.Error());
     }
     Detail::TaskHandle Dump(const pybind11::buffer& ids, const pybind11::buffer& indexes,
-                            const pybind11::buffer& addrs, uintptr_t prerequisite_handle = 0)
+                            const pybind11::buffer& addrs, uintptr_t prerequisite_handle = 0,
+                            std::vector<uint32_t> owner_ranks = {})
     {
         auto desc = MakeTaskDesc(ids, indexes, addrs);
         desc.brief = "Dump";
         desc.prerequisiteHandle = prerequisite_handle;
+        desc.ownerRanks = std::move(owner_ranks);
         auto res = StoreBack()->Dump(desc);
         if (res) { return res.Value(); }
         if (res.Error() == Status::StoreUnhealthy()) { return UNHEALTHY_DUMP_TASK; }
@@ -274,9 +312,12 @@ PYBIND11_MODULE(ucmpipelinestore, m)
     s.def("LookupOnReverse", &PipelineStore::LookupOnReverse, py::arg("ids").noconvert());
     s.def("Prefetch", &PipelineStore::Prefetch, py::arg("ids").noconvert());
     s.def("Load", &PipelineStore::Load, py::arg("ids").noconvert(), py::arg("indexes").noconvert(),
-          py::arg("addrs").noconvert());
+          py::arg("addrs").noconvert(), py::arg("prerequisite_handle") = 0,
+          py::arg("distribute_backend_load") = false,
+          py::arg("owner_ranks") = std::vector<uint32_t>{});
     s.def("Dump", &PipelineStore::Dump, py::arg("ids").noconvert(), py::arg("indexes").noconvert(),
-          py::arg("addrs").noconvert(), py::arg("prerequisite_handle") = 0);
+          py::arg("addrs").noconvert(), py::arg("prerequisite_handle") = 0,
+          py::arg("owner_ranks") = std::vector<uint32_t>{});
     s.def("Check", &PipelineStore::Check);
     s.def("Wait", &PipelineStore::Wait);
     s.def("Close", &PipelineStore::Close, py::call_guard<py::gil_scoped_release>());

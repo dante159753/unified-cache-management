@@ -131,9 +131,8 @@ class LocalBufferStrategy : public BufferStrategy {
         void Unlock() { pthread_spin_unlock(&lock); }
     };
 
-    bool ioDirect_{false};
+    bool useDriverMemoryApi_{false};
     bool mapHostToDevice_{false};
-    int32_t numaNode_{-1};
     BufferHeader header_;
     LocalMutex bucketLocks_[nHashTableBucket];
     std::unique_ptr<LocalLock[]> nodeLocks_;
@@ -145,11 +144,10 @@ class LocalBufferStrategy : public BufferStrategy {
 
 public:
     LocalBufferStrategy(int32_t deviceId, size_t nodeSize, size_t totalSize, size_t reservedNumber,
-                        bool ioDirect, bool mapHostToDevice, int32_t numaNode)
+                        bool useDriverMemoryApi, bool mapHostToDevice)
         : BufferStrategy(deviceId, nodeSize, totalSize, reservedNumber),
-          ioDirect_(ioDirect),
-          mapHostToDevice_(mapHostToDevice),
-          numaNode_(numaNode)
+          useDriverMemoryApi_(useDriverMemoryApi),
+          mapHostToDevice_(mapHostToDevice)
     {
     }
     ~LocalBufferStrategy() override
@@ -186,32 +184,24 @@ public:
             UC_ERROR("Failed to make buffer on device({}).", deviceId);
             return Status::Error();
         }
-        const auto dataSize = nodeSize * nNode;
-        const auto registeredAllocation = ioDirect_ || numaNode_ >= 0;
-        data_ = numaNode_ >= 0   ? buffer->MakeHostBufferOnNuma(dataSize, numaNode_)
-                : ioDirect_      ? buffer->MakeHostBuffer4DirectIo(dataSize)
-                                 : buffer->MakeHostBuffer(dataSize);
+        data_ = !useDriverMemoryApi_ ? buffer->MakeHostBuffer4DirectIo(nodeSize * nNode)
+                                     : buffer->MakeHostBuffer(nodeSize * nNode);
         if (!data_) [[unlikely]] {
-            UC_ERROR("Failed to make pinned({}) for device({}) on NUMA node({}).", dataSize,
-                     deviceId, numaNode_);
+            UC_ERROR("Failed to make pinned({}) for device({}).", nodeSize * nNode, deviceId);
             return Status::OutOfMemory();
-        }
-        if (numaNode_ >= 0) {
-            UC_INFO("Bound CacheStore host buffer({}) for device({}) to NUMA node({}).", dataSize,
-                    deviceId, numaNode_);
         }
         if (mapHostToDevice_) {
             void* deviceData = nullptr;
             auto s = Status::OK();
-            if (registeredAllocation) {
+            if (!useDriverMemoryApi_) {
                 s = Trans::Buffer::GetHostDevicePointer(data_.get(), &deviceData);
             } else {
-                s = Trans::Buffer::RegisterHostBuffer(data_.get(), dataSize, &deviceData);
+                s = Trans::Buffer::RegisterHostBuffer(data_.get(), nodeSize * nNode, &deviceData);
                 registeredMappedHost_ = s.Success();
             }
             if (s.Failure()) [[unlikely]] {
                 UC_ERROR("Failed({}) to map pinned host buffer({}) to device({}).", s,
-                         dataSize, deviceId);
+                         nodeSize * nNode, deviceId);
                 return s;
             }
             dataOnDevice_ = static_cast<std::byte*>(deviceData);
@@ -343,7 +333,8 @@ protected:
         fs::path shmDir = "/dev/shm";
         if (!fs::exists(shmDir)) { return; }
         const auto now = fs::file_time_type::clock::now();
-        const auto keepThreshold = std::chrono::minutes(10);
+        const auto keepThreshold = std::chrono::minutes(30);
+        auto myUid = me.substr(prefix.size(), me.find('_', prefix.size()) - prefix.size());
         for (const auto& entry : fs::directory_iterator(shmDir)) {
             const auto& path = entry.path();
             const auto& name = path.filename().string();
@@ -351,6 +342,8 @@ protected:
                 name == me) {
                 continue;
             }
+            auto uid = name.substr(prefix.size(), name.find('_', prefix.size()) - prefix.size());
+            if (uid == myUid) { continue; }
             try {
                 const auto lwt = fs::last_write_time(path);
                 if (now - lwt <= keepThreshold) { continue; }
@@ -526,7 +519,6 @@ public:
     Status Setup() override
     {
         shmName_ = ShmPrefix() + uuid_;
-        CleanUpShmFileExceptMe(shmName_);
         PosixShm shmFile{shmName_};
         auto s = shmFile.ShmOpen(PosixShm::OpenFlag::READ_WRITE);
         if (s.Failure()) {
@@ -564,10 +556,10 @@ Status TransBuffer::Setup(const Config& config)
     bypassHitOnLoad_ = config.cacheLoadBackendOnly;
     try {
         if (!config.shareBufferEnable) {
+            auto useDriverMemoryApi = config.useDpc || !config.ioDirect;
             strategy_ = std::make_shared<LocalBufferStrategy>(
                 config.deviceId, config.shardSize, config.bufferCapacity,
-                config.loadExclusiveBufferNumber, config.ioDirect, config.cacheSdmaDirect,
-                config.numaNode);
+                config.loadExclusiveBufferNumber, useDriverMemoryApi, config.cacheSdmaDirect);
         } else if (config.deviceId >= 0) {
             strategy_ = std::make_shared<SharedBufferStrategy>(
                 config.uniqueId, config.deviceId, config.shardSize, config.bufferCapacity,
@@ -645,14 +637,8 @@ bool TransBuffer::ExistAt(size_t iBucket, const Detail::BlockId& blockId, size_t
     auto iNode = strategy_->FirstAt(iBucket);
     while (iNode != invalidIndex) {
         auto meta = strategy_->MetaAt(iNode);
-        strategy_->NodeLock(iNode);
-        if (meta->block == blockId && meta->shard == shardIdx) {
-            strategy_->NodeUnlock(iNode);
-            return true;
-        }
-        auto next = meta->next;
-        strategy_->NodeUnlock(iNode);
-        iNode = next;
+        if (meta->block == blockId && meta->shard == shardIdx) { return true; }
+        iNode = meta->next;
     }
     return false;
 }
@@ -663,8 +649,8 @@ size_t TransBuffer::FindAt(size_t iBucket, const Detail::BlockId& blockId, size_
     auto iNode = strategy_->FirstAt(iBucket);
     while (iNode != invalidIndex) {
         auto meta = strategy_->MetaAt(iNode);
-        strategy_->NodeLock(iNode);
         if (meta->block == blockId && meta->shard == shardIdx) {
+            strategy_->NodeLock(iNode);
             owner = meta->reference == 0;
             if (owner && meta->state.load(std::memory_order_relaxed) == State::FAILED) {
                 meta->state.store(State::LOADING, std::memory_order_relaxed);
@@ -675,9 +661,7 @@ size_t TransBuffer::FindAt(size_t iBucket, const Detail::BlockId& blockId, size_
             strategy_->NodeUnlock(iNode);
             break;
         }
-        auto next = meta->next;
-        strategy_->NodeUnlock(iNode);
-        iNode = next;
+        iNode = meta->next;
     }
     return iNode;
 }

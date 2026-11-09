@@ -310,11 +310,12 @@ struct TaskState {
 /** Communication failures are process-level, not request-level. */
 bool IsFatalCommunication(const Status& status) { return status == Status::StoreUnhealthy(); }
 
-uint32_t Owner(const Detail::BlockId& id, uint32_t worldSize)
+/** Rank that moves a task row through the backend: the caller's choice, else row % world. */
+uint32_t RowOwner(const Detail::TaskDesc& input, size_t row, uint32_t worldSize)
 {
-    uint64_t value = 0;
-    std::memcpy(&value, id.data(), std::min(sizeof(value), id.size()));
-    return static_cast<uint32_t>(value % worldSize);
+    if (worldSize == 1) { return 0; }
+    if (input.ownerRanks.empty()) { return static_cast<uint32_t>(row % worldSize); }
+    return input.ownerRanks[row];
 }
 
 uint64_t WindowTag(const TaskState& task, const WindowPlan& window)
@@ -488,33 +489,12 @@ public:
 
     void Prefetch(const Detail::BlockId* blocks, size_t num) override
     {
-        if (deviceId_ < 0 || !distributedLoadEnabled_) {
-            backend_->Prefetch(blocks, num);
-            return;
-        }
-        std::vector<Detail::BlockId> owned;
-        for (size_t i = 0; i < num; ++i) {
-            if (Owner(blocks[i], loadStorageWorldSize_) == loadStorageRank_) {
-                owned.push_back(blocks[i]);
-            }
-        }
-        if (!owned.empty()) { backend_->Prefetch(owned.data(), owned.size()); }
+        backend_->Prefetch(blocks, num);
     }
 
     void Prefetch(const Detail::Shard* shards, size_t num) override
     {
-        if (deviceId_ < 0 || !distributedLoadEnabled_) {
-            backend_->Prefetch(shards, num);
-            return;
-        }
-        std::vector<Detail::Shard> owned;
-        owned.reserve(num);
-        for (size_t i = 0; i < num; ++i) {
-            if (Owner(shards[i].owner, loadStorageWorldSize_) == loadStorageRank_) {
-                owned.push_back({shards[i].owner, shards[i].index, {}});
-            }
-        }
-        if (!owned.empty()) { backend_->Prefetch(owned.data(), owned.size()); }
+        backend_->Prefetch(shards, num);
     }
 
     Status CheckHealth() override { return backend_->CheckHealth(); }
@@ -554,6 +534,21 @@ public:
     }
 
 private:
+    /** Start backend fills for every row this rank will load, ahead of its windows. */
+    void PrefetchOwnedRows(const TaskState& task)
+    {
+        std::vector<Detail::Shard> owned;
+        owned.reserve(task.input.size());
+        for (const auto& window : task.windows) {
+            for (size_t i = 0; i < window.rows.size(); ++i) {
+                if (window.owners[i] != loadStorageRank_) { continue; }
+                const auto& shard = task.input[window.rows[i]];
+                owned.push_back({shard.owner, shard.index, {}});
+            }
+        }
+        if (!owned.empty()) { backend_->Prefetch(owned.data(), owned.size()); }
+    }
+
     Status AllocateBuffers()
     {
         const size_t windowBytes = windowBlocks_ * shardSize_;
@@ -654,6 +649,18 @@ private:
     Expected<Detail::TaskHandle> Submit(TaskState::Operation operation, Detail::TaskDesc input)
     {
         if (input.empty()) { return Status::InvalidParam("empty allgather task"); }
+        if (!input.ownerRanks.empty()) {
+            if (input.ownerRanks.size() != input.size()) {
+                return Status::InvalidParam("invalid allgather owner count({}/{})",
+                                            input.ownerRanks.size(), input.size());
+            }
+            for (const auto owner : input.ownerRanks) {
+                if (owner >= worldSize_) {
+                    return Status::InvalidParam("invalid allgather owner({}/{})", owner,
+                                                worldSize_);
+                }
+            }
+        }
         for (const auto& shard : input) {
             if (shard.addrs.size() != tensorSizes_.size()) {
                 return Status::InvalidParam("invalid allgather address count({}/{})",
@@ -723,7 +730,7 @@ private:
         std::iota(order.begin(), order.end(), 0);
         size_t windowCount = 0;
         for (const auto row : order) {
-            owners[row] = Owner(input[row].owner, storageWorldSize);
+            owners[row] = RowOwner(input, row, storageWorldSize);
             ownerSlots[row] = counts[owners[row]]++;
             windowCount = std::max(windowCount, ownerSlots[row] / windowBlocks_ + 1);
         }
@@ -973,7 +980,7 @@ private:
         for (size_t i = 0; i < loadSlots_.size(); ++i) { freeSlots.push_back(i); }
         size_t nextWindow = 0;
         const auto prefetchStarted = Clock::now();
-        Prefetch(task->input.data(), task->input.size());
+        PrefetchOwnedRows(*task);
         metrics.prefetchMs = Milliseconds(Clock::now() - prefetchStarted);
         auto submitReadyWindows = [&] {
             while (nextWindow < task->windows.size() && !freeSlots.empty()) {
@@ -1021,7 +1028,7 @@ private:
         if (task->stageTrace) { stageTraceRecords.reserve(task->windows.size()); }
 
         const auto prefetchStarted = Clock::now();
-        Prefetch(task->input.data(), task->input.size());
+        PrefetchOwnedRows(*task);
         metrics.prefetchMs = Milliseconds(Clock::now() - prefetchStarted);
         auto reclaim = [&](size_t slotIndex) {
             auto& slot = *loadSlots_[slotIndex];

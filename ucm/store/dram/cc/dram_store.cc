@@ -42,16 +42,6 @@
 
 namespace UC::Dram {
 
-// Synchronize an optional compute-stream event before a dump task is submitted.
-// DramStore owns no NPU stream; the real D2H is an RDMA Read executed on the
-// remote DramPool directly against this client's device memory.
-// RDMA and the compute stream are unordered, so the only safe point is to
-// block on the prerequisite event here, before the control message is sent.
-static Status WaitPrerequisiteEvent(std::uintptr_t eventHandle)
-{
-    return Trans::Event{eventHandle}.Synchronize();
-}
-
 class DramStore final : public StoreV1 {
 public:
     DramStore() = default;
@@ -73,6 +63,7 @@ public:
     Status Wait(Detail::TaskHandle taskId) override;
 
 private:
+    Status RegisterKvBuffers(const DramConfig& config);
     Expected<Detail::TaskHandle> SubmitTransfer(OpType op, Detail::TaskDesc task);
     Status Start();
 
@@ -90,12 +81,13 @@ private:
 
     Status Compose()
     {
+        const auto runtimeDeviceId = config_->RuntimeDeviceId();
         UC::Trans::Device device;
         const auto initStatus = device.Init();
         if (initStatus.Failure() && initStatus != Status::DuplicateKey()) {
             return Status::Error("aclInit failed: " + initStatus.ToString());
         }
-        const auto setupStatus = device.Setup(config_->deviceId);
+        const auto setupStatus = device.Setup(runtimeDeviceId);
         if (setupStatus.Failure()) {
             return Status::Error("aclrtSetDevice failed: " + setupStatus.ToString());
         }
@@ -105,13 +97,11 @@ private:
         const auto transferTimeout =
             std::max(config_->taskTimeouts.load, config_->taskTimeouts.dump);
         TransportManagerBackendOptions backendOpts{
-            config_->localControlHost,
-            config_->localControlPort,
-            config_->localTransportManagerId,
-            config_->localHost,
-            config_->deviceId,
+            config_->localAddr,
+            runtimeDeviceId,
             config_->hixlListenPort,
             config_->enableHixlCs,
+            config_->managerMaxThreads,
             1000,
             static_cast<std::int32_t>(std::min<std::int64_t>(
                 transferTimeout.count(), std::numeric_limits<std::int32_t>::max())),
@@ -121,8 +111,8 @@ private:
         transportBackend_ = std::move(createdBackend).Value();
 
         auto createdReplies = ReplyService::Create(ReplyService::Options{
-            config_->deviceId, config_->replySlotSize, config_->replySlotCount,
-            std::chrono::microseconds{50}, [this](NodeId nodeId, NodeEvent event) {
+            runtimeDeviceId, config_->replySlotSize, config_->replySlotCount,
+            config_->nodeScheduler.pollInterval, [this](NodeId nodeId, NodeEvent event) {
                 nodeScheduler_->Publish(nodeId, std::move(event));
             }});
         if (!createdReplies) { return createdReplies.Error(); }
@@ -154,30 +144,27 @@ private:
             config_->nodeScheduler,
             NodeDependencies{
                 [this](std::vector<RequestCompleted>& events) { taskManager_->Publish(events); },
-                [this](TransportCommand& command) {
-                    return transport_ ? transport_->TryPost(command)
-                                      : Status::Error("TransportExecutor is unavailable");
-                },
+                [this](TransportCommand& command) { return transport_->TryPost(command); },
                 [this](const RequestToken& token, OpType op,
                        std::size_t entryCount) -> Expected<ReplySlot> {
-                    return replyService_
-                               ? replyService_->Acquire(token, op, entryCount)
-                               : Expected<ReplySlot>{Status::Error("ReplyService is unavailable")};
+                    return replyService_->Acquire(token, op, entryCount);
                 },
                 [this](const RequestToken& token, const ReplySlot& slot) {
-                    return replyService_ ? replyService_->Release(token, slot)
-                                         : Status::Error("ReplyService is unavailable");
-                }});
+                    return replyService_->Release(token, slot);
+                },
+                [](std::uintptr_t handle) { return Trans::Event{handle}.Query(); }});
 
         taskManager_ = std::make_unique<TaskManager>(
             TaskManagerConfig{config_->tensorSizes, config_->maxIoEntries,
                               config_->nodeScheduler.limits.maxBatchEntries, config_->taskTimeouts},
-            TaskManagerDependencies{router_, [this](Request& request) {
-                                        return nodeScheduler_
-                                                   ? nodeScheduler_->Post(request)
-                                                   : Status::Error("NodeScheduler is unavailable");
-                                    }});
-        return config_->role == Role::SCHEDULER ? Start() : Status::OK();
+            TaskManagerDependencies{
+                router_, [this](Request& request) { return nodeScheduler_->Post(request); },
+                [this] { nodeScheduler_->Shutdown(); }});
+        if (config_->GetRole() == Role::WORKER) {
+            const auto registerStatus = RegisterKvBuffers(*config_);
+            if (registerStatus.Failure()) { return registerStatus; }
+        }
+        return Start();
 #else
         return Status::Unsupported();
 #endif
@@ -231,11 +218,47 @@ Status DramStore::Setup(const Detail::Dictionary& config)
     }
     UC_INFO(
         "DramStore setup succeeded, role={} device_id={} nodes={} max_io_entries={} "
-        "max_batch_entries={} max_inflight_per_node={} reply_slots={}",
-        config_->role == Role::SCHEDULER ? "scheduler" : "worker", config_->deviceId,
+        "max_batch_entries={} max_inflight_per_node={} reply_slots={} poll_interval_us={}",
+        config_->GetRole() == Role::SCHEDULER ? "scheduler" : "worker", config_->deviceId,
         config_->nodeScheduler.nodes.size(), config_->maxIoEntries,
         config_->nodeScheduler.limits.maxBatchEntries,
-        config_->nodeScheduler.limits.maxInflightRequests, config_->replySlotCount);
+        config_->nodeScheduler.limits.maxInflightRequests, config_->replySlotCount,
+        config_->nodeScheduler.pollInterval.count());
+    return Status::OK();
+}
+
+Status DramStore::RegisterKvBuffers(const DramConfig& config)
+{
+    if (config.gpuKvBufferAddrs.empty()) { return Status::OK(); }
+    if (!transportBackend_) { return Status::Error("DramStore transport backend is unavailable"); }
+
+    const auto firstHandle = memoryHandles_.size();
+    memoryHandles_.reserve(firstHandle + config.gpuKvBufferAddrs.size());
+
+    for (std::size_t index = 0; index < config.gpuKvBufferAddrs.size(); ++index) {
+        auto registered = transportBackend_->RegisterMemory(
+            reinterpret_cast<void*>(config.gpuKvBufferAddrs[index]), config.gpuKvBufferSizes[index],
+            MemoryRegionType::DEVICE);
+        if (registered) {
+            memoryHandles_.push_back(std::move(registered).Value());
+            continue;
+        }
+
+        auto result = registered.Error();
+        while (memoryHandles_.size() > firstHandle) {
+            const auto cleanup = transportBackend_->UnregisterMemory(memoryHandles_.back());
+            if (cleanup.Failure()) {
+                result = cleanup;
+                break;
+            }
+            memoryHandles_.pop_back();
+        }
+        UC_ERROR("DramStore GPU KV buffer registration failed, failed_index={} count={} status={}",
+                 index, config.gpuKvBufferAddrs.size(), result);
+        return result;
+    }
+
+    UC_INFO("DramStore GPU KV buffers registered, count={}", config.gpuKvBufferAddrs.size());
     return Status::OK();
 }
 
@@ -262,7 +285,7 @@ Status DramStore::Start()
         return status;
     }
     UC_INFO("DramStore started, role={} nodes={}",
-            config_->role == Role::SCHEDULER ? "scheduler" : "worker",
+            config_->GetRole() == Role::SCHEDULER ? "scheduler" : "worker",
             config_->nodeScheduler.nodes.size());
     return Status::OK();
 }
@@ -317,13 +340,6 @@ Expected<Detail::TaskHandle> DramStore::Load(Detail::TaskDesc task)
 
 Expected<Detail::TaskHandle> DramStore::Dump(Detail::TaskDesc task)
 {
-    auto status = WaitPrerequisiteEvent(task.prerequisiteHandle);
-    if (status.Failure()) {
-        UC_ERROR("DramStore dump prerequisite wait failed, prerequisite_handle={} status={}",
-                 task.prerequisiteHandle, status);
-        return status;
-    }
-    task.prerequisiteHandle = 0;
     return SubmitTransfer(OpType::DUMP, std::move(task));
 }
 

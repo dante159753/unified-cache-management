@@ -76,14 +76,12 @@ void HealthBreakerStore::Stop()
 
 size_t HealthBreakerStore::FailureCount() const
 {
-    std::lock_guard<std::mutex> lock(healthMutex_);
-    return failureCount_;
+    return health_ ? health_->Snapshot().probeFailures : 0;
 }
 
 size_t HealthBreakerStore::SampleCount() const
 {
-    std::lock_guard<std::mutex> lock(healthMutex_);
-    return healthResults_.size();
+    return health_ ? health_->Snapshot().probeSamples : 0;
 }
 
 Status HealthBreakerStore::Setup(const Detail::Dictionary&)
@@ -92,7 +90,7 @@ Status HealthBreakerStore::Setup(const Detail::Dictionary&)
 }
 
 Status HealthBreakerStore::Setup(StoreV1* store, std::string storeId,
-                                 const StoreHealthConfig& config)
+                                 const Detail::StoreHealthConfig& config)
 {
     if (healthCheck_ || probeThread_.joinable()) {
         return Status::InvalidParam("health breaker store is already set up");
@@ -104,6 +102,7 @@ Status HealthBreakerStore::Setup(StoreV1* store, std::string storeId,
     store_ = store;
     storeId_ = std::move(storeId);
     config_ = config;
+    health_ = std::make_unique<Detail::HealthTracker>("PipelineStore", storeId_, config_);
     healthCheck_ = std::make_unique<Detail::HealthCheckExecutor>(config_.healthCheckTimeout);
     return Status::OK();
 }
@@ -113,19 +112,28 @@ std::string HealthBreakerStore::Readme() const { return "HealthBreakerStore(" + 
 Expected<std::vector<uint8_t>> HealthBreakerStore::Lookup(const Detail::BlockId* blocks, size_t num)
 {
     if (!Enabled()) { return std::vector<uint8_t>(num, 0); }
-    return store_->Lookup(blocks, num);
+    const auto generation = health_->Generation();
+    auto result = store_->Lookup(blocks, num);
+    RecordPassiveResult(result ? Status::OK() : result.Error(), generation);
+    return result;
 }
 
 Expected<ssize_t> HealthBreakerStore::LookupOnPrefix(const Detail::BlockId* blocks, size_t num)
 {
     if (!Enabled()) { return static_cast<ssize_t>(-1); }
-    return store_->LookupOnPrefix(blocks, num);
+    const auto generation = health_->Generation();
+    auto result = store_->LookupOnPrefix(blocks, num);
+    RecordPassiveResult(result ? Status::OK() : result.Error(), generation);
+    return result;
 }
 
 Expected<ssize_t> HealthBreakerStore::LookupOnReverse(const Detail::BlockId* blocks, size_t num)
 {
     if (!Enabled()) { return static_cast<ssize_t>(-1); }
-    return store_->LookupOnReverse(blocks, num);
+    const auto generation = health_->Generation();
+    auto result = store_->LookupOnReverse(blocks, num);
+    RecordPassiveResult(result ? Status::OK() : result.Error(), generation);
+    return result;
 }
 
 void HealthBreakerStore::Prefetch(const Detail::BlockId* blocks, size_t num)
@@ -141,14 +149,9 @@ void HealthBreakerStore::Prefetch(const Detail::Shard* shards, size_t num)
 Status HealthBreakerStore::CheckHealth()
 {
     if (!healthCheck_) { return Status::InvalidParam("health breaker store is not set up"); }
+    const auto generation = health_->Generation();
     auto status = healthCheck_->Run([this] { return store_->CheckHealth(); });
-    if (status == Status::Timeout()) {
-        UC_WARN("Store health check({}) timed out after {} ms.", storeId_,
-                config_.healthCheckTimeout.count());
-    } else if (status.Failure()) {
-        UC_WARN("Store health check({}) failed({}).", storeId_, status);
-    }
-    RecordHealth(status.Success());
+    health_->RecordProbe(generation, status);
     RecordProbeMetrics(status.Success());
     return status;
 }
@@ -157,6 +160,13 @@ Expected<Detail::TaskHandle> HealthBreakerStore::Load(Detail::TaskDesc task)
 {
     if (!Enabled()) { return Status::StoreUnhealthy(storeId_); }
     return store_->Load(std::move(task));
+}
+
+Expected<Detail::TaskHandle> HealthBreakerStore::LoadOnToken(
+    Detail::TaskDesc task, const std::vector<Detail::TokenFilter>& filter)
+{
+    if (!Enabled()) { return Status::StoreUnhealthy(storeId_); }
+    return store_->LoadOnToken(std::move(task), filter);
 }
 
 Expected<Detail::TaskHandle> HealthBreakerStore::Dump(Detail::TaskDesc task)
@@ -170,58 +180,35 @@ Expected<bool> HealthBreakerStore::Check(Detail::TaskHandle taskId)
     return store_->Check(taskId);
 }
 
-Status HealthBreakerStore::Wait(Detail::TaskHandle taskId) { return store_->Wait(taskId); }
-
-void HealthBreakerStore::RecordHealth(bool healthy)
+Status HealthBreakerStore::Wait(Detail::TaskHandle taskId)
 {
-    bool oldEnabled = false;
-    bool newEnabled = false;
-    size_t failureCount = 0;
-    size_t sampleCount = 0;
-    std::string healthWindow;
-    {
-        std::lock_guard<std::mutex> lock(healthMutex_);
-        if (healthResults_.size() == config_.healthWindowSize) {
-            if (!healthResults_.front()) { --failureCount_; }
-            healthResults_.pop_front();
-        }
-        healthResults_.push_back(healthy);
-        if (!healthy) { ++failureCount_; }
-
-        oldEnabled = enabled_.load(std::memory_order_relaxed);
-        newEnabled = oldEnabled;
-        if (oldEnabled && failureCount_ >= config_.failureThreshold) {
-            newEnabled = false;
-        } else if (!oldEnabled && healthResults_.size() == config_.healthWindowSize &&
-                   failureCount_ == 0) {
-            newEnabled = true;
-        }
-        enabled_.store(newEnabled, std::memory_order_release);
-        failureCount = failureCount_;
-        sampleCount = healthResults_.size();
-        if (oldEnabled != newEnabled) {
-            for (bool result : healthResults_) {
-                if (!healthWindow.empty()) { healthWindow += ", "; }
-                healthWindow += result ? "success" : "failure";
-            }
-        }
+    const auto generation = health_->Generation();
+    auto status = store_->Wait(taskId);
+    if (RecordPassiveResult(status, generation) && status.Failure()) {
+        // change to unhealthy so it will not be count as failure again in upper store
+        return Status::StoreUnhealthy(fmt::format("{}: {}", storeId_, status));
+    } else {
+        return status;
     }
-    if (oldEnabled != newEnabled) {
-        UC_WARN(
-            "Store health breaker({}) transitioned to {}, window=[{}], samples={}, failures={}, "
-            "threshold={}.",
-            storeId_, newEnabled ? "HEALTHY" : "UNHEALTHY", healthWindow, sampleCount, failureCount,
-            config_.failureThreshold);
+}
+
+// Returns whether the result was counted as a passive health sample.
+bool HealthBreakerStore::RecordPassiveResult(const Status& status, uint64_t generation)
+{
+    if (config_.passiveEnabled && Detail::ShouldRecordResult(status)) {
+        if (health_->RecordIo(generation, status)) { RecordEffectiveHealth(); }
+        if (status.Failure() && storeId_.find(":MooncakeStore") != std::string::npos) {
+            UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("mooncake_passive_failures_total"), 1.0);
+        }
+        return true;
+    } else {
+        return false;
     }
 }
 
 void HealthBreakerStore::RecordProbeMetrics(bool healthy)
 {
-    if (storeId_.find(":PosixStore") != std::string::npos) {
-        UC::Metrics::UpdateStats(healthy ? NAME_TO_METRIC_ID("posix_healthy_count_total")
-                                         : NAME_TO_METRIC_ID("posix_unhealthy_count_total"),
-                                 1.0);
-    } else if (storeId_.find(":MooncakeStore") != std::string::npos) {
+    if (storeId_.find(":MooncakeStore") != std::string::npos) {
         UC::Metrics::UpdateStats(healthy ? NAME_TO_METRIC_ID("mooncake_healthy_count_total")
                                          : NAME_TO_METRIC_ID("mooncake_unhealthy_count_total"),
                                  1.0);
@@ -231,9 +218,7 @@ void HealthBreakerStore::RecordProbeMetrics(bool healthy)
 
 void HealthBreakerStore::RecordEffectiveHealth()
 {
-    if (storeId_.find(":PosixStore") != std::string::npos) {
-        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("posix_store_health"), Enabled() ? 1.0 : 0.0);
-    } else if (storeId_.find(":MooncakeStore") != std::string::npos) {
+    if (storeId_.find(":MooncakeStore") != std::string::npos) {
         UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("mooncake_store_health"), Enabled() ? 1.0 : 0.0);
     }
 }
@@ -249,6 +234,7 @@ void HealthBreakerStore::ProbeLoop()
     while (!stopCv_.wait_for(lock, delay, [this] { return stop_; })) {
         lock.unlock();
         const auto start = std::chrono::steady_clock::now();
+        if (config_.passiveEnabled) { health_->SamplePassiveWindow(start); }
         CheckHealth();
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start);

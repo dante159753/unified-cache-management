@@ -52,6 +52,7 @@ namespace {
 constexpr std::size_t kQueueCapacity = 16;
 constexpr std::size_t kValueLength = 16;
 constexpr std::size_t kFlagSlotSize = 64;
+constexpr std::size_t kManagerMaxThreads = 1;
 constexpr std::uint64_t kRequestId = 42;
 constexpr char kUnavailablePeer[] = "127.0.0.1:29000";
 
@@ -162,7 +163,7 @@ protected:
     std::unique_ptr<MetadataManager> metadata_;
     BufferPool flagBufferPool_;
     ProtocolManager protocols_;
-    transport::TransportManager manager_{"127.0.0.1:28000"};
+    transport::TransportManager manager_{"127.0.0.1:28000", kManagerMaxThreads};
     std::unique_ptr<DramPoolRuntime> runtime_;
     std::unique_ptr<CompletionPoller> poller_;
     DramPoolConfig savedConfig_;
@@ -302,14 +303,15 @@ TEST_F(CompletionPollerTest, CompletedDumpDeletesEntryWhenStoreEndFails)
     EXPECT_FALSE(metadata_->Query(key));
 }
 
-TEST_F(CompletionPollerTest, FailedDumpHandlesMissingMetadataAndOutOfRangeResult)
+TEST_F(CompletionPollerTest, FailedDumpHandlesMissingMetadataAndSparseResultIndices)
 {
     const auto reservedKey = KeyFromHex("a4");
     const auto missingKey = KeyFromHex("a5");
     ReserveEntry(reservedKey);
     CompletionRecord record;
     record.opcode = OpType::DUMP;
-    record.results = {ResultCode(DumpLoadResult::Ok)};
+    // Results cover the whole request; item 1 did not require a data transfer.
+    record.results.assign(3, ResultCode(DumpLoadResult::Ok));
     record.transfer_items = {
         TransferItem{0, reservedKey},
         TransferItem{2, missingKey }
@@ -317,7 +319,9 @@ TEST_F(CompletionPollerTest, FailedDumpHandlesMissingMetadataAndOutOfRangeResult
 
     poller_->SettleDataTransfer(record, transport::TransferStatus::Failed);
 
-    EXPECT_EQ(record.results, (std::vector<std::uint8_t>{ResultCode(DumpLoadResult::Failed)}));
+    EXPECT_EQ(record.results, (std::vector<std::uint8_t>{ResultCode(DumpLoadResult::Failed),
+                                                         ResultCode(DumpLoadResult::Ok),
+                                                         ResultCode(DumpLoadResult::Failed)}));
     EXPECT_FALSE(metadata_->Query(reservedKey));
     EXPECT_TRUE(record.transfer_items.empty());
 }

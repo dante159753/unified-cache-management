@@ -41,6 +41,7 @@ ENABLE_SPARSE = os.getenv("ENABLE_SPARSE", "0").lower() in (
     "on",
 )
 ENABLE_UCM_PATCH = os.environ.get("ENABLE_UCM_PATCH", "").lower() in ("1", "true")
+ENABLE_GSA_PATCH = os.environ.get("ENABLE_GSA_PATCH", "").lower() in ("1", "true")
 
 
 def _strip_build(v: Optional[str]) -> Optional[str]:
@@ -51,6 +52,7 @@ def _strip_build(v: Optional[str]) -> Optional[str]:
 
 
 def _norm_version(v: Optional[str]) -> Optional[str]:
+    v = _strip_build(v)
     if not v:
         return None
     # common suffixes: 0.11.0.post1 / 0.11.0rc1
@@ -136,7 +138,9 @@ def get_supported_versions() -> list[str]:
         "0.25.1",
         "0.26.0",
         "0.27.0",
+        "0.27.1",
         "0.28.0",
+        "0.30.0",
     ]
 
 
@@ -147,9 +151,6 @@ def apply_all_patches() -> None:
         from ucm.integration.vllm.patch.logger_patch import patch_logger
 
         if not ENABLE_UCM_PATCH:
-            logger.warning(
-                "UCM patching is disabled. Set ENABLE_UCM_PATCH=1 to enable it."
-            )
             return
 
         version = get_vllm_version()
@@ -211,6 +212,22 @@ def apply_all_patches() -> None:
             case "0.19.1":
                 logger.info("UCM patching vllm for pc...")
                 import ucm.integration.vllm.patch.v0191.vllm.pc_patch
+            case "0.23.0":
+                if ENABLE_GSA_PATCH:
+                    logger.info("UCM patching vllm 0.23.0 for GSA sparse attention...")
+
+                    import ucm.sandbox.sparse.gsav2.patch.v0230.vllm.block_table_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0230.vllm.engine_core_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0230.vllm.gpu_model_runner_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0230.vllm.gpu_worker_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0230.vllm.kv_cache_manager_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0230.vllm.mla_attention_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0230.vllm.sched_output_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0230.vllm.scheduler_patch
+                else:
+                    logger.info(
+                        "UCM GSA vllm patches skipped (ENABLE_GSA_PATCH is not set)."
+                    )
             case _:
                 pass
 
@@ -227,11 +244,33 @@ def apply_all_patches() -> None:
             )
             import ucm.integration.vllm.patch.gpu_worker_memory_reservation_patch
 
+        if (int(major), int(minor)) >= (0, 23):
+            logger.info("UCM patching vllm Model Runner V2 preemption order...")
+            import ucm.integration.vllm.patch.v0230.vllm.v2_preemption_order_patch
+
+        if (int(major), int(minor)) >= (0, 24):
+            logger.info(
+                "UCM patching vllm for EngineCore startup-failure worker shutdown..."
+            )
+            import ucm.integration.vllm.patch.engine_core_startup_shutdown_patch
+
         # vllm_ascend patches
         # Disable CpuAlloc.bind_memory BEFORE any cpu_binding_patch so that
         # bind_memory is a no-op before bind_threads replacement is installed.
         logger.info("UCM patching vllm-ascend bind_memory to no-op...")
         import ucm.integration.vllm.patch.bind_memory_patch
+
+        # The CPU binding patch is version-independent since 0.26.0: the fixed
+        # implementation wraps the upstream CpuAlloc methods (see
+        # cpu_binding_affinity_patch.*_fixed), so every release >= 0.26.0 is
+        # patched here; older versions keep their per-version cpu_binding
+        # patches inside the match below. @when_imported is self-guarding
+        # (only fires when vllm_ascend.cpu_binding exists).
+        if ascend_version is not None and tuple(
+            int(part) for part in ascend_version.split(".")
+        )[:2] >= (0, 26):
+            logger.info("UCM patching vllm-ascend CPU binding (fixed impl)...")
+            import ucm.integration.vllm.patch.v0260.vllm_ascend.cpu_binding_patch
 
         match ascend_version:
             case "0.11.0":
@@ -277,7 +316,35 @@ def apply_all_patches() -> None:
                 )
                 import ucm.integration.vllm.patch.v0230.vllm_ascend.ascend_hybrid_cache_patch
                 import ucm.integration.vllm.patch.v0230.vllm_ascend.cpu_binding_patch
-                import ucm.integration.vllm.patch.v0230.vllm_ascend.sfa_kv_transfer_patch
+
+                if ENABLE_GSA_PATCH:
+                    # GSA-aware SFA forward (drives
+                    # maybe_execute_sparse_attention_begin/finished and the
+                    # gsa_prefetch/warmup/swap top-k bookkeeping). Replaces
+                    # the plain SFA KV-transfer forward below.
+                    logger.info(
+                        "UCM patching vllm-ascend 0.23.0 SFA with the GSA "
+                        "forward (ENABLE_GSA_PATCH is set)..."
+                    )
+                    # GSA runtime monkey-patches (Python portions of
+                    # vllm-ascend-adapt-1020-c8.patch). The C++ ops registered
+                    # in csrc/torch_binding*.cpp still require the build-time
+                    # patch vllm-ascend-csrc-build-1020-c8.patch to be applied
+                    # before `pip install -v -e .` so the gsa_* ops are
+                    # compiled in.
+                    import ucm.sandbox.sparse.gsav2.patch.v0230.vllm_ascend.block_table_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0230.vllm_ascend.device_op_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0230.vllm_ascend.model_runner_v1_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0230.vllm_ascend.sfa_kv_transfer_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0230.vllm_ascend.sfa_v1_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0230.vllm_ascend.worker_patch
+                else:
+                    # Plain SFA KV-transfer forward (no GSA hooks).
+                    logger.info(
+                        "UCM patching vllm-ascend 0.23.0 SFA with the plain "
+                        "KV-transfer forward (ENABLE_GSA_PATCH is not set)..."
+                    )
+                    import ucm.integration.vllm.patch.v0230.vllm_ascend.sfa_kv_transfer_patch
                 import ucm.integration.vllm.patch.v0230.vllm_ascend.worker_memory_reservation_patch
             case "0.24.0":
                 logger.info(
@@ -293,11 +360,17 @@ def apply_all_patches() -> None:
                 )
                 import ucm.integration.vllm.patch.v0251.vllm_ascend.ascend_hybrid_cache_patch
                 import ucm.integration.vllm.patch.v0251.vllm_ascend.cpu_binding_patch
-            case "0.26.0":
-                logger.info("UCM patching vllm-ascend 0.26.0 for CPU affinity...")
-                import ucm.integration.vllm.patch.v0260.vllm_ascend.cpu_binding_patch
+            case "0.30.0":
+                logger.info(
+                    "UCM patching vllm-ascend 0.30.0 for chunked-prefill alignment..."
+                )
+                import ucm.integration.vllm.patch.v0300.vllm_ascend.balance_sync_kv_load_patch
+                import ucm.integration.vllm.patch.v0300.vllm_ascend.mamba_block_aligned_split_patch
             case _:
                 pass
+
+        if ascend_version and tuple(map(int, ascend_version.split(".")[:2])) >= (0, 26):
+            import ucm.integration.vllm.patch.v0260.vllm_ascend.minimax_m3_kv_transfer_patch
 
         # Fix: vllm-ascend >= 0.21.0 defers do_mamba_copy_block to after
         # start_load_kv, overwriting UCM-loaded data. @when_imported is
@@ -308,6 +381,13 @@ def apply_all_patches() -> None:
         # so wait_for_layer_load/save_kv_layer are never called. @when_imported
         # only fires when vllm.models.kimi_k3.nvidia.mla is imported.
         import ucm.integration.vllm.patch.v0270.vllm.models.kimi_k3.nvidia.kimi_k3_mla_kv_hook_patch
+        import ucm.integration.vllm.patch.v0271.vllm.minimax_m3_kv_transfer_patch
+
+        # GDN/KDA (hybrid linear-attention) forwards never receive
+        # @maybe_transfer_kv_layer; wire the per-layer KV hooks in for the
+        # layerwise v2 connector. @when_imported is self-guarding (only fires
+        # when the GDN modules exist).
+        import ucm.integration.vllm.patch.v0300.mamba_layer_hooks_patch
 
         logger.info("UCM patch initialization completed!")
 

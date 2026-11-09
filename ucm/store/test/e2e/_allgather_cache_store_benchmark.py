@@ -130,9 +130,8 @@ def _owner_counts(
     seed: int, batch: int, block_count: int, world_size: int
 ) -> list[int]:
     counts = [0] * world_size
-    for block_id in _make_block_ids(seed, batch, block_count):
-        owner = int.from_bytes(block_id[:8], byteorder="little") % world_size
-        counts[owner] += 1
+    for row in range(len(_make_block_ids(seed, batch, block_count))):
+        counts[row % world_size] += 1
     return counts
 
 
@@ -210,10 +209,10 @@ def _make_store_config(
         "io_direct": True,
         "timeout_ms": args.timeout_ms,
     }
-    if scatter_only:
+    if scatter_only or use_allgather:
         config["local_rank_size"] = world_size
     if args.cache_numa_nodes is not None:
-        config["cache_numa_node"] = args.cache_numa_nodes[rank]
+        config["cache_detected_numa_node"] = args.cache_numa_nodes[rank]
     if use_allgather:
         replicated_data = not args.local_coalesced
         config.update(
@@ -332,10 +331,7 @@ def _run_iterations(
                         first = int(torch.nonzero(mismatch.flatten())[0].item())
                         actual = int(tensor.flatten()[first].item())
                         mismatch_count = int(torch.count_nonzero(mismatch).item())
-                        owner = (
-                            int.from_bytes(block_ids[row][:8], byteorder="little")
-                            % world_size
-                        )
+                        owner = row % world_size
                         raise RuntimeError(
                             f"roundtrip mismatch at rank {rank}, row {row}, "
                             f"owner {owner}, tensor {tensor_index}, offset {first}, "

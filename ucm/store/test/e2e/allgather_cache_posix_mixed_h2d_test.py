@@ -40,8 +40,13 @@ def _aligned_size(sizes: tuple[int, ...]) -> int:
     return (sum(sizes) + 4095) // 4096 * 4096
 
 
-def _owner(block_id: bytes, world_size: int) -> int:
-    return int.from_bytes(block_id[:8], byteorder="little") % world_size
+def _owner(position: int, world_size: int) -> int:
+    """Owner rank of a block by its position in the request, as the connector does."""
+    return position % world_size
+
+
+def _owner_ranks(request_len: int, world_size: int) -> list[int]:
+    return [_owner(position, world_size) for position in range(request_len)]
 
 
 def _make_requests(
@@ -134,7 +139,7 @@ def _make_load_store(
     config.update(
         {
             "store_pipeline": "AllGather|Cache|Posix",
-            "share_buffer_enable": False,
+            "local_rank_size": world_size,
             "cache_load_backend_only": False,
             "cache_buffer_capacity_gb": args.cache_capacity_gb,
             "cache_stream_number": args.cache_streams,
@@ -154,7 +159,7 @@ def _make_load_store(
         }
     )
     if args.cache_numa_nodes is not None:
-        config["cache_numa_node"] = args.cache_numa_nodes[rank]
+        config["cache_detected_numa_node"] = args.cache_numa_nodes[rank]
     return UcmPipelineStore(config)
 
 
@@ -171,7 +176,9 @@ def _seed_posix(
     tasks = []
     for block_ids in requests:
         owned = [
-            block_id for block_id in block_ids if _owner(block_id, world_size) == rank
+            block_id
+            for position, block_id in enumerate(block_ids)
+            if _owner(position, world_size) == rank
         ]
         if owned:
             tasks.append(store.dump(owned, [0] * len(owned), [[packed]] * len(owned)))
@@ -181,8 +188,8 @@ def _seed_posix(
     owned_ids = [
         block_id
         for request in requests
-        for block_id in request
-        if _owner(block_id, world_size) == rank
+        for position, block_id in enumerate(request)
+        if _owner(position, world_size) == rank
     ]
     if owned_ids and not bool(store.lookup(owned_ids).all()):
         raise RuntimeError(f"rank {rank} failed to seed every owned block into POSIX")
@@ -207,13 +214,20 @@ def _warm_cache(
     requests: list[list[bytes]],
     tensors,
     positions: list[int],
+    world_size: int,
 ) -> None:
     flat_ids = [block_id for request in requests for block_id in request]
+    request_size = len(requests[0])
     warm_ids = [flat_ids[position] for position in positions]
     warm_tensors = [tensors[position] for position in positions]
+    warm_owners = [
+        _owner(position % request_size, world_size) for position in positions
+    ]
     if not warm_ids:
         return
-    task = store.load(warm_ids, [0] * len(warm_ids), warm_tensors)
+    task = store.load(
+        warm_ids, [0] * len(warm_ids), warm_tensors, owner_ranks=warm_owners
+    )
     store.wait(task)
 
 
@@ -225,6 +239,7 @@ def _run_round(
     tensors,
     device: str,
     batch_load_requests: bool,
+    world_size: int,
 ) -> dict[str, float]:
     request_tensors = []
     offset = 0
@@ -237,10 +252,22 @@ def _run_round(
     started = time.perf_counter()
     if batch_load_requests:
         flat_ids = [block_id for request in requests for block_id in request]
-        tasks = [store.load(flat_ids, [0] * len(flat_ids), tensors)]
+        flat_owners = [
+            owner
+            for request in requests
+            for owner in _owner_ranks(len(request), world_size)
+        ]
+        tasks = [
+            store.load(flat_ids, [0] * len(flat_ids), tensors, owner_ranks=flat_owners)
+        ]
     else:
         tasks = [
-            store.load(block_ids, [0] * len(block_ids), dst)
+            store.load(
+                block_ids,
+                [0] * len(block_ids),
+                dst,
+                owner_ranks=_owner_ranks(len(block_ids), world_size),
+            )
             for block_ids, dst in zip(requests, request_tensors)
         ]
     submitted = time.perf_counter()
@@ -339,7 +366,7 @@ def _worker(
             positions, per_request = _warm_selection(
                 requests, args.cache_ratio, args.cache_seed, round_index
             )
-            _warm_cache(load_store, requests, tensors, positions)
+            _warm_cache(load_store, requests, tensors, positions, world_size)
             _synchronize(torch, "npu")
             record = _run_round(
                 torch,
@@ -349,14 +376,16 @@ def _worker(
                 tensors,
                 device,
                 args.batch_load_requests,
+                world_size,
             )
             if placement is None:
                 flat_ids = [block_id for request in requests for block_id in request]
                 position_set = set(positions)
                 owner_blocks = [0] * world_size
                 owner_cache_blocks = [0] * world_size
+                request_size = len(requests[0])
                 for position, block_id in enumerate(flat_ids):
-                    owner = _owner(block_id, world_size)
+                    owner = _owner(position % request_size, world_size)
                     owner_blocks[owner] += 1
                     if position in position_set:
                         owner_cache_blocks[owner] += 1

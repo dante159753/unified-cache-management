@@ -119,9 +119,40 @@ public:
     Expected<Detail::TaskHandle> Load(Detail::TaskDesc task) override
     {
         if (!transEnable_) { return Status::Error("transfer is not enable"); }
+        if (task.memoryType == Detail::TaskDesc::MemoryType::DDR) {
+            for (const auto& shard : task) {
+                if (shard.addrs.size() != 1 || shard.addrs.front() == nullptr) {
+                    return Status::InvalidParam("ddr load shard({}) requires one host address",
+                                                shard.index);
+                }
+            }
+        }
         auto res = transMgr_.Submit({TransTask::Type::LOAD, std::move(task)});
         if (!res) [[unlikely]] {
             UC_ERROR("Failed({}) to submit load task({}).", res.Error(), task.brief);
+        }
+        return res;
+    }
+    Expected<Detail::TaskHandle> LoadOnToken(
+        Detail::TaskDesc task, const std::vector<Detail::TokenFilter>& filter) override
+    {
+        if (!transEnable_) { return Status::Error("transfer is not enable"); }
+        if (task.memoryType != Detail::TaskDesc::MemoryType::DDR) {
+            return Status::InvalidParam("LoadOnToken currently supports memoryType=DDR only");
+        }
+        if (filter.size() != task.size()) {
+            return Status::InvalidParam("LoadOnToken filter size({}) != shards({})", filter.size(),
+                                        task.size());
+        }
+        for (const auto& shard : task) {
+            if (shard.addrs.size() != 1 || shard.addrs.front() == nullptr) {
+                return Status::InvalidParam("ddr LoadOnToken shard({}) requires one host address",
+                                            shard.index);
+            }
+        }
+        auto res = transMgr_.Submit({TransTask::Type::LOAD_ON_TOKEN, std::move(task), filter});
+        if (!res) [[unlikely]] {
+            UC_ERROR("Failed({}) to submit load-on-token task({}).", res.Error(), task.brief);
         }
         return res;
     }
@@ -157,7 +188,6 @@ private:
         config.Get("unique_id", param.uniqueId);
         config.Get("cache_load_backend_only", param.cacheLoadBackendOnly);
         config.GetNumber("device_id", param.deviceId);
-        config.GetNumber("cache_numa_node", param.numaNode);
         size_t tensorSize = 0;
         config.GetNumber("tensor_size", tensorSize);
         config.GetNumber("shard_size", param.shardSize);
@@ -172,6 +202,7 @@ private:
         config.Get("share_buffer_enable", param.shareBufferEnable);
         if (!param.shareBufferEnable) { param.bufferCapacity /= 8; }
         config.Get("io_direct", param.ioDirect);
+        config.Get("use_dpc", param.useDpc);
         size_t bufferCapacityGb = 0;
         config.GetNumber("cache_buffer_capacity_gb", bufferCapacityGb);
         if (bufferCapacityGb != 0) { param.bufferCapacity = bufferCapacityGb << 30; }
@@ -208,9 +239,6 @@ private:
         if (!config.storeBackend) { return Status::InvalidParam("invalid store backend"); }
         if (config.deviceId < -1) {
             return Status::InvalidParam("invalid device({})", config.deviceId);
-        }
-        if (config.numaNode < -1) {
-            return Status::InvalidParam("invalid NUMA node({})", config.numaNode);
         }
         if (config.uniqueId.empty()) { return Status::InvalidParam("invalid unique id"); }
         auto s =
@@ -264,7 +292,6 @@ private:
         UC_INFO("Set {}::UniqueId to {}.", ns, config.uniqueId);
         UC_INFO("Set {}::CacheLoadBackendOnly to {}.", ns, config.cacheLoadBackendOnly);
         UC_INFO("Set {}::DeviceId to {}.", ns, config.deviceId);
-        UC_INFO("Set {}::NumaNode to {}.", ns, config.numaNode);
         const auto& v = config.tensorSizes;
         if (v.empty()) {
             UC_INFO("Set {}::TensorSizes to [].", ns);
@@ -276,6 +303,7 @@ private:
         UC_INFO("Set {}::ShardSize to {}.", ns, config.shardSize);
         UC_INFO("Set {}::BlockSize to {}.", ns, config.blockSize);
         UC_INFO("Set {}::IoDirect to {}.", ns, config.ioDirect);
+        UC_INFO("Set {}::UseDpc to {}.", ns, config.useDpc);
         UC_INFO("Set {}::CpuAffinityCores to {}.", ns, config.cpuAffinityCores);
         UC_INFO("Set {}::BufferCapacity to {}GB.", ns, config.bufferCapacity >> 30);
         UC_INFO("Set {}::ShareBufferEnable to {}.", ns, config.shareBufferEnable);
@@ -303,4 +331,5 @@ private:
 
 }  // namespace UC::CacheStore
 
+extern "C" uint32_t UcmCacheCoreVersion() { return 1; }
 extern "C" UC::StoreV1* MakeCacheStore() { return new UC::CacheStore::CacheStore(); }

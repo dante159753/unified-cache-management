@@ -45,13 +45,13 @@ struct Config {
     StoreV1* storeBackend{};
     std::string uniqueId{};
     int32_t deviceId{-1};
-    int32_t numaNode{-1};
     std::vector<size_t> tensorSizes{};
     size_t shardSize{0};
     size_t blockSize{0};
     bool ioDirect{true};
+    bool useDpc{false};
     std::vector<ssize_t> cpuAffinityCores{};
-    size_t bufferCapacity{256ULL << 30};
+    size_t bufferCapacity{160ULL << 30};
     size_t loadExclusiveBufferNumber{1024};
     bool shareBufferEnable{true};
     size_t waitingQueueDepth{8192};

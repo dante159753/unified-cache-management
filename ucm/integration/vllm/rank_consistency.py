@@ -20,7 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from typing import Any
+from typing import Any, Callable
 
 from ucm.logger import init_logger
 from ucm.store.pipeline.errors import StoreNotFoundError, StoreUnhealthyError
@@ -157,8 +157,15 @@ class RankConsistencyManager:
         block_ids: list[bytes],
         shard_indices: list[int],
         ptrs: Any,
+        *,
+        distribute_backend_load: bool = False,
+        owner_ranks: list[int] | None = None,
     ) -> Any:
-        """Retain request block IDs and classify immediate NotFound errors."""
+        """Retain request block IDs and classify immediate NotFound errors.
+
+        ``owner_ranks`` names the TP rank that reads each block for an
+        AllGather store; other stores never receive it.
+        """
         request_context = (
             {
                 request_id: list(request_block_ids)
@@ -167,8 +174,18 @@ class RankConsistencyManager:
             if self.enabled
             else {}
         )
+        load_options: dict[str, Any] = {}
+        if getattr(store, "supports_distributed_backend_load", False):
+            load_options["distribute_backend_load"] = distribute_backend_load
+        if owner_ranks is not None:
+            load_options["owner_ranks"] = owner_ranks
         try:
-            task = store.load_data(block_ids, shard_indices, ptrs)
+            task = store.load_data(
+                block_ids,
+                shard_indices,
+                ptrs,
+                **load_options,
+            )
         except Exception as error:
             if self.enabled and isinstance(error, StoreNotFoundError):
                 self._mark_load_context_missing(request_context)
@@ -176,15 +193,37 @@ class RankConsistencyManager:
         self._load_task_contexts[id(task)] = (store, request_context)
         return task
 
-    def wait_load(self, task: Any) -> None:
-        """Wait through the task's Store and record blocks missing at wait time."""
+    def wait_load(self, task: Any, *, wait: Callable[[], Any] | None = None) -> None:
+        """Consume a Store wait (or its background result) on the worker thread."""
         task_key = id(task)
         if task_key not in self._load_task_contexts:
             raise RuntimeError("Load task was not submitted through submit_load().")
         store, request_context = self._load_task_contexts.pop(task_key)
         try:
-            store.wait(task)
+            if wait is None:
+                store.wait(task)
+            else:
+                wait()
         except Exception as error:
+            if self.enabled and isinstance(error, StoreNotFoundError):
+                self._mark_load_context_missing(request_context)
+            raise
+
+    def check_load(self, task: Any) -> bool:
+        """Poll a load task without blocking and retain its wait context.
+
+        A successful poll does not remove the context. The caller must invoke
+        wait_load() once after completion so the Store can surface deferred
+        errors and release task resources.
+        """
+        task_key = id(task)
+        if task_key not in self._load_task_contexts:
+            raise RuntimeError("Load task was not submitted through submit_load().")
+        store, request_context = self._load_task_contexts[task_key]
+        try:
+            return store.check(task)
+        except Exception as error:
+            self._load_task_contexts.pop(task_key, None)
             if self.enabled and isinstance(error, StoreNotFoundError):
                 self._mark_load_context_missing(request_context)
             raise
@@ -197,6 +236,8 @@ class RankConsistencyManager:
         shard_indices: list[int],
         ptrs: Any,
         event_handle: int,
+        *,
+        owner_ranks: list[int] | None = None,
     ) -> Any:
         """Track submitted blocks and the Store used by each dump task."""
         request_context = (
@@ -212,7 +253,16 @@ class RankConsistencyManager:
                 request_block_ids
             )
         try:
-            task = store.dump_data(block_ids, shard_indices, ptrs, event_handle)
+            if owner_ranks is None:
+                task = store.dump_data(block_ids, shard_indices, ptrs, event_handle)
+            else:
+                task = store.dump_data(
+                    block_ids,
+                    shard_indices,
+                    ptrs,
+                    event_handle,
+                    owner_ranks=owner_ranks,
+                )
         except Exception:
             self._record_dump_failure(request_context)
             raise

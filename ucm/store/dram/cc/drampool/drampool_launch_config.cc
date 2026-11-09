@@ -21,6 +21,7 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  * */
+#include <algorithm>
 #include <cstddef>
 #include <limits>
 #include <string>
@@ -99,21 +100,11 @@ Status ParseBlockProportions(const std::vector<std::string>& values,
     proportions.clear();
     proportions.reserve(values.size());
     for (const auto& value : values) {
-        std::uint32_t proportion;
+        std::uint32_t proportion = 0;
         if (Dram::ParseUint32(value, proportion).Failure()) {
             return Status::InvalidParam("invalid --kvcache-block-proportions value: {}", value);
         }
         proportions.push_back(proportion);
-    }
-    return Status::OK();
-}
-
-Status ValidateNics(const std::vector<std::string>& nics)
-{
-    for (const auto& nic : nics) {
-        if (Dram::Trim(nic).empty()) {
-            return Status::InvalidParam("--nics contains an empty name");
-        }
     }
     return Status::OK();
 }
@@ -170,6 +161,34 @@ Status ValidateBlockClassCount(const std::vector<std::uint64_t>& blockSizes,
             "--kvcache-block-sizes and --kvcache-block-proportions must have the same length");
     }
     return Status::OK();
+}
+
+// BufferManager keeps one pool per distinct size, so a repeated size would
+// register the same per-slot-size gauge twice (duplicate JSON keys in the
+// snapshot, duplicate Prometheus series) and silently discard the repeated
+// class's capacity share. Collapse duplicates here, merging their proportions
+// so the surviving class keeps the full capacity it was asked for.
+void NormalizeBlockClasses(DramPoolConfig& config)
+{
+    std::vector<std::uint64_t> sizes;
+    std::vector<std::uint32_t> proportions;
+    sizes.reserve(config.poolBlockSizes.size());
+    proportions.reserve(config.poolBlockProportions.size());
+    for (std::size_t index = 0; index < config.poolBlockSizes.size(); ++index) {
+        const auto blockSize = config.poolBlockSizes[index];
+        const auto existing = std::find(sizes.begin(), sizes.end(), blockSize);
+        if (existing == sizes.end()) {
+            sizes.push_back(blockSize);
+            proportions.push_back(config.poolBlockProportions[index]);
+            continue;
+        }
+        // Merging preserves the proportion total, which ValidateBlockProportions
+        // already bounded to uint32, so an accumulated share cannot overflow.
+        proportions[static_cast<std::size_t>(existing - sizes.begin())] +=
+            config.poolBlockProportions[index];
+    }
+    config.poolBlockSizes = std::move(sizes);
+    config.poolBlockProportions = std::move(proportions);
 }
 
 Status CalculatePoolSlotCounts(DramPoolConfig& config)
@@ -229,12 +248,11 @@ std::string BuildUsage(const char* program)
 {
     const std::string name = program == nullptr ? "drampool" : program;
     return "Usage: " + name +
-           " --addr <IP>:<PORT> --nics <NAME>... --pool-size-gb <SIZE>"
+           " --addr <IP>:<PORT> --pool-size-gb <SIZE>"
            " --kvcache-block-sizes <SIZE>... [options]\n"
            "Required options:\n"
            "  --addr <IP>:<PORT>                 DramPool service address for KV control "
            "messages.\n"
-           "  --nics <NAME>...                   RDMA NIC names for pinned memory registration.\n"
            "  --pool-size-gb <SIZE>              Local DRAM capacity contributed to the pool.\n"
            "  --kvcache-block-sizes <SIZE>...    Supported fixed KVCache block sizes.\n"
            "Optional options:\n"
@@ -251,7 +269,6 @@ Status ParseCommandLine(int argc, char** argv, DramPoolConfig& config)
     config = DramPoolConfig{};
 
     bool hasAddr = false;
-    bool hasNics = false;
     bool hasPoolSize = false;
     bool hasBlockSizes = false;
     bool hasBlockProportions = false;
@@ -293,16 +310,6 @@ Status ParseCommandLine(int argc, char** argv, DramPoolConfig& config)
             if (status.Failure()) { return status; }
             config.addr = std::move(endpoint);
             hasAddr = true;
-            continue;
-        }
-        if (option == "--nics") {
-            if (hasNics) { return Status::InvalidParam("--nics may be specified once"); }
-            status = ReadListValues(option, hasInlineValue, inlineValue, argc, argv, index, values);
-            if (status.Failure()) { return status; }
-            config.nics = std::move(values);
-            status = ValidateNics(config.nics);
-            if (status.Failure()) { return status; }
-            hasNics = true;
             continue;
         }
         if (option == "--pool-size-gb") {
@@ -364,19 +371,27 @@ Status ParseCommandLine(int argc, char** argv, DramPoolConfig& config)
         return Status::InvalidParam("unknown argument: {}", argument);
     }
 
-    if (!hasAddr || !hasNics || !hasPoolSize || !hasBlockSizes) {
+    if (!hasAddr || !hasPoolSize || !hasBlockSizes) {
         return Status::InvalidParam(
-            "--addr, --nics, --pool-size-gb, and --kvcache-block-sizes are required");
+            "--addr, --pool-size-gb, and --kvcache-block-sizes are required");
     }
     if (!hasBlockProportions) {
         // Each configured block size receives an equal capacity share by default.
         config.poolBlockProportions.assign(config.poolBlockSizes.size(), 1);
     }
+    // Reject mismatched size/proportion counts before collapsing duplicates:
+    // NormalizeBlockClasses reads one proportion per size entry, so a short
+    // proportions list would read out of bounds, and collapsing first would
+    // equalize the lengths and mask the mismatch from this check.
     if (const auto status =
             ValidateBlockClassCount(config.poolBlockSizes, config.poolBlockProportions);
         status.Failure()) {
         return status;
     }
+    // Options are order-independent; both size and proportion inputs are final
+    // only here, so duplicate-size collapsing must precede the slot-count
+    // calculation below.
+    NormalizeBlockClasses(config);
     // Options are order-independent; all pool inputs are complete only here.
     if (const auto status = CalculatePoolSlotCounts(config); status.Failure()) { return status; }
     return Status::OK();

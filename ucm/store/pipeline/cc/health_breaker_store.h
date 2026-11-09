@@ -24,16 +24,15 @@
 #ifndef UNIFIEDCACHE_PIPELINE_HEALTH_BREAKER_STORE_H
 #define UNIFIEDCACHE_PIPELINE_HEALTH_BREAKER_STORE_H
 
-#include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include "detail/health_tracker.h"
+#include "detail/store_health_config.h"
 #include "health_check_executor.h"
-#include "store_health_config.h"
 #include "ucmstore_v1.h"
 
 namespace UC::PipelineStore {
@@ -43,10 +42,10 @@ public:
     HealthBreakerStore() = default;
     ~HealthBreakerStore() override;
 
-    Status Setup(StoreV1* store, std::string storeId, const StoreHealthConfig& config);
+    Status Setup(StoreV1* store, std::string storeId, const Detail::StoreHealthConfig& config);
     Status Start();
     void Stop();
-    bool Enabled() const { return enabled_.load(std::memory_order_acquire); }
+    bool Enabled() const { return !health_ || health_->Healthy(); }
     size_t FailureCount() const;
     size_t SampleCount() const;
 
@@ -59,23 +58,22 @@ public:
     void Prefetch(const Detail::Shard* shards, size_t num) override;
     Status CheckHealth() override;
     Expected<Detail::TaskHandle> Load(Detail::TaskDesc task) override;
+    Expected<Detail::TaskHandle> LoadOnToken(
+        Detail::TaskDesc task, const std::vector<Detail::TokenFilter>& filter) override;
     Expected<Detail::TaskHandle> Dump(Detail::TaskDesc task) override;
     Expected<bool> Check(Detail::TaskHandle taskId) override;
     Status Wait(Detail::TaskHandle taskId) override;
 
 private:
-    void RecordHealth(bool healthy);
+    bool RecordPassiveResult(const Status& status, uint64_t generation);
     void RecordProbeMetrics(bool healthy);
     void RecordEffectiveHealth();
     void ProbeLoop();
 
     StoreV1* store_{nullptr};
     std::string storeId_;
-    StoreHealthConfig config_{};
-    std::atomic<bool> enabled_{true};
-    mutable std::mutex healthMutex_;
-    std::deque<bool> healthResults_;
-    size_t failureCount_{0};
+    Detail::StoreHealthConfig config_{};
+    std::unique_ptr<Detail::HealthTracker> health_;
     std::mutex stopMutex_;
     std::condition_variable stopCv_;
     bool stop_{false};

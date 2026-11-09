@@ -1,14 +1,19 @@
 import ast
+import copy
 import importlib
 import json
 import math
 import re
 import sys
 import threading
+from collections import defaultdict
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import get_type_hints
+from unittest.mock import Mock
 
 import pytest
 
@@ -143,8 +148,14 @@ class KVConnectorBase_V1:
         self._role = role
         self._kv_cache_config = kv_cache_config
 
+    def bind_connector_metadata(self, metadata):
+        self._connector_metadata = metadata
+
     def clear_connector_metadata(self):
-        pass
+        self._connector_metadata = None
+
+    def _get_connector_metadata(self):
+        return self._connector_metadata
 
     def get_kv_connector_stats(self):
         return None
@@ -156,6 +167,13 @@ class SupportsHMA:
 
 class KVConnectorMetadata:
     pass
+
+
+@dataclass
+class KVConnectorTransferResults:
+    finished_sending: set[str] = field(default_factory=set)
+    finished_recving: set[str] = field(default_factory=set)
+    failed_recving: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -205,6 +223,9 @@ class FakeUcmMetrics:
 
 class _Logger:
     def info(self, *args, **kwargs):
+        pass
+
+    def info_once(self, *args, **kwargs):
         pass
 
     def debug(self, *args, **kwargs):
@@ -302,7 +323,8 @@ def _install_stubs():
     _install_package("ucm", REPO_ROOT / "ucm")
     _install_package("ucm.integration", REPO_ROOT / "ucm" / "integration")
     _install_package("ucm.integration.vllm", REPO_ROOT / "ucm" / "integration" / "vllm")
-    _install_module("torch", Tensor=type("Tensor", (), {}))
+    # Python 3.12 evaluates torch.dtype annotations while importing HMA/HLA.
+    _install_module("torch", Tensor=type("Tensor", (), {}), dtype=type("dtype", (), {}))
     _install_module(
         "prometheus_client",
         Counter=FakeCounter,
@@ -310,12 +332,15 @@ def _install_stubs():
         Histogram=FakeHistogram,
     )
     _install_module("wrapt", ObjectProxy=object)
+    # Keep CPU protocol tests isolated even when a real vLLM is installed.
+    _install_module("vllm", __path__=[])
     _install_module("vllm.config", VllmConfig=type("VllmConfig", (), {}))
     _install_module(
         "vllm.distributed.kv_transfer.kv_connector.v1.base",
         KVConnectorBase_V1=KVConnectorBase_V1,
         KVConnectorMetadata=KVConnectorMetadata,
         KVConnectorRole=KVConnectorRole,
+        KVConnectorTransferResults=KVConnectorTransferResults,
         SupportsHMA=SupportsHMA,
     )
     _install_module(
@@ -350,6 +375,7 @@ def _install_stubs():
         KVCacheConfig=type("KVCacheConfig", (), {}),
         KVCacheSpec=type("KVCacheSpec", (), {}),
         MambaSpec=type("MambaSpec", (), {}),
+        MLAAttentionSpec=type("MLAAttentionSpec", (), {}),
         SlidingWindowSpec=type("SlidingWindowSpec", (), {}),
         UniformTypeKVCacheSpecs=type("UniformTypeKVCacheSpecs", (), {}),
     )
@@ -358,11 +384,21 @@ def _install_stubs():
         KVConnectorOutput=type("KVConnectorOutput", (), {}),
     )
     _install_module(
+        "vllm.v1.request",
+        RequestStatus=SimpleNamespace(PREEMPTED="preempted"),
+    )
+    _install_module(
         "ucm.integration.vllm.device",
         create_device=lambda *args, **kwargs: None,
+        get_current_device_id=lambda: 0,
+        get_ucm_worker_torch_device=lambda local_rank: f"cuda:{local_rank}",
     )
     _install_module("ucm.logger", init_logger=lambda name: _Logger())
-    _install_module("ucm.shared.metrics", ucmmetrics=fake_ucmmetrics)
+    _install_module(
+        "ucm.shared.metrics",
+        __path__=[str(REPO_ROOT / "ucm/shared/metrics")],
+        ucmmetrics=fake_ucmmetrics,
+    )
     _install_module(
         "ucm.store.factory_v1",
         UcmConnectorFactoryV1=type("UcmConnectorFactoryV1", (), {}),
@@ -383,6 +419,9 @@ from ucm.default_metrics_config import DEFAULT_METRICS_CONFIG
 from ucm.integration.vllm.metrics import UCMConnectorStats, UCMPromMetrics
 from ucm.integration.vllm.ucm_connector import (
     PendingDumpTask,
+    PendingLoadTask,
+    RequestDispatchMeta,
+    RequestMeta,
     UCMConnector,
     UCMDirectConnector,
     UCMLayerWiseConnector,
@@ -1094,6 +1133,53 @@ def test_stats_reduce_skips_ucm_cli_summary():
     assert stats.reduce() == {}
 
 
+@pytest.mark.parametrize("name", ["plain", "kv:sample", "ucm:sample", "custom:sample"])
+@pytest.mark.parametrize("field", ["name", "prometheus_name", "vllm_connector_name"])
+def test_explicit_metric_namespace_is_preserved(name, field):
+    item = {"name": "internal", field: name}
+    config = {"counter": [item]}
+    expected = name if ":" in name else "ucm:" + name
+    definition = get_metric_definitions(config)[0]
+    assert definition.vllm_connector_name == expected
+    export_name = str(item.get("prometheus_name") or item["name"])
+    assert multiproc_metric_name(config, export_name) == (
+        "ucm:internal" if field == "vllm_connector_name" else expected
+    )
+
+
+def test_default_kv_export_names_keep_internal_snapshot_keys():
+    _reset_fakes()
+    from ucm.default_metrics_config import get_default_metrics_config
+
+    config = get_default_metrics_config()
+    definitions = setup_ucm_metrics(config)
+    kv_definitions = [
+        d for d in definitions if d.name.startswith(("kv_client_", "kv_transport_"))
+    ]
+    assert len(kv_definitions) == 37
+    for definition in definitions:
+        prefix = "kv:" if definition in kv_definitions else "ucm:"
+        assert definition.vllm_connector_name == prefix + definition.name
+        assert (
+            multiproc_metric_name(config, definition.vllm_connector_name)
+            == prefix + definition.name
+        )
+    prom = UCMPromMetrics(_vllm_config(config), _metric_types(), [], {0: []})
+    prom.observe(
+        {
+            "counters_by_rank": {"0": {"kv_client_query_requests_total": 3}},
+            "histograms_by_rank": {"0": {"kv_client_task_e2e_duration_seconds": [0.5]}},
+        }
+    )
+    assert FakeCounter.created["kv:kv_client_query_requests_total"].children[
+        ("0",)
+    ].increments == [3]
+    assert FakeHistogram.created["kv:kv_client_task_e2e_duration_seconds"].children[
+        ("0",)
+    ].observations == [0.5]
+    assert all(not name.startswith("kv:") for name, _, _ in fake_ucmmetrics.created)
+
+
 def test_prom_metrics_register_vllm_connector_prefixed_metrics():
     _reset_fakes()
     import ucm.integration.vllm.metrics as metrics_module
@@ -1234,8 +1320,11 @@ def test_ucm_connector_metrics_registration_is_owned_by_outer_connector():
     assert stats.data["counters_by_rank"]["0"]["load_bytes_total"] == 1.0
 
 
-def test_ucm_connector_prefers_lite_when_lite_and_fawa_are_both_enabled(monkeypatch):
+def test_ucm_connector_uses_fawa_lite_when_lite_and_fawa_are_both_enabled(monkeypatch):
     class FakeInnerConnector(KVConnectorBase_V1):
+        pass
+
+    class FakeFawaLiteConnector(KVConnectorBase_V1):
         pass
 
     class FakeFawaConnector(KVConnectorBase_V1):
@@ -1248,16 +1337,19 @@ def test_ucm_connector_prefers_lite_when_lite_and_fawa_are_both_enabled(monkeypa
     monkeypatch.setitem(
         sys.modules,
         "ucm.integration.vllm.hma_connector",
-        SimpleNamespace(UCMFAWAConnector=FakeFawaConnector),
+        SimpleNamespace(
+            UCMFAWAConnector=FakeFawaConnector,
+            UCMFAWALiteConnector=FakeFawaLiteConnector,
+        ),
     )
 
     connector = UCMConnector(
         _vllm_config(launch_config={"use_lite": True}),
         KVConnectorRole.SCHEDULER,
-        kv_cache_config=object(),
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
     )
 
-    assert type(connector.connector) is FakeInnerConnector
+    assert type(connector.connector) is FakeFawaLiteConnector
 
 
 def test_ucm_connector_drains_dispatcher_vllm_connector_snapshot():
@@ -1578,17 +1670,172 @@ def test_direct_connector_poll_records_zero_completion_wait_duration():
     ]
 
 
-def test_multiproc_logger_uses_prefix_and_dispatcher_snapshot(tmp_path):
+def test_request_async_alloc_dispatches_load_without_scheduled_forward():
+    connector = object.__new__(UCMDirectConnector)
+    connector.use_request_async_load = True
+    connector.block_size = 16
+    connector.cp_world_size = 1
+    connector.requests_meta = {
+        "req-async": RequestMeta(
+            ucm_block_ids=[b"u0", b"u1", b"u2", b"u3", b"u4", b"u5"],
+            hbm_hit_block_num=2,
+            total_hit_block_num=5,
+            num_token_ids=96,
+            token_processed=80,
+        )
+    }
+    connector._pending_async_load_dispatches = {}
+    connector._async_load_req_ids = set()
+    connector._async_dump_req_ids = set()
+
+    blocks = SimpleNamespace(get_block_ids=lambda: ([10, 11, 40, 41, 42],))
+    connector.update_state_after_alloc(
+        SimpleNamespace(request_id="req-async"), blocks, 48
+    )
+
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=[],
+        num_scheduled_tokens={},
+        finished_req_ids=set(),
+        preempted_req_ids=None,
+    )
+    metadata = connector.build_connector_meta(scheduler_output)
+
+    assert metadata.request_meta == {
+        "req-async": RequestDispatchMeta(
+            load_block_ids=([b"u2", b"u3", b"u4"], [40, 41, 42]),
+            dump_block_ids=([], []),
+            load_async=True,
+        )
+    }
+    assert connector._pending_async_load_dispatches == {}
+    assert connector._async_load_req_ids == {"req-async"}
+
+
+def test_request_dispatch_async_flag_preserves_subclass_positional_fields():
+    @dataclass
+    class SpecializedRequestDispatchMeta(RequestDispatchMeta):
+        required_value: int
+
+    dispatch = SpecializedRequestDispatchMeta(
+        ([b"u0"], [10]),
+        ([], []),
+        7,
+        load_async=True,
+    )
+
+    assert dispatch.required_value == 7
+    assert dispatch.load_async is True
+
+
+def test_request_async_reschedule_does_not_dispatch_duplicate_load():
+    connector = object.__new__(UCMDirectConnector)
+    connector.block_size = 16
+    connector.cp_world_size = 1
+    connector.requests_meta = {
+        "req-async": RequestMeta(
+            ucm_block_ids=[b"u0", b"u1", b"u2", b"u3", b"u4", b"u5"],
+            hbm_hit_block_num=2,
+            total_hit_block_num=5,
+            num_token_ids=96,
+            token_processed=80,
+        )
+    }
+    connector._pending_async_load_dispatches = {}
+    connector._async_load_req_ids = {"req-async"}
+    connector._async_dump_req_ids = set()
+
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[
+            SimpleNamespace(req_id="req-async", block_ids=([10, 11, 40, 41, 42, 43],))
+        ],
+        scheduled_cached_reqs=[],
+        num_scheduled_tokens={"req-async": 16},
+        finished_req_ids=set(),
+        preempted_req_ids=None,
+    )
+    metadata = connector.build_connector_meta(scheduler_output)
+    dispatch = metadata.request_meta["req-async"]
+
+    assert dispatch.load_block_ids == ([], [])
+    assert dispatch.dump_block_ids == ([b"u5"], [43])
+    assert dispatch.load_async is False
+
+
+def test_request_async_poll_reports_only_completed_loads():
+    class RankConsistency:
+        def __init__(self):
+            self.ready = False
+            self.waited = []
+
+        def check_load(self, task):
+            return self.ready
+
+        def wait_load(self, task):
+            self.waited.append(task)
+
+    connector = object.__new__(UCMDirectConnector)
+    connector._rank_consistency = RankConsistency()
+    connector._pending_load_tasks = {
+        "req-async": PendingLoadTask(object(), "req-async", [40, 41])
+    }
+    connector._finished_async_load_req_ids = set()
+
+    assert connector._poll_pending_load_tasks() == set()
+    assert set(connector._pending_load_tasks) == {"req-async"}
+
+    connector._rank_consistency.ready = True
+    assert connector._poll_pending_load_tasks() == {"req-async"}
+    assert connector._pending_load_tasks == {}
+    assert len(connector._rank_consistency.waited) == 1
+
+
+def test_request_async_poll_failure_unblocks_and_invalidates_blocks():
+    class RankConsistency:
+        def check_load(self, task):
+            raise RuntimeError("load failed")
+
+    class WorkerMeta:
+        def __init__(self):
+            self.failed = set()
+
+        def mark_failed(self, request_id):
+            self.failed.add(request_id)
+
+    connector = object.__new__(UCMDirectConnector)
+    connector._rank_consistency = RankConsistency()
+    connector._connector_worker_meta = WorkerMeta()
+    connector._invalid_block_ids = set()
+    connector._pending_load_tasks = {
+        "req-async": PendingLoadTask(object(), "req-async", [40, 41])
+    }
+    connector._finished_async_load_req_ids = set()
+
+    assert connector._poll_pending_load_tasks() == {"req-async"}
+    assert connector._pending_load_tasks == {}
+    assert connector._connector_worker_meta.failed == {"req-async"}
+    assert connector._invalid_block_ids == {40, 41}
+
+
+@pytest.mark.parametrize("public_names", [False, True])
+def test_multiproc_logger_uses_prefix_and_dispatcher_snapshot(
+    tmp_path, public_names, monkeypatch
+):
     _reset_fakes()
     import ucm.observability as observability
 
     config = _metrics_config()
+    if public_names:
+        for kind in ("counter", "gauge", "histogram"):
+            for item in config[kind]:
+                item["prometheus_name"] = "kv:" + item["name"]
     config["multiproc_dir"] = str(tmp_path)
     capture_logger = CaptureLogger()
     observability._metric_mappings.clear()
     observability.load_metrics_config = lambda _: config
     observability.logger = capture_logger
-    observability.threading.Thread = FakeThread
+    monkeypatch.setattr(observability.threading, "Thread", FakeThread)
     original_sleep = observability.time.sleep
     logger = observability.PrometheusStatsLogger("model-a", "worker-0", "unused.yaml")
     fake_ucmmetrics.snapshot = (
@@ -1603,9 +1850,10 @@ def test_multiproc_logger_uses_prefix_and_dispatcher_snapshot(tmp_path):
     finally:
         observability.time.sleep = original_sleep
 
-    counter = FakeCounter.created["ucm_multiproc:load_bytes_total"]
-    gauge = FakeGauge.created["ucm_multiproc:test_health"]
-    histogram = FakeHistogram.created["ucm_multiproc:load_duration"]
+    prefix = "kv:" if public_names else "ucm_multiproc:"
+    counter = FakeCounter.created[prefix + "load_bytes_total"]
+    gauge = FakeGauge.created[prefix + "test_health"]
+    histogram = FakeHistogram.created[prefix + "load_duration"]
 
     assert logger.thread.started
     assert any(
@@ -2277,6 +2525,145 @@ def test_layerwise_wait_for_save_records_completion_start():
     assert "pending_dump_task.wait_for_save_start_ms = wait_for_save_start_ms" in source
 
 
+@pytest.fixture(params=[0, 30], ids=["pp-first", "pp-later"])
+def layerwise_connector(request):
+    _reset_fakes()
+    connector = object.__new__(UCMLayerWiseConnector)
+    connector.first_layer_id = request.param
+    connector.layer_ids = [request.param, request.param + 1]
+    connector.layer_name_to_id = {
+        f"layer.{layer_id}": layer_id for layer_id in connector.layer_ids
+    }
+    connector.load_tasks = defaultdict(list)
+    connector.request_data = []
+    connector._failure_req_ids = set()
+    connector._dumped_layer_ids = set()
+    connector._layerwise_load_start_by_layer = {}
+    connector._layerwise_layer_load_duration_sum_ms = 0.0
+    connector._layerwise_load_bytes = 0
+    connector._layerwise_save_bytes = 0
+    connector.need_load = False
+    connector.tp_rank = 0
+    connector.tp_size = 8
+    connector.is_mla = True
+    connector.store = object()
+    connector.kv_cache_layout = SimpleNamespace(
+        shard_size=64, extract_block_addrs=lambda *args, **kwargs: [[101], [102]]
+    )
+    connector._rank_consistency = SimpleNamespace(
+        submit_load=Mock(side_effect=lambda *args: object()), wait_load=Mock()
+    )
+    connector._connector_worker_meta = SimpleNamespace(mark_failed=Mock())
+    connector._record_load_error = Mock()
+    connector._pending_dump_tasks = []
+    connector._poll_pending_dump_tasks = Mock()
+    connector._async_dump_req_ids = set()
+    return connector
+
+
+@pytest.mark.parametrize("fail_load", [False, True])
+def test_layerwise_decode_hooks_do_not_reuse_previous_batch_loads(
+    layerwise_connector, fail_load
+):
+    connector = layerwise_connector
+    connector.bind_connector_metadata(
+        SimpleNamespace(
+            request_meta={
+                "prefix": RequestDispatchMeta(
+                    load_block_ids=([b"a"], [1]), dump_block_ids=([], [])
+                )
+            }
+        )
+    )
+    if fail_load:
+        connector._rank_consistency.wait_load.side_effect = RuntimeError("load failed")
+    connector.start_load_kv(None)
+    for layer_name in connector.layer_name_to_id:
+        connector.wait_for_layer_load(layer_name)
+    connector.wait_for_save()
+    connector.clear_connector_metadata()
+    submit_count = connector._rank_consistency.submit_load.call_count
+    wait_count = connector._rank_consistency.wait_load.call_count
+
+    # has_sync_kv_loads=False: bind -> forward hooks -> start_load_kv.
+    connector.bind_connector_metadata(
+        SimpleNamespace(
+            request_meta={
+                "decode": RequestDispatchMeta(
+                    load_block_ids=([], []), dump_block_ids=([], [])
+                )
+            }
+        )
+    )
+    for layer_name in connector.layer_name_to_id:
+        connector.wait_for_layer_load(layer_name)
+    connector.start_load_kv(None)
+
+    assert connector._rank_consistency.submit_load.call_count == submit_count
+    assert connector._rank_consistency.wait_load.call_count == wait_count
+    assert not connector.load_tasks
+    assert not connector.need_load
+
+
+def test_layerwise_repeated_hook_does_not_replace_next_layer_task(layerwise_connector):
+    connector = layerwise_connector
+    connector.bind_connector_metadata(
+        SimpleNamespace(
+            request_meta={
+                "prefix": RequestDispatchMeta(
+                    load_block_ids=([b"a"], [1]), dump_block_ids=([], [])
+                )
+            }
+        )
+    )
+    connector.start_load_kv(None)
+    first, second = connector.layer_name_to_id
+    connector.wait_for_layer_load(first)
+    connector.wait_for_layer_load(first)
+    connector.wait_for_layer_load(second)
+    assert connector._rank_consistency.submit_load.call_count == 2
+    assert connector._rank_consistency.wait_load.call_count == 2
+    assert not connector.load_tasks
+
+
+def test_layerwise_deferred_start_preserves_saves_and_resets_each_batch(
+    layerwise_connector,
+):
+    connector = layerwise_connector
+
+    def submit_dump(*args):
+        connector._layerwise_save_bytes += 64
+        return True
+
+    connector._submit_layerwise_dump_task = Mock(side_effect=submit_dump)
+    for request_id in ("first", "second"):
+        connector.bind_connector_metadata(
+            SimpleNamespace(
+                request_meta={
+                    request_id: RequestDispatchMeta(
+                        load_block_ids=([], []), dump_block_ids=([b"a"], [1])
+                    )
+                }
+            )
+        )
+        # Saves happen during forward, before the deferred load start.
+        for layer_name in connector.layer_name_to_id:
+            connector.save_kv_layer(layer_name, None, None)
+            connector.save_kv_layer(layer_name, None, None)
+        connector.start_load_kv(None)
+        # A deferred draft forward may revisit layers after start_load_kv.
+        for layer_name in connector.layer_name_to_id:
+            connector.save_kv_layer(layer_name, None, None)
+        connector.wait_for_save()
+        connector.clear_connector_metadata()
+
+    assert connector._submit_layerwise_dump_task.call_count == 4
+    assert fake_ucmmetrics.updated == [
+        {"save_bytes_total": 128},
+        {"save_bytes_total": 128},
+    ]
+
+
 def test_layerwise_records_per_layer_load_duration_and_batch_sum():
     _reset_fakes()
     connector = object.__new__(UCMLayerWiseConnector)
@@ -2362,7 +2749,9 @@ def test_hybrid_layerwise_records_save_bytes_once():
 
     connector = object.__new__(UCMHybridLinearAttentionLayerWiseConnector)
     connector.is_save = True
-    connector._dump_transfer_data = ([], [], {"req-1"}, {})
+    connector._dump_transfer_data = ([], [], {}, {"req-1"})
+    connector._connector_metadata = None
+    connector.commit_row_id = 0
     connector.row_ids = []
     connector.dump_tasks = {}
     connector._layerwise_save_bytes = 896
@@ -2374,6 +2763,450 @@ def test_hybrid_layerwise_records_save_bytes_once():
     assert fake_ucmmetrics.updated == [{"save_bytes_total": 896}]
     assert connector._layerwise_save_bytes == 0
     assert connector.is_save is False
+
+
+def _create_metrics_test_store(monkeypatch, kind, launch_config, store_config):
+    from ucm.integration.vllm.hla_connector import (
+        UCMHybridLinearAttentionConnector,
+        UCMHybridLinearAttentionLayerWiseConnector,
+    )
+    from ucm.integration.vllm.hma_connector import UCMFAWAConnector
+
+    connector_class = {
+        "direct": UCMDirectConnector,
+        "hma": UCMFAWAConnector,
+        "hla": UCMHybridLinearAttentionConnector,
+        "hla_layerwise": UCMHybridLinearAttentionLayerWiseConnector,
+    }[kind]
+    connector = object.__new__(connector_class)
+    connector.launch_config = launch_config
+    original_launch = copy.deepcopy(launch_config)
+    connector.connector_configs = [
+        {"ucm_connector_name": "test-store", "ucm_connector_config": store_config}
+    ]
+    original = copy.deepcopy(connector.connector_configs)
+    connector.is_mla = False
+    connector.unique_id = "metrics-switch-test"
+    connector._role = KVConnectorRole.SCHEDULER
+    # A non-owner scheduler does not need a GPU layout or shared-memory setup.
+    connector._vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_rank=1)
+    )
+    calls = []
+
+    def create_connector(name, config, module_path):
+        calls.append((name, config, module_path))
+        return config
+
+    monkeypatch.setattr(
+        ucm_connector_module.UcmConnectorFactoryV1,
+        "create_connector",
+        create_connector,
+        raising=False,
+    )
+    if kind != "hma":
+        config = connector._create_store(None)
+    else:
+        connector.file_size = {"FA": 4096}
+        config = connector._create_store("FA", "fa", None)
+    assert calls == [("test-store", config, None)]
+    assert connector.connector_configs == original
+    assert connector.launch_config == original_launch
+    return config
+
+
+@pytest.mark.parametrize("kind", ["direct", "hma", "hla", "hla_layerwise"])
+@pytest.mark.parametrize("pipeline", ["ASU", "Cache|Empty"])
+@pytest.mark.parametrize("launch_enabled", [None, False, True])
+@pytest.mark.parametrize("store_enabled", [None, False, True])
+def test_store_metrics_switch_is_passed_through(
+    monkeypatch, kind, pipeline, launch_enabled, store_enabled
+):
+    launch_config = {} if launch_enabled is None else {"enable_metrics": launch_enabled}
+    store_config = {"store_pipeline": pipeline}
+    if store_enabled is not None:
+        store_config["enable_metrics"] = store_enabled
+    config = _create_metrics_test_store(monkeypatch, kind, launch_config, store_config)
+    if store_enabled is None:
+        assert "enable_metrics" not in config
+    else:
+        assert config["enable_metrics"] is store_enabled
+
+
+@pytest.mark.parametrize("kind", ["direct", "hma", "hla", "hla_layerwise"])
+@pytest.mark.parametrize("pipeline", ["ASU", "Cache|Empty"])
+@pytest.mark.parametrize("store_enabled", [False, True])
+@pytest.mark.parametrize(
+    "source, consumers, expected_setup",
+    [
+        pytest.param("default", None, True, id="builtin-defaults"),
+        pytest.param("inline", None, True, id="consumers-omitted"),
+        pytest.param("inline", {}, False, id="empty-consumers"),
+        pytest.param(
+            "inline",
+            {"multiproc": False, "vllm_connector": False},
+            False,
+            id="both-off",
+        ),
+        pytest.param(
+            "inline",
+            {"multiproc": True, "vllm_connector": False},
+            True,
+            id="multiproc-only",
+        ),
+        pytest.param(
+            "inline", {"multiproc": False, "vllm_connector": True}, True, id="vllm-only"
+        ),
+        pytest.param(
+            "inline", {"multiproc": True, "vllm_connector": True}, True, id="both-on"
+        ),
+        pytest.param(
+            "inline", {"multiproc": False}, False, id="omitted-consumer-is-off"
+        ),
+        pytest.param(
+            "inline",
+            {"multiproc": "false", "vllm_connector": "false"},
+            False,
+            id="string-false",
+        ),
+        pytest.param(
+            "inline",
+            {"multiproc": "true", "vllm_connector": "false"},
+            True,
+            id="string-true",
+        ),
+        pytest.param("empty-inline", None, False, id="empty-inline-config"),
+        pytest.param("missing-file", None, False, id="missing-file"),
+        pytest.param("invalid-file", None, False, id="invalid-yaml"),
+        pytest.param("empty-file", None, False, id="empty-file"),
+        pytest.param(
+            "file",
+            {"multiproc": False, "vllm_connector": False},
+            False,
+            id="file-both-off",
+        ),
+        pytest.param(
+            "file",
+            {"multiproc": True, "vllm_connector": False},
+            True,
+            id="file-multiproc-only",
+        ),
+    ],
+)
+def test_store_metrics_switch_is_independent_of_outer_setup(
+    monkeypatch,
+    tmp_path,
+    kind,
+    pipeline,
+    store_enabled,
+    source,
+    consumers,
+    expected_setup,
+):
+    _reset_fakes()
+    launch_config = {"enable_metrics": True}
+    effective_config = _metrics_config()
+    if consumers is None:
+        effective_config.pop("consumers")
+    else:
+        effective_config["consumers"] = consumers
+    if source == "inline":
+        launch_config["metrics_config"] = effective_config
+    elif source == "empty-inline":
+        launch_config["metrics_config"] = {}
+    elif source != "default":
+        path = tmp_path / "metrics.yaml"
+        launch_config["metrics_config_path"] = str(path)
+        if source != "missing-file":
+            content = {"empty-file": "", "invalid-file": "counter: ["}.get(
+                source, json.dumps(effective_config)
+            )
+            path.write_text(content, encoding="utf-8")
+
+    setup_configs = []
+
+    def record_setup(config):
+        setup_configs.append(copy.deepcopy(config))
+        return setup_ucm_metrics(config)
+
+    monkeypatch.setattr(ucm_connector_module, "setup_ucm_metrics", record_setup)
+    monkeypatch.setattr(
+        ucm_connector_module, "get_metrics_dispatcher", lambda config: object()
+    )
+    monkeypatch.setattr(
+        ucm_connector_module, "PrometheusStatsLogger", lambda *args: object()
+    )
+    outer = object.__new__(UCMConnector)
+    outer.launch_config = launch_config
+    outer.engine_id = "metrics-gate-test"
+    vllm_config = _vllm_config(launch_config=launch_config)
+    vllm_config.model_config = SimpleNamespace(served_model_name="test-model")
+    outer._setup_ucm_metrics(vllm_config, KVConnectorRole.SCHEDULER)
+
+    assert len(setup_configs) == int(expected_setup)
+    assert fake_ucmmetrics.setup_calls == int(expected_setup)
+    assert (outer._metrics_dispatcher is not None) is expected_setup
+    config = _create_metrics_test_store(
+        monkeypatch,
+        kind,
+        launch_config,
+        {"store_pipeline": pipeline, "enable_metrics": store_enabled},
+    )
+    assert config["enable_metrics"] is store_enabled
+    # Store creation leaves the switch untouched; the outer connector owns setup.
+    assert len(setup_configs) == int(expected_setup)
+    assert fake_ucmmetrics.setup_calls == int(expected_setup)
+
+
+@pytest.mark.parametrize("kind", ["direct", "hma", "hla", "hla_layerwise"])
+def test_disabled_consumers_preserve_store_metrics_switch(monkeypatch, kind):
+    config = _create_metrics_test_store(
+        monkeypatch,
+        kind,
+        {
+            "metrics_config": {
+                "consumers": {"multiproc": False, "vllm_connector": False}
+            }
+        },
+        {"store_pipeline": "Cache|Empty", "enable_metrics": True},
+    )
+    assert config["enable_metrics"] is True
+
+
+def test_sparse_utils_annotations_resolve_with_torch_stub():
+    from ucm.sparse.utils import align_to_256bytes, get_type_size
+
+    # Also evaluate lazy annotations on Python 3.14, so local runs catch missing
+    # stub attributes that fail at import time on the CI's Python 3.12.
+    for function in (get_type_size, align_to_256bytes):
+        assert get_type_hints(function)["return"] is int
+
+
+class DeferredLoadWaits:
+    """Control completion without racing real threads in protocol tests."""
+
+    def __init__(self):
+        self.futures = {}
+
+    def submit(self, wait, task):
+        future = Future()
+        self.futures[task] = future
+        return future
+
+
+def _async_fawa_worker(has_window=True):
+    from ucm.integration.vllm.hma_connector import (
+        FAWARequestDispatchMeta,
+        UCMFAWAConnector,
+        UCMFAWAConnectorMetadata,
+    )
+    from ucm.integration.vllm.rank_consistency import RankConsistencyManager
+
+    connector = object.__new__(UCMFAWAConnector)
+    connector.is_v41_layout = True
+    connector.is_mla = False
+    connector.device = SimpleNamespace(synchronize=Mock())
+    connector.fa_store = SimpleNamespace(
+        wait=Mock(), load_data=Mock(return_value=object())
+    )
+    connector.wa_store = (
+        SimpleNamespace(wait=Mock(), load_data=Mock(return_value=object()))
+        if has_window
+        else None
+    )
+    connector.window_group_ids = [1] if has_window else []
+    connector.file_size = {"FA": 100, "WA": 40}
+    connector._pending_fawa_loads = {}
+    connector._failed_fawa_loads = set()
+    connector._load_wait_executor = DeferredLoadWaits()
+    connector._load_wait_workers = 2
+    connector._finished_async_load_req_ids = set()
+    connector._invalid_block_ids = set()
+    connector._connector_worker_meta = SimpleNamespace(mark_failed=Mock())
+    connector._drain_best_effort_dump_tasks = Mock()
+    connector._extract_fa_ptr = Mock(return_value=[])
+    connector._extract_wa_ptr = Mock(return_value=[])
+    # IDs deliberately overlap between groups: they cannot identify failures.
+    connector._connector_metadata = UCMFAWAConnectorMetadata(
+        {
+            "req": FAWARequestDispatchMeta(
+                load_keys=[b"a", b"b"],
+                load_hash_end=2,
+                load_vllm_block_ids=([10, 11], [10]) if has_window else ([10, 11],),
+                load_async=True,
+            )
+        }
+    )
+    connector._rank_consistency = RankConsistencyManager(
+        is_scheduler=False, use_consistency_manager=True
+    )
+    connector._rank_consistency.finish_dump = Mock()
+    connector._rank_consistency.check_load = Mock(
+        side_effect=AssertionError("async loads must run Store.wait, not check")
+    )
+    return connector
+
+
+@pytest.mark.parametrize("has_window", [False, True])
+@pytest.mark.parametrize("failure", [None, "submit", "wait", "both_wait"])
+def test_fawa_async_load_drains_before_releasing_cancelled_request(has_window, failure):
+    _reset_fakes()
+    connector = _async_fawa_worker(has_window)
+    failing_store = connector.wa_store if has_window else connector.fa_store
+    if failure == "submit":
+        failing_store.load_data.side_effect = RuntimeError("submit failed")
+    connector.start_load_kv(None)
+    submitted = list(connector._load_wait_executor.futures.items())
+    if submitted:
+        calls = connector.fa_store.load_data.call_count
+        connector.start_load_kv(None)
+        assert connector.fa_store.load_data.call_count == calls
+        assert connector.get_transfer_results({"req"}) == KVConnectorTransferResults()
+        assert not connector._failed_fawa_loads
+        connector._connector_worker_meta.mark_failed.assert_not_called()
+        for index, (task, future) in enumerate(submitted):
+            if failure == "both_wait" or (
+                failure == "wait" and task is failing_store.load_data.return_value
+            ):
+                future.set_exception(RuntimeError("wait failed"))
+            else:
+                future.set_result(None)
+            if index < len(submitted) - 1:
+                assert (
+                    connector.get_transfer_results(set())
+                    == KVConnectorTransferResults()
+                )
+                assert not connector._failed_fawa_loads
+                connector._connector_worker_meta.mark_failed.assert_not_called()
+
+    # Completion survives replacement of the dispatch step's metadata.
+    connector.clear_connector_metadata()
+    assert connector.get_transfer_results({"req"}) == KVConnectorTransferResults(
+        finished_recving={"req"}, failed_recving={"req"} if failure else set()
+    )
+    assert connector.get_transfer_results(set()) == KVConnectorTransferResults()
+    assert not connector._pending_fawa_loads
+    assert not connector._rank_consistency._load_task_contexts
+    assert connector.get_block_ids_with_load_errors() == set()
+    if failure:
+        connector._connector_worker_meta.mark_failed.assert_called_once_with("req")
+        assert not any("load_bytes_total" in stats for stats in fake_ucmmetrics.updated)
+    else:
+        connector._connector_worker_meta.mark_failed.assert_not_called()
+        assert fake_ucmmetrics.updated == [
+            {"load_bytes_total": 240 if has_window else 200}
+        ]
+
+
+def test_fawa_background_wait_times_out_but_keeps_hbm_until_both_tasks_drain():
+    """An always-incomplete Store.check must not bypass timeout/cancel/drain."""
+    connector = _async_fawa_worker()
+    connector._load_wait_executor = None
+    timed_out = {label: threading.Event() for label in ("FA", "WA")}
+    drain = {label: threading.Event() for label in ("FA", "WA")}
+    cancelled = []
+
+    def wait(label):
+        # Emulate the Store contract: deadline -> cancel -> drain -> exception.
+        assert not drain[label].wait(0.02)
+        cancelled.append(label)
+        timed_out[label].set()
+        assert drain[label].wait(5), "test did not release the simulated I/O"
+        raise TimeoutError("Store timeout after draining")
+
+    for label, store in (("FA", connector.fa_store), ("WA", connector.wa_store)):
+        store.check = Mock(return_value=False)
+        store.wait = lambda task, label=label: wait(label)
+    try:
+        connector.start_load_kv(None)
+        futures = {
+            t.label: t.wait_future for t in connector._pending_fawa_loads["req"].tasks
+        }
+        assert all(event.wait(2) for event in timed_out.values())
+        assert set(cancelled) == {"FA", "WA"}
+        assert connector.get_transfer_results({"req"}) == KVConnectorTransferResults()
+        drain["FA"].set()
+        with pytest.raises(TimeoutError):
+            futures["FA"].result(timeout=2)
+        assert connector.get_transfer_results({"req"}) == KVConnectorTransferResults()
+        assert connector.get_block_ids_with_load_errors() == set()
+        drain["WA"].set()
+        with pytest.raises(TimeoutError):
+            futures["WA"].result(timeout=2)
+        assert connector.get_transfer_results({"req"}) == KVConnectorTransferResults(
+            finished_recving={"req"}, failed_recving={"req"}
+        )
+        assert not connector._rank_consistency._load_task_contexts
+        connector.fa_store.check.assert_not_called()
+        connector.wa_store.check.assert_not_called()
+    finally:
+        for event in drain.values():
+            event.set()
+        connector.shutdown()
+    assert connector._load_wait_executor is None
+
+
+def test_fawa_legacy_protocol_fails_closed_only_after_io_drains(monkeypatch):
+    import ucm.integration.vllm.hma_connector as hma
+
+    monkeypatch.setattr(hma, "KVConnectorTransferResults", None)
+    connector = _async_fawa_worker()
+    connector.start_load_kv(None)
+    futures = list(connector._load_wait_executor.futures.values())
+    futures[0].set_exception(RuntimeError("FA failed"))
+    assert connector.get_finished({"req"}) == (None, None)
+    futures[1].set_result(None)
+    with pytest.raises(
+        RuntimeError, match="lacks KVConnectorTransferResults.failed_recving"
+    ):
+        connector.get_finished({"req"})
+    assert not connector._pending_fawa_loads
+    assert connector.get_block_ids_with_load_errors() == set()
+
+
+def test_fawa_legacy_protocol_still_reports_successful_async_completion(monkeypatch):
+    import ucm.integration.vllm.hma_connector as hma
+
+    monkeypatch.setattr(hma, "KVConnectorTransferResults", None)
+    connector = _async_fawa_worker()
+    connector.start_load_kv(None)
+    assert connector.get_finished({"req"}) == (None, None)
+    for future in connector._load_wait_executor.futures.values():
+        future.set_result(None)
+    assert connector.get_finished({"req"}) == (None, {"req"})
+    assert connector.get_finished(set()) == (None, None)
+
+
+def test_fawa_background_not_found_updates_rank_consistency_on_worker_thread():
+    from ucm.store.pipeline.errors import StoreNotFoundError
+
+    connector = _async_fawa_worker(False)
+    connector.start_load_kv(None)
+    future = next(iter(connector._load_wait_executor.futures.values()))
+    # Completion in the background does not mutate the rank-consistency state.
+    mark_missing = Mock()
+    connector._rank_consistency._mark_load_context_missing = mark_missing
+    future.set_exception(StoreNotFoundError("missing"))
+    mark_missing.assert_not_called()
+    result = connector.get_transfer_results(set())
+    assert result.failed_recving == {"req"}
+    mark_missing.assert_called_once_with({"req": [b"a", b"b"]})
+
+
+def test_outer_connector_exposes_failed_recving_after_all_groups_drain():
+    worker = _async_fawa_worker()
+    outer = object.__new__(UCMConnector)
+    outer.connector = worker
+    worker.start_load_kv(None)
+    futures = list(worker._load_wait_executor.futures.values())
+    futures[0].set_exception(RuntimeError("FA failed"))
+    assert outer.get_transfer_results(set()) == KVConnectorTransferResults()
+    futures[1].set_result(None)
+    assert outer.get_transfer_results(set()) == KVConnectorTransferResults(
+        finished_recving={"req"}, failed_recving={"req"}
+    )
+    assert outer.get_block_ids_with_load_errors() == set()
+    assert outer.get_transfer_results(set()) == KVConnectorTransferResults()
 
 
 def test_fawa_records_only_successful_load_task_bytes():
@@ -2475,6 +3308,7 @@ def test_fawa_records_submitted_save_bytes():
     connector._get_connector_metadata = lambda: metadata
     connector.fa_store = object()
     connector.wa_store = object()
+    connector.window_group_ids = [1]
     connector._poll_completed_dump_tasks = lambda: None
     connector.tp_size = 1
     connector.tp_rank = 0

@@ -31,6 +31,9 @@
 #include <string_view>
 #include <unordered_set>
 #include <utility>
+#ifdef UC_DRAM_ASCEND_BACKEND
+#include <acl/acl.h>
+#endif
 #include "kv_protocol.h"
 
 namespace UC::Dram {
@@ -38,6 +41,17 @@ namespace {
 
 constexpr std::size_t kTargetBatchEntries = 128;
 constexpr std::size_t kMaxInflightRequestsPerNode = 128;
+
+#ifdef UC_DRAM_ASCEND_BACKEND
+Status ResolvePhysicalDeviceId(int32_t logicalDeviceId, int32_t& physicalDeviceId)
+{
+    const auto ret = aclrtGetPhyDevIdByLogicDevId(logicalDeviceId, &physicalDeviceId);
+    return ret == ACL_SUCCESS
+               ? Status::OK()
+               : Status::Error(fmt::format("aclrtGetPhyDevIdByLogicDevId({}) returned {}",
+                                           logicalDeviceId, static_cast<int>(ret)));
+}
+#endif
 
 std::size_t MaxReplySize(std::size_t entryCount)
 {
@@ -133,16 +147,8 @@ Expected<DramConfig> DramConfig::Parse(const Detail::Dictionary& dictionary)
 {
     try {
         DramConfig result;
-        std::string localControlEndpoint;
-        auto status = RequiredString(dictionary, "local_control_endpoint", &localControlEndpoint);
-        if (status.Failure()) { return status; }
-        status = ParseControlEndpoint(localControlEndpoint, "local_control_endpoint",
-                                      &result.localControlHost, &result.localControlPort);
-        if (status.Failure()) { return status; }
-        status = RequiredString(dictionary, "local_host", &result.localHost);
-        if (status.Failure()) { return status; }
-        status = RequiredString(dictionary, "local_transport_manager_id",
-                                &result.localTransportManagerId);
+        std::string localAddr;
+        auto status = RequiredString(dictionary, "local_addr", &localAddr);
         if (status.Failure()) { return status; }
 
         std::string routerType{"ring_hash"};
@@ -159,79 +165,60 @@ Expected<DramConfig> DramConfig::Parse(const Detail::Dictionary& dictionary)
             return Status::InvalidParam("unsupported router_type({})", routerType);
         }
 
-        std::size_t deviceId = 0;
-        status = OptionalSize(dictionary, "device_id", &deviceId);
-        if (status.Failure() || deviceId > 65) {
-            return status.Failure() ? status : Status::InvalidParam("device_id is out of range");
+        ssize_t deviceId = result.deviceId;
+        dictionary.GetNumber("device_id", deviceId);
+        if (deviceId < std::numeric_limits<std::int32_t>::min() || deviceId > 65) {
+            return Status::InvalidParam("device_id is out of range");
         }
         result.deviceId = static_cast<std::int32_t>(deviceId);
-        result.nodeScheduler.deviceId = result.deviceId;
+        result.nodeScheduler.deviceId = result.RuntimeDeviceId();
 
-        if (dictionary.Contains("role")) {
-            std::string roleStr;
-            dictionary.Get("role", roleStr);
-            if (roleStr == "scheduler") {
-                result.role = Role::SCHEDULER;
-            } else if (roleStr != "worker") {
-                return Status::InvalidParam("unsupported role({})", roleStr);
-            }
-        }
+        std::int32_t physicalDeviceId = result.RuntimeDeviceId();
+#ifdef UC_DRAM_ASCEND_BACKEND
+        status = ResolvePhysicalDeviceId(result.RuntimeDeviceId(), physicalDeviceId);
+        if (status.Failure()) { return status; }
+#endif
+        const auto portOffset = static_cast<std::uint32_t>(physicalDeviceId) * 2U +
+                                (result.GetRole() == Role::WORKER ? 1U : 0U);
 
         std::size_t hixlListenPort = result.hixlListenPort;
         status = OptionalSize(dictionary, "hixl_listen_port", &hixlListenPort);
-        const auto hixlPortOffset = result.role == Role::WORKER ? 1U : 0U;
         if (status.Failure() || hixlListenPort == 0 ||
-            hixlListenPort > std::numeric_limits<std::uint16_t>::max() - hixlPortOffset) {
+            hixlListenPort > std::numeric_limits<std::uint16_t>::max() - portOffset) {
             return status.Failure() ? status
                                     : Status::InvalidParam("hixl_listen_port is out of range");
         }
-        result.hixlListenPort = static_cast<std::uint16_t>(hixlListenPort + hixlPortOffset);
+        result.hixlListenPort = static_cast<std::uint16_t>(hixlListenPort + portOffset);
         if (dictionary.Contains("enable_hixl_cs")) {
             dictionary.Get("enable_hixl_cs", result.enableHixlCs);
         }
+        status = OptionalSize(dictionary, "manager_max_threads", &result.managerMaxThreads);
+        if (status.Failure()) { return status; }
 
         std::string managerHost;
         std::uint16_t managerPort = 0;
-        status = ParseControlEndpoint(result.localTransportManagerId, "local_transport_manager_id",
-                                      &managerHost, &managerPort);
+        status = ParseControlEndpoint(localAddr, "local_addr", &managerHost, &managerPort);
         if (status.Failure()) { return status; }
-        if (result.role == Role::WORKER) {
-            const auto offset = static_cast<std::uint32_t>(result.deviceId) + 1;
-            if (result.localControlPort > std::numeric_limits<std::uint16_t>::max() - offset ||
-                managerPort > std::numeric_limits<std::uint16_t>::max() - offset) {
-                return Status::InvalidParam("worker transport port is out of range");
-            }
-            result.localControlPort += static_cast<std::uint16_t>(offset);
-            managerPort += static_cast<std::uint16_t>(offset);
+        if (managerPort > std::numeric_limits<std::uint16_t>::max() - portOffset) {
+            return Status::InvalidParam("local transport port is out of range");
         }
-        result.localTransportManagerId = fmt::format("{}:{}", managerHost, managerPort);
+        managerPort += static_cast<std::uint16_t>(portOffset);
+        result.localAddr = transport::Endpoint{std::move(managerHost), managerPort};
 
-        std::vector<std::string> controlEndpoints;
-        std::vector<std::string> transportManagerIds;
-        if (!dictionary.Contains("node_control_endpoints") ||
-            !dictionary.Contains("node_transport_manager_ids")) {
-            return Status::InvalidParam("missing DramStore node configuration arrays");
+        std::vector<std::string> peerAddrs;
+        if (!dictionary.Contains("peer_addrs")) {
+            return Status::InvalidParam("missing peer_addrs");
         }
-        dictionary.Get("node_control_endpoints", controlEndpoints);
-        dictionary.Get("node_transport_manager_ids", transportManagerIds);
-        if (controlEndpoints.size() != transportManagerIds.size()) {
-            return Status::InvalidParam("node config arrays must have equal lengths");
-        }
-        result.nodeScheduler.nodes.reserve(controlEndpoints.size());
-        for (std::size_t index = 0; index < controlEndpoints.size(); ++index) {
-            const auto controlField = fmt::format("node_control_endpoints[{}]", index);
-            std::string controlHost;
-            std::uint16_t controlPort = 0;
-            status = ParseControlEndpoint(controlEndpoints[index], controlField, &controlHost,
-                                          &controlPort);
+        dictionary.Get("peer_addrs", peerAddrs);
+        result.nodeScheduler.nodes.reserve(peerAddrs.size());
+        for (std::size_t index = 0; index < peerAddrs.size(); ++index) {
+            std::string managerHost;
+            std::uint16_t managerPort = 0;
+            const auto peerField = fmt::format("peer_addrs[{}]", index);
+            status = ParseControlEndpoint(peerAddrs[index], peerField, &managerHost, &managerPort);
             if (status.Failure()) { return status; }
-            if (transportManagerIds[index].empty()) {
-                return Status::InvalidParam("node_transport_manager_ids[{}] must not be empty",
-                                            index);
-            }
             result.nodeScheduler.nodes.push_back(
-                NodeEndpoint{static_cast<NodeId>(index), std::move(controlHost), controlPort,
-                             std::move(transportManagerIds[index])});
+                NodeEndpoint{static_cast<NodeId>(index), std::move(peerAddrs[index])});
         }
 
         status = OptionalSize(dictionary, "max_io_entries", &result.maxIoEntries);
@@ -263,6 +250,12 @@ Expected<DramConfig> DramConfig::Parse(const Detail::Dictionary& dictionary)
         result.replySlotCount = result.nodeScheduler.nodes.size() * maxInflight;
         result.replySlotSize = static_cast<std::uint32_t>(MaxReplySize(maxBatch));
 
+        auto pollInterval = static_cast<std::size_t>(result.nodeScheduler.pollInterval.count());
+        status = OptionalSize(dictionary, "poll_interval_us", &pollInterval);
+        if (status.Failure()) { return status; }
+        result.nodeScheduler.pollInterval =
+            std::chrono::microseconds{static_cast<std::chrono::microseconds::rep>(pollInterval)};
+
         std::size_t lookupTimeout = 1000;
         std::size_t dumpTimeout = 3000;
         std::size_t loadTimeout = 3000;
@@ -289,6 +282,17 @@ Expected<DramConfig> DramConfig::Parse(const Detail::Dictionary& dictionary)
         }
         result.tensorSizes.assign(tensorSizes.begin(), tensorSizes.end());
 
+        std::vector<std::size_t> gpuKvBufferAddrs;
+        if (dictionary.Contains("gpu_kv_buffer_addrs")) {
+            status = NumberList(dictionary, "gpu_kv_buffer_addrs", &gpuKvBufferAddrs);
+            if (status.Failure()) { return status; }
+        }
+        result.gpuKvBufferAddrs.assign(gpuKvBufferAddrs.begin(), gpuKvBufferAddrs.end());
+        if (dictionary.Contains("gpu_kv_buffer_sizes")) {
+            status = NumberList(dictionary, "gpu_kv_buffer_sizes", &result.gpuKvBufferSizes);
+            if (status.Failure()) { return status; }
+        }
+
         status = result.Validate();
         if (status.Failure()) { return status; }
         return result;
@@ -299,15 +303,14 @@ Expected<DramConfig> DramConfig::Parse(const Detail::Dictionary& dictionary)
 
 Status DramConfig::Validate() const
 {
-    if (localControlHost.empty() || localControlPort == 0 || localHost.empty() ||
-        localTransportManagerId.empty()) {
+    if (localAddr.host.empty() || localAddr.port == 0) {
         return Status::InvalidParam("local DramStore transport configuration is invalid");
     }
     if (nodeScheduler.nodes.empty()) { return Status::InvalidParam("node list must not be empty"); }
     std::unordered_set<NodeId> ids;
     for (const auto& node : nodeScheduler.nodes) {
         if (node.nodeId == std::numeric_limits<NodeId>::max() || !ids.insert(node.nodeId).second ||
-            node.controlHost.empty() || node.controlPort == 0 || node.transportManagerId.empty()) {
+            node.peerAddr.empty()) {
             return Status::InvalidParam("invalid or duplicate DramPool node endpoint");
         }
     }
@@ -334,11 +337,25 @@ Status DramConfig::Validate() const
         taskTimeouts.load.count() <= 0) {
         return Status::InvalidParam("DramStore timeouts must be positive");
     }
+    const auto pollIntervalUs = nodeScheduler.pollInterval.count();
+    if (pollIntervalUs < 1 || pollIntervalUs > 10000) {
+        return Status::InvalidParam("DramStore poll_interval_us must be in [1, 10000]");
+    }
     if (nodeScheduler.reconnectInterval.count() <= 0) {
         return Status::InvalidParam("DramStore reconnect interval must be positive");
     }
-    if (role != Role::SCHEDULER && tensorSizes.empty()) {
+    if (GetRole() == Role::WORKER && tensorSizes.empty()) {
         return Status::InvalidParam("tensor_size_list must not be empty");
+    }
+    if (gpuKvBufferAddrs.size() != gpuKvBufferSizes.size()) {
+        return Status::InvalidParam(
+            "gpu_kv_buffer_addrs({}) and gpu_kv_buffer_sizes({}) must have the same size",
+            gpuKvBufferAddrs.size(), gpuKvBufferSizes.size());
+    }
+    for (std::size_t index = 0; index < gpuKvBufferAddrs.size(); ++index) {
+        if (gpuKvBufferAddrs[index] == 0 || gpuKvBufferSizes[index] == 0) {
+            return Status::InvalidParam("invalid GPU KV buffer at index({})", index);
+        }
     }
     return Status::OK();
 }

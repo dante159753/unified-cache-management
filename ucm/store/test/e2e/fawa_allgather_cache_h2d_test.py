@@ -59,7 +59,7 @@ def _store_config(
         "shard_size": shard_size,
         "block_size": shard_size,
         "share_buffer_enable": scatter_only,
-        "local_rank_size": world_size if scatter_only else 1,
+        "local_rank_size": world_size,
         "cache_load_backend_only": False,
         "cache_buffer_capacity_gb": 8,
         "cache_stream_number": 4,
@@ -79,7 +79,7 @@ def _store_config(
         "allgather_load_backend_only": load_backend_only,
     }
     if cache_numa_node is not None:
-        config["cache_numa_node"] = cache_numa_node
+        config["cache_detected_numa_node"] = cache_numa_node
     return config
 
 

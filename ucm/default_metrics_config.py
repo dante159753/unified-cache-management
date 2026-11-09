@@ -1,10 +1,13 @@
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 #
 # MIT License
 #
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All rights reserved.
 #
-# This file is generated from examples/metrics/metrics_configs.yaml.
-# Update the YAML first, then regenerate this file.
+# Keep non-KV definitions in sync with examples/metrics/metrics_configs.yaml.
+# BEGIN/END GENERATED KV blocks come from kv_semantics/metrics/config/kv_metrics.yaml.
+# Update that source, then run:
+# python kv_semantics/metrics/tools/generate_kv_metrics.py --sync-ucm
 #
 
 from copy import deepcopy
@@ -12,6 +15,41 @@ from typing import Any
 
 # fmt: off
 _COUNTER_METRICS = [
+    ("asu_lookup_requests_total", "AsuStore Lookup, prefix lookup and reverse lookup calls"),
+    ("asu_lookup_errors_total", "Failed AsuStore lookup calls; excludes timeout fallback to misses"),
+    ("asu_lookup_query_blocks_total", "Blocks queried by normally returned Lookup calls, including timeout fallback"),
+    ("asu_lookup_hit_blocks_total", "Hit blocks returned by Lookup; timeout fallback contributes zero hits"),
+    ("asu_lookup_prefix_query_blocks_total", "Blocks queried by normally returned prefix lookup calls, including timeout fallback"),
+    ("asu_lookup_prefix_hit_blocks_total", "Contiguous prefix hit blocks, computed as returned index + 1; timeout fallback contributes zero hits"),
+    ("asu_lookup_timeout_fallback_total", "AsuStore lookup calls returning cache misses after query timeout"),
+    ("asu_load_requests_total", "AsuStore Load calls, including validation and submission failures"),
+    ("asu_load_submit_errors_total", "Failed AsuStore Load submissions, including buffer validation failures"),
+    ("asu_load_submitted_bytes_total", "Payload bytes accepted by AsuStore Load; not successfully completed bytes"),
+    ("asu_dump_requests_total", "AsuStore Dump calls, including validation and submission failures"),
+    ("asu_dump_submit_errors_total", "Failed AsuStore Dump submissions, including buffer validation failures"),
+    ("asu_dump_submitted_bytes_total", "Payload bytes accepted by AsuStore Dump; not successfully completed bytes"),
+    ("asu_wait_requests_total", "AsuStore Wait calls; repeated waits are counted separately"),
+    ("asu_wait_errors_total", "AsuStore Wait calls returning errors, including timeouts and task failures"),
+    ("asu_wait_timeouts_total", "AsuStore Wait calls returning timeout; a subset of wait errors"),
+    # BEGIN GENERATED KV counter
+    ("kv_client_query_requests_total", "Total KV client query submissions", {"prometheus_name": "kv:kv_client_query_requests_total"}),
+    ("kv_client_query_entries_total", "Total keys submitted to KV client query", {"prometheus_name": "kv:kv_client_query_entries_total"}),
+    ("kv_client_query_errors_total", "Total failed KV client query submissions", {"prometheus_name": "kv:kv_client_query_errors_total"}),
+    ("kv_client_load_requests_total", "Total KV client load API calls across single and batch protocols", {"prometheus_name": "kv:kv_client_load_requests_total"}),
+    ("kv_client_load_entries_total", "Total entries in KV client load API calls across single and batch protocols", {"prometheus_name": "kv:kv_client_load_entries_total"}),
+    ("kv_client_load_errors_total", "Total failed KV client load API submissions, excluding asynchronous execution failures", {"prometheus_name": "kv:kv_client_load_errors_total"}),
+    ("kv_client_store_requests_total", "Total KV client store API calls across single and batch protocols", {"prometheus_name": "kv:kv_client_store_requests_total"}),
+    ("kv_client_store_entries_total", "Total entries in KV client store API calls across single and batch protocols", {"prometheus_name": "kv:kv_client_store_entries_total"}),
+    ("kv_client_store_errors_total", "Total failed KV client store API submissions, excluding asynchronous execution failures", {"prometheus_name": "kv:kv_client_store_errors_total"}),
+    ("kv_client_delete_requests_total", "Total KV client delete submissions", {"prometheus_name": "kv:kv_client_delete_requests_total"}),
+    ("kv_client_delete_entries_total", "Total keys submitted to KV client delete", {"prometheus_name": "kv:kv_client_delete_entries_total"}),
+    ("kv_client_delete_errors_total", "Total failed KV client delete submissions", {"prometheus_name": "kv:kv_client_delete_errors_total"}),
+    ("kv_client_wait_requests_total", "Total KV client wait calls", {"prometheus_name": "kv:kv_client_wait_requests_total"}),
+    ("kv_client_wait_errors_total", "Total failed KV client wait calls", {"prometheus_name": "kv:kv_client_wait_errors_total"}),
+    ("kv_transport_task_completion_timeouts_total", "Total KV transport task completion timeouts", {"prometheus_name": "kv:kv_transport_task_completion_timeouts_total"}),
+    ("kv_transport_task_io_timeouts_total", "Total KV transport sub-batch IO timeouts", {"prometheus_name": "kv:kv_transport_task_io_timeouts_total"}),
+    ("kv_transport_task_connection_errors_total", "Total KV transport connection errors", {"prometheus_name": "kv:kv_transport_task_connection_errors_total"}),
+    # END GENERATED KV counter
     (
         "cache_lookup_hit_blocks_total",
         "Number of lookup hits served by the Cache stage (no descent to backend)",
@@ -129,6 +167,10 @@ _COUNTER_METRICS = [
         "Number of failed Posix health probes",
     ),
     (
+        "posix_passive_failures_total",
+        "Number of failed Posix IO tasks observed by passive health detection",
+    ),
+    (
         "posix_aio_timeout_total",
         "Number of Posix AIO task or submit timeouts",
     ),
@@ -150,6 +192,22 @@ _COUNTER_METRICS = [
     (
         "posix_io_errors_total",
         "Number of Posix read, write, or AIO completion failures",
+    ),
+    (
+        "posix_handle_cache_hit_total",
+        "Number of Posix load handle-cache hits",
+    ),
+    (
+        "posix_handle_cache_miss_total",
+        "Number of Posix load handle-cache misses",
+    ),
+    (
+        "posix_handle_cache_evict_total",
+        "Number of Posix load handle-cache CLOCK evictions",
+    ),
+    (
+        "posix_handle_cache_bypass_total",
+        "Number of Posix load opens that skipped the handle cache",
     ),
     (
         "yuanrong_load_success_shards_total",
@@ -206,6 +264,10 @@ _COUNTER_METRICS = [
     (
         "mooncake_unhealthy_count_total",
         "Number of failed Mooncake health probes",
+    ),
+    (
+        "mooncake_passive_failures_total",
+        "Number of failed Mooncake IO tasks observed by passive health detection",
     ),
     (
         "mooncake_load_bytes_total",
@@ -355,6 +417,187 @@ _COUNTER_METRICS = [
         "connector_dump_wait_errors_total",
         "Number of connector dump wait failures",
     ),
+    (
+        "dramstore_lookup_tasks_submitted_total",
+        "DramStore lookup: tasks submitted",
+    ),
+    (
+        "dramstore_lookup_tasks_rejected_total",
+        "DramStore lookup: tasks rejected",
+    ),
+    (
+        "dramstore_lookup_tasks_succeeded_total",
+        "DramStore lookup: tasks succeeded",
+    ),
+    (
+        "dramstore_lookup_tasks_failed_total",
+        "DramStore lookup: tasks failed",
+    ),
+    (
+        "dramstore_lookup_task_timeouts_total",
+        "DramStore lookup: task timeouts",
+    ),
+    (
+        "dramstore_lookup_requests_completed_total",
+        "DramStore lookup: requests completed",
+    ),
+    (
+        "dramstore_lookup_requests_failed_total",
+        "DramStore lookup: requests failed",
+    ),
+    (
+        "dramstore_lookup_request_timeouts_total",
+        "DramStore lookup: requests completed with Timeout status",
+    ),
+    (
+        "dramstore_dump_tasks_submitted_total",
+        "DramStore dump: tasks submitted",
+    ),
+    (
+        "dramstore_dump_tasks_rejected_total",
+        "DramStore dump: tasks rejected",
+    ),
+    (
+        "dramstore_dump_tasks_succeeded_total",
+        "DramStore dump: tasks succeeded",
+    ),
+    (
+        "dramstore_dump_tasks_failed_total",
+        "DramStore dump: tasks failed",
+    ),
+    (
+        "dramstore_dump_task_timeouts_total",
+        "DramStore dump: task timeouts",
+    ),
+    (
+        "dramstore_dump_requests_completed_total",
+        "DramStore dump: requests completed",
+    ),
+    (
+        "dramstore_dump_requests_failed_total",
+        "DramStore dump: requests failed",
+    ),
+    (
+        "dramstore_dump_request_timeouts_total",
+        "DramStore dump: requests completed with Timeout status",
+    ),
+    (
+        "dramstore_load_tasks_submitted_total",
+        "DramStore load: tasks submitted",
+    ),
+    (
+        "dramstore_load_tasks_rejected_total",
+        "DramStore load: tasks rejected",
+    ),
+    (
+        "dramstore_load_tasks_succeeded_total",
+        "DramStore load: tasks succeeded",
+    ),
+    (
+        "dramstore_load_tasks_failed_total",
+        "DramStore load: tasks failed",
+    ),
+    (
+        "dramstore_load_task_timeouts_total",
+        "DramStore load: task timeouts",
+    ),
+    (
+        "dramstore_load_requests_completed_total",
+        "DramStore load: requests completed",
+    ),
+    (
+        "dramstore_load_requests_failed_total",
+        "DramStore load: requests failed",
+    ),
+    (
+        "dramstore_load_request_timeouts_total",
+        "DramStore load: requests completed with Timeout status",
+    ),
+    (
+        "dramstore_connect_attempts_total",
+        "DramStore connect attempts",
+    ),
+    (
+        "dramstore_connect_failures_total",
+        "DramStore connect failures",
+    ),
+    (
+        "dramstore_fence_attempts_total",
+        "DramStore fence attempts",
+    ),
+    (
+        "dramstore_fence_failures_total",
+        "DramStore fence failures",
+    ),
+    (
+        "dramstore_fence_timeout_triggers_total",
+        "DramStore node fencing episodes triggered by request timeouts; excludes fence retries",
+    ),
+    (
+        "dramstore_reply_slot_nospace_total",
+        "DramStore reply slot acquisition failures due to exhausted capacity",
+    ),
+    (
+        "dramstore_stale_replies_total",
+        "DramStore stale replies",
+    ),
+    # -- DramPool server observability ----------------------------------------
+    (
+        "drampool_dump_requests_total",
+        "Total DUMP requests received and processed by DramPool",
+    ),
+    (
+        "drampool_load_requests_total",
+        "Total LOAD requests received and processed by DramPool",
+    ),
+    (
+        "drampool_lookup_requests_total",
+        "Total LOOKUP requests received and processed by DramPool",
+    ),
+    (
+        "drampool_dump_nospace_failures_total",
+        "DUMP entries whose buffer allocation finally failed with NoSpace after eviction retries (registration failures excluded)",
+    ),
+    (
+        "drampool_dump_failed_entries_total",
+        "Total DUMP entries that settled with a Failed result (all failure paths merged)",
+    ),
+    (
+        "drampool_load_miss_entries_total",
+        "LOAD entries that missed stored data (LoadBegin failure or request longer than stored length)",
+    ),
+    (
+        "drampool_lookup_miss_entries_total",
+        "LOOKUP entries that do not exist or are not READY",
+    ),
+    (
+        "drampool_transfer_failures_total",
+        "Data transfers that ended in a non-Completed terminal state (DUMP and LOAD merged)",
+    ),
+    (
+        "drampool_response_failures_total",
+        "Response return-path failures (local submit failures plus write-back transfer failures, DUMP and LOAD merged)",
+    ),
+    (
+        "drampool_submit_failures_total",
+        "Data transfer submission failures (ExecuteAsync failure or invalid handle)",
+    ),
+    (
+        "drampool_queue_request_full_total",
+        "requestQueue TryPush failures because the queue was full",
+    ),
+    (
+        "drampool_queue_completion_full_total",
+        "completionQueue full events that forced SubmitCompletion to spin-wait",
+    ),
+    (
+        "drampool_queue_response_buffer_retry_total",
+        "Response flag-buffer NoSpace events where SubmitResponse parked the request for retry",
+    ),
+    (
+        "drampool_resource_log_read_errors_total",
+        "Number of failures opening, reading, or parsing the DramPool resource log",
+    ),
 ]
 _GAUGE_METRICS = [
     (
@@ -427,6 +670,125 @@ _GAUGE_METRICS = [
         "Posix garbage collection state, where 1 is running and 0 is idle",
         {"multiprocess_mode": 'livemostrecent'},
     ),
+    (
+        "dramstore_scheduler_request_queue_size",
+        "Sampled queued Requests across scheduler runners, excluding batches already dequeued",
+        {"multiprocess_mode": "livemostrecent"},
+    ),
+    (
+        "dramstore_scheduler_event_queue_size",
+        "Sampled queued NodeEvents across scheduler runners, excluding batches already dequeued",
+        {"multiprocess_mode": "livemostrecent"},
+    ),
+    (
+        "dramstore_task_queue_size",
+        "Sampled TaskManager submission queue occupancy (tasks)",
+        {"multiprocess_mode": "livemostrecent"},
+    ),
+    (
+        "dramstore_task_queue_capacity",
+        "TaskManager submission queue capacity (tasks)",
+        {"multiprocess_mode": "livemostrecent"},
+    ),
+    (
+        "dramstore_completion_queue_size",
+        "Sampled TaskManager completion queue occupancy (request completions)",
+        {"multiprocess_mode": "livemostrecent"},
+    ),
+    (
+        "dramstore_completion_queue_capacity",
+        "TaskManager completion queue capacity (request completions)",
+        {"multiprocess_mode": "livemostrecent"},
+    ),
+    (
+        "dramstore_tasks_active",
+        "Sampled tasks awaiting completion, excluding queued submissions and retained results",
+        {"multiprocess_mode": "livemostrecent"},
+    ),
+    (
+        "dramstore_io_entries_used",
+        "Sampled entries reserved by active tasks",
+        {"multiprocess_mode": "livemostrecent"},
+    ),
+    (
+        "dramstore_io_entries_capacity",
+        "Maximum entries reserved by active tasks",
+        {"multiprocess_mode": "livemostrecent"},
+    ),
+    (
+        "dramstore_reply_buffer_used_bytes",
+        "Sampled leased reply slot bytes including alignment, not payload bytes",
+        {"multiprocess_mode": "livemostrecent"},
+    ),
+    (
+        "dramstore_reply_buffer_capacity_bytes",
+        "Total reply slot bytes including alignment",
+        {"multiprocess_mode": "livemostrecent"},
+    ),
+    (
+        "dramstore_transport_queue_size",
+        "Sampled aggregate queued Transmit and Connect admission occupancy",
+        {"multiprocess_mode": "livemostrecent"},
+    ),
+    (
+        "dramstore_transport_queue_capacity",
+        "Aggregate Transmit and Connect admission capacity",
+        {"multiprocess_mode": "livemostrecent"},
+    ),
+    (
+        "dramstore_transport_fence_queue_size",
+        "Sampled aggregate queued Fence admission occupancy",
+        {"multiprocess_mode": "livemostrecent"},
+    ),
+    (
+        "dramstore_transport_fence_queue_capacity",
+        "Aggregate reserved Fence admission capacity",
+        {"multiprocess_mode": "livemostrecent"},
+    ),
+    # -- DramPool server observability ----------------------------------------
+    (
+        "drampool_metadata_entry_count",
+        "Current number of cached entries (blocks) in the pool, summed over all shards",
+        {"multiprocess_mode": "livemostrecent"},
+    ),
+    (
+        "drampool_buffer_pool_usage_ratio",
+        "Used-slot ratio of the data pool per block size; exported as drampool_buffer_pool_usage_ratio{slot_size=<size>}",
+        {
+            "multiprocess_mode": "livemostrecent",
+            "dynamic_labels": ["slot_size"],
+        },
+    ),
+    (
+        "drampool_flag_pool_usage_ratio",
+        "Used-slot ratio of the flag response-buffer pool",
+        {"multiprocess_mode": "livemostrecent"},
+    ),
+    (
+        "drampool_queue_request_size",
+        "Current number of requests queued in requestQueue",
+        {"multiprocess_mode": "livemostrecent"},
+    ),
+    (
+        "drampool_queue_completion_size",
+        "Current number of completion records queued in completionQueue",
+        {"multiprocess_mode": "livemostrecent"},
+    ),
+    (
+        "drampool_queue_completion_inflight",
+        "Completion records currently in flight in the Poller pending window",
+        {"multiprocess_mode": "livemostrecent"},
+    ),
+    (
+        "drampool_queue_request_capacity",
+        "Configured requestQueue depth (requests)",
+        {"multiprocess_mode": "livemostrecent"},
+    ),
+    (
+        "drampool_queue_completion_capacity",
+        "Configured completionQueue depth (records)",
+        {"multiprocess_mode": "livemostrecent"},
+    ),
 ]
 _CONNECTOR_INTERFACE_METHODS = [
     "get_block_size",
@@ -455,6 +817,26 @@ _CONNECTOR_INTERFACE_DURATION_BUCKETS = [
     2000, 5000, 10000,
 ]
 _HISTOGRAM_METRICS = [
+    ("asu_lookup_duration_ms", "AsuStore lookup call duration including key conversion, query wait and result processing (ms)", [0.01, 0.05, 0.1, 0.5, 1, 5, 10, 50, 100, 500, 1000, 5000, 10000, 30000, 60000]),
+    ("asu_load_submit_duration_ms", "AsuStore Load submission duration including buffer conversion and failed submissions (ms)", [0.01, 0.05, 0.1, 0.5, 1, 5, 10, 50, 100, 500, 1000, 5000, 10000, 30000, 60000]),
+    ("asu_dump_submit_duration_ms", "AsuStore Dump submission duration including buffer conversion and failed submissions (ms)", [0.01, 0.05, 0.1, 0.5, 1, 5, 10, 50, 100, 500, 1000, 5000, 10000, 30000, 60000]),
+    ("asu_wait_duration_ms", "AsuStore Wait call duration including failed and timed-out waits (ms)", [0.01, 0.05, 0.1, 0.5, 1, 5, 10, 50, 100, 500, 1000, 5000, 10000, 30000, 60000]),
+    # BEGIN GENERATED KV histogram
+    ("kv_client_task_enqueue_duration_seconds", "KV client API-to-enqueue duration", [0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0], {"prometheus_name": "kv:kv_client_task_enqueue_duration_seconds"}),
+    ("kv_client_task_queue_duration_seconds", "KV client task queue duration", [0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0], {"prometheus_name": "kv:kv_client_task_queue_duration_seconds"}),
+    ("kv_client_task_process_duration_seconds", "KV client task processing duration", [0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0], {"prometheus_name": "kv:kv_client_task_process_duration_seconds"}),
+    ("kv_client_task_send_duration_seconds", "KV client duration until all Send calls return", [0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0], {"prometheus_name": "kv:kv_client_task_send_duration_seconds"}),
+    ("kv_client_task_e2e_duration_seconds", "KV client task end-to-end duration", [0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0], {"prometheus_name": "kv:kv_client_task_e2e_duration_seconds"}),
+    ("kv_transport_task_pre_send_duration_seconds", "KV transport duration before Send", [0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0], {"prometheus_name": "kv:kv_transport_task_pre_send_duration_seconds"}),
+    ("kv_transport_task_queue_duration_seconds", "KV transport task queue duration", [0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0], {"prometheus_name": "kv:kv_transport_task_queue_duration_seconds"}),
+    ("kv_transport_task_process_duration_seconds", "KV transport task processing duration", [0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0], {"prometheus_name": "kv:kv_transport_task_process_duration_seconds"}),
+    ("kv_transport_task_send_duration_seconds", "KV transport duration until Send returns", [0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0], {"prometheus_name": "kv:kv_transport_task_send_duration_seconds"}),
+    ("kv_transport_task_send_call_duration_seconds", "KV transport provider Send call duration", [0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0], {"prometheus_name": "kv:kv_transport_task_send_call_duration_seconds"}),
+    ("kv_transport_task_completion_duration_seconds", "KV transport completion duration after Send", [0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0], {"prometheus_name": "kv:kv_transport_task_completion_duration_seconds"}),
+    ("kv_transport_node_task_send_duration_seconds", "KV transport send duration by node", [0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0], {"prometheus_name": "kv:kv_transport_node_task_send_duration_seconds"}),
+    ("kv_transport_node_task_completion_duration_seconds", "KV transport completion duration by node", [0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0], {"prometheus_name": "kv:kv_transport_node_task_completion_duration_seconds"}),
+    ("kv_transport_task_e2e_duration_seconds", "KV transport task end-to-end duration from submit to completion", [0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0], {"prometheus_name": "kv:kv_transport_task_e2e_duration_seconds"}),
+    # END GENERATED KV histogram
     (
         "save_duration",
         "Time from UCM connector wait_for_save entry to async dump task completion (ms)",
@@ -1047,6 +1429,262 @@ _HISTOGRAM_METRICS = [
         "store dump task latency",
         [1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 100, 150, 200, 250, 300, 350, 400, 450, 500],
     ),
+    (
+        "dramstore_lookup_duration_ms",
+        "End-to-end DramStore lookup duration (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+    ),
+    (
+        "dramstore_lookup_task_queue_duration_ms",
+        "DramStore lookup task queue duration (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
+    ),
+    (
+        "dramstore_lookup_task_to_request_duration_ms",
+        "DramStore lookup duration from task admission through request construction (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "dramstore_lookup_request_duration_ms",
+        "DramStore lookup request duration (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+    ),
+    (
+        "dramstore_lookup_request_queue_duration_ms",
+        "DramStore lookup request NodeScheduler queue duration (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
+    ),
+    (
+        "dramstore_lookup_request_pending_duration_ms",
+        "DramStore lookup request NodeActor pending duration (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+    ),
+    (
+        "dramstore_lookup_request_setup_duration_ms",
+        "DramStore lookup request successful setup duration including reply-slot allocation and encoding (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "dramstore_lookup_request_transport_queue_duration_ms",
+        "DramStore lookup request TransportExecutor queue duration (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
+    ),
+    (
+        "dramstore_lookup_request_transport_send_duration_ms",
+        "DramStore lookup request TCP send duration (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000],
+    ),
+    (
+        "dramstore_lookup_request_remote_duration_ms",
+        "DramStore lookup request remote processing and reply duration (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+    ),
+    (
+        "dramstore_dump_duration_ms",
+        "End-to-end DramStore dump duration (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+    ),
+    (
+        "dramstore_dump_task_queue_duration_ms",
+        "DramStore dump task queue duration (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
+    ),
+    (
+        "dramstore_dump_task_to_request_duration_ms",
+        "DramStore dump duration from task admission through request construction (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "dramstore_dump_request_duration_ms",
+        "DramStore dump request duration (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+    ),
+    (
+        "dramstore_dump_request_queue_duration_ms",
+        "DramStore dump request NodeScheduler queue duration (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
+    ),
+    (
+        "dramstore_dump_request_pending_duration_ms",
+        "DramStore dump request NodeActor pending duration (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+    ),
+    (
+        "dramstore_dump_request_setup_duration_ms",
+        "DramStore dump request successful setup duration including reply-slot allocation and encoding (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "dramstore_dump_request_transport_queue_duration_ms",
+        "DramStore dump request TransportExecutor queue duration (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
+    ),
+    (
+        "dramstore_dump_request_transport_send_duration_ms",
+        "DramStore dump request TCP send duration (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000],
+    ),
+    (
+        "dramstore_dump_request_remote_duration_ms",
+        "DramStore dump request remote processing and reply duration (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+    ),
+    (
+        "dramstore_load_duration_ms",
+        "End-to-end DramStore load duration (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+    ),
+    (
+        "dramstore_load_task_queue_duration_ms",
+        "DramStore load task queue duration (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
+    ),
+    (
+        "dramstore_load_task_to_request_duration_ms",
+        "DramStore load duration from task admission through request construction (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "dramstore_load_request_duration_ms",
+        "DramStore load request duration (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+    ),
+    (
+        "dramstore_load_request_queue_duration_ms",
+        "DramStore load request NodeScheduler queue duration (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
+    ),
+    (
+        "dramstore_load_request_pending_duration_ms",
+        "DramStore load request NodeActor pending duration (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+    ),
+    (
+        "dramstore_load_request_setup_duration_ms",
+        "DramStore load request successful setup duration including reply-slot allocation and encoding (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "dramstore_load_request_transport_queue_duration_ms",
+        "DramStore load request TransportExecutor queue duration (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
+    ),
+    (
+        "dramstore_load_request_transport_send_duration_ms",
+        "DramStore load request TCP send duration (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000],
+    ),
+    (
+        "dramstore_load_request_remote_duration_ms",
+        "DramStore load request remote processing and reply duration (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+    ),
+    (
+        "dramstore_dump_prerequisite_duration_ms",
+        "DUMP prerequisite event wait before task admission (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    # -- DramPool server observability ----------------------------------------
+    (
+        "drampool_dump_prepare_duration_ms",
+        "DUMP local preparation duration per batch: StoreBegin per entry, buffer allocation, eviction retries, and transfer submission (ms, successful path only; split into dump_metadata and dump_submit)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+    ),
+    (
+        "drampool_dump_metadata_duration_ms",
+        "DUMP metadata-processing segment per batch: StoreBegin per entry, buffer allocation, eviction retries, and transfer-item building, excluding the ExecuteAsync submission (ms, successful path only)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+    ),
+    (
+        "drampool_dump_submit_duration_ms",
+        "DUMP data-transfer ExecuteAsync submission duration (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
+    ),
+    (
+        "drampool_load_prepare_duration_ms",
+        "LOAD local preparation duration per batch: LoadBegin per entry, length validation, and transfer submission (ms, successful path only; split into load_metadata and load_submit)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+    ),
+    (
+        "drampool_load_metadata_duration_ms",
+        "LOAD metadata-processing segment per batch: LoadBegin per entry, length validation, and transfer-item building, excluding the ExecuteAsync submission (ms, successful path only)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+    ),
+    (
+        "drampool_load_submit_duration_ms",
+        "LOAD data-transfer ExecuteAsync submission duration (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
+    ),
+    (
+        "drampool_lookup_scan_duration_ms",
+        "Per-batch LOOKUP metadata scan duration: per-entry existence checks plus result filling (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
+    ),
+    (
+        "drampool_dump_transfer_duration_ms",
+        "DUMP data transfer duration from ExecuteAsync return to terminal-state observation, including HiXL transfer, polling delay, and GetStatus (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+    ),
+    (
+        "drampool_load_transfer_duration_ms",
+        "LOAD data transfer duration from ExecuteAsync return to terminal-state observation, including HiXL transfer, polling delay, and GetStatus (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+    ),
+    (
+        "drampool_get_status_duration_ms",
+        "GetStatus() execution duration when the Poller queries data or response transfers (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
+    ),
+    (
+        "drampool_response_submit_duration_ms",
+        "Response write-back ExecuteAsync submission duration (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
+    ),
+    (
+        "drampool_response_rtt_ms",
+        "Response round-trip duration from response-transfer ExecuteAsync return to write-back completion in client memory, including polling delay and GetStatus but excluding the submission itself (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+    ),
+    (
+        "drampool_metadata_storeend_duration_ms",
+        "Per-entry StoreEnd settlement duration after DUMP transfer completion (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
+    ),
+    (
+        "drampool_metadata_loadend_duration_ms",
+        "Per-entry LoadEnd reference-release duration (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
+    ),
+    (
+        "drampool_metadata_evict_gc_duration_ms",
+        "Duration of one background GC eviction sweep across all shards (ms)",
+        [1, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000],
+    ),
+    (
+        "drampool_queue_request_enqueue_wait_ms",
+        "Per-request wait from preparation to successful requestQueue TryPush, including full-queue retries (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
+    ),
+    (
+        "drampool_queue_request_residence_ms",
+        "Per-request residence in requestQueue from the successful TryPush to the TaskWorker dequeue, excluding the TryPush wait (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+    ),
+    (
+        "drampool_dump_batch_total_duration_ms",
+        "End-to-end DUMP batch duration across the full server-side request lifecycle: from requestQueue push to response-transfer terminal state, or the record leaving the Poller on a permanent response failure (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+    ),
+    (
+        "drampool_load_batch_total_duration_ms",
+        "End-to-end LOAD batch duration across the full server-side request lifecycle: from requestQueue push to response-transfer terminal state, or the record leaving the Poller on a permanent response failure (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+    ),
+    (
+        "drampool_lookup_batch_total_duration_ms",
+        "End-to-end LOOKUP batch duration across the full server-side request lifecycle: from requestQueue push to response-transfer terminal state, or the record leaving the Poller on a permanent response failure (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+    ),
 ]
 
 
@@ -1055,9 +1693,9 @@ def _metric(name: str, documentation: str, **extra: Any) -> dict[str, Any]:
 
 
 def _histogram_metric(
-    name: str, documentation: str, buckets: list[int | float]
+    name: str, documentation: str, buckets: list[int | float], **extra: Any
 ) -> dict[str, Any]:
-    return _metric(name, documentation, buckets=buckets)
+    return _metric(name, documentation, buckets=buckets, **extra)
 
 
 DEFAULT_METRICS_CONFIG: dict[str, Any] = {
@@ -1065,15 +1703,16 @@ DEFAULT_METRICS_CONFIG: dict[str, Any] = {
     "vllm_connector_prefix": "ucm:",
     "consumers": {"vllm_connector": True},
     "counter": [
-        _metric(name, documentation) for name, documentation in _COUNTER_METRICS
+        _metric(name, documentation, **(extra[0] if extra else {}))
+        for name, documentation, *extra in _COUNTER_METRICS
     ],
     "gauge": [
         _metric(name, documentation, **extra)
         for name, documentation, extra in _GAUGE_METRICS
     ],
     "histogram": [
-        _histogram_metric(name, documentation, buckets)
-        for name, documentation, buckets in _HISTOGRAM_METRICS
+        _histogram_metric(name, documentation, buckets, **(extra[0] if extra else {}))
+        for name, documentation, buckets, *extra in _HISTOGRAM_METRICS
     ],
 }
 

@@ -21,15 +21,26 @@ The stage remains the top element of `AllGather|Cache|Posix` or
 model tensors <-> RemoteScatterStore <-> packed CacheStore <-> PosixStore
 ```
 
-For replicated MLA data:
+For replicated MLA data the owner follows the connector's MLA dump split:
 
 ```text
-owner = little_endian_u64(block_id[0:8]) % TP
+owner = absolute_block_position % TP
 ```
+
+The connector passes one owner per row in `TaskDesc::ownerRanks`. Dump rows are
+already the rows this rank selected, so their owners are all the local rank.
+Load rows carry the position of each block in its request, so the rank that
+dumped a block also loads it. Without `ownerRanks` (store benchmarks), a row's
+owner is its index in the task modulo TP.
 
 Only the owner submits the packed shard to CacheStore. Lookup still passes the
 complete block sequence through the lower stores, while load, dump, and
 prefetch filter data movement by owner.
+
+On Cache2 the inner CacheStore keeps the connector's machine-wide partitioned
+domain (`local_rank_size` is the local cache rank count). An owner fills and
+reads its own NUMA-local partition, and a block another rank dumped is still a
+cache hit. The legacy Cache (A5) keeps one private buffer per rank.
 
 Non-replicated models use the same packed load and scatter implementation with
 storage world size one. No IPC transport is created in that mode.
