@@ -802,6 +802,7 @@ class FAWADumpTask:
     task: Task
     key_count: int
     event_handle: int
+    external_event: bool = False
 
 
 @dataclass
@@ -2350,6 +2351,8 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         ptrs: np.ndarray,
         event_handle: int,
         block_ids_by_request: dict[str, set[bytes]],
+        *,
+        external_event: bool = False,
     ) -> FAWADumpTask:
         """Submit one store dump for FA or WA rows."""
 
@@ -2361,6 +2364,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             shard_indices,
             ptrs,
             event_handle,
+            external_event=external_event,
         )
         return FAWADumpTask(
             label=label,
@@ -2368,6 +2372,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             task=task,
             key_count=len(keys),
             event_handle=event_handle,
+            external_event=external_event,
         )
 
     def _extract_fa_ptr(
@@ -2751,41 +2756,43 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                     )
 
         dump_tasks: list[FAWADumpTask] = []
-        if fa_dump_keys:
-            event_handle = self._get_dump_event_handle()
-            fa_ptrs = np.vstack(fa_ptr_rows)
+        for label, store, keys, ptr_rows, blocks_by_request in (
+            ("FA", self.fa_store, fa_dump_keys, fa_ptr_rows, fa_dump_blocks_by_request),
+            ("WA", self.wa_store, wa_dump_keys, wa_ptr_rows, wa_dump_blocks_by_request),
+        ):
+            if not keys:
+                continue
+            ptrs = np.vstack(ptr_rows)
+            external_handle = 0
+            if (
+                metadata.dump_batch_id is not None
+                and getattr(store, "supports_external_dump_event", False) is True
+                and self.enable_event_sync
+            ):
+                external_handle = self.device.get_external_dump_event_handle()
+            event_handle = external_handle or self._get_dump_event_handle()
             try:
-                fa_dump_task = self._submit_dump_task(
-                    "FA",
-                    self.fa_store,
-                    fa_dump_keys,
-                    fa_ptrs,
+                dump_task = self._submit_dump_task(
+                    label,
+                    store,
+                    keys,
+                    ptrs,
                     event_handle,
-                    fa_dump_blocks_by_request,
+                    blocks_by_request,
+                    external_event=bool(external_handle),
                 )
-                dump_tasks.append(fa_dump_task)
-                save_bytes += fa_dump_task.key_count * self.file_size["FA"]
+                dump_tasks.append(dump_task)
+                save_bytes += dump_task.key_count * self.file_size[label]
             except Exception as e:
-                self.device.destroy_event_handle(event_handle)
-                logger.error(f"dump FAWA kv cache failed. {type(e).__name__}: {e}")
-                self._record_counter("connector_dump_submit_errors_total")
-        if wa_dump_keys:
-            event_handle = self._get_dump_event_handle()
-            window_ptrs = np.vstack(wa_ptr_rows)
-            try:
-                wa_dump_task = self._submit_dump_task(
-                    "WA",
-                    self.wa_store,
-                    wa_dump_keys,
-                    window_ptrs,
-                    event_handle,
-                    wa_dump_blocks_by_request,
+                if external_handle:
+                    self.device.release_external_dump_event_handle(
+                        external_handle, reusable=False
+                    )
+                else:
+                    self.device.destroy_event_handle(event_handle)
+                logger.error(
+                    f"dump FAWA {label} kv cache failed. {type(e).__name__}: {e}"
                 )
-                dump_tasks.append(wa_dump_task)
-                save_bytes += wa_dump_task.key_count * self.file_size["WA"]
-            except Exception as e:
-                self.device.destroy_event_handle(event_handle)
-                logger.error(f"dump FAWA WA kv cache failed. {type(e).__name__}: {e}")
                 self._record_counter("connector_dump_submit_errors_total")
         if fa_dump_keys or wa_dump_keys:
             ucmmetrics.update_stats({"save_bytes_total": save_bytes})
@@ -2833,8 +2840,9 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                         task_done = True
 
                 if task_done:
+                    completed = False
                     try:
-                        self._rank_consistency.wait_dump(dump_task.task)
+                        completed = self._rank_consistency.wait_dump(dump_task.task)
                     except Exception as e:
                         logger.error(
                             "Best-effort FAWA dump task failed; external cache may miss. "
@@ -2843,7 +2851,12 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                         )
                         self._record_counter("connector_dump_wait_errors_total")
                     finally:
-                        self.device.destroy_event_handle(dump_task.event_handle)
+                        if dump_task.external_event:
+                            self.device.release_external_dump_event_handle(
+                                dump_task.event_handle, reusable=completed
+                            )
+                        else:
+                            self.device.destroy_event_handle(dump_task.event_handle)
                 else:
                     in_flight_tasks.append(dump_task)
 

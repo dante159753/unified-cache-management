@@ -1465,7 +1465,7 @@ class UCMV41CompatibilityTest(unittest.TestCase):
             with self.subTest(tp_size=tp_size, rank=rank):
                 saved = []
 
-                def submit(label, _store, row_keys, *_args):
+                def submit(label, _store, row_keys, *_args, **_kwargs):
                     saved.append((label, row_keys))
                     return types.SimpleNamespace(key_count=len(row_keys))
 

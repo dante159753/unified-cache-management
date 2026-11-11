@@ -32,6 +32,15 @@ class Device(ABC):
         """Return event handle for stream sync. 0 means no event (use synchronize instead)."""
         pass
 
+    def get_external_dump_event_handle(self) -> int:
+        """Record a value-backed dump event, or return zero if unavailable."""
+        return 0
+
+    def release_external_dump_event_handle(
+        self, handle: int, *, reusable: bool
+    ) -> None:
+        """Return a consumed event to the pool, or retire it on failure."""
+
     @abstractmethod
     def synchronize(self):
         pass
@@ -271,6 +280,56 @@ class NpuDevice(Device):
 
     def __init__(self):
         super().__init__()
+        self._external_dump_events_enabled: Optional[bool] = None
+        self._external_dump_events: dict[int, Any] = {}
+        self._available_external_dump_events: list[tuple[int, Any]] = []
+
+    def get_external_dump_event_handle(self) -> int:
+        if self._external_dump_events_enabled is None:
+            try:
+                from ucm.shared.trans import ucmtrans
+
+                self._external_dump_events_enabled = (
+                    hasattr(torch.npu, "ExternalEvent")
+                    and ucmtrans.SupportsExternalEventWait()
+                )
+            except (ImportError, AttributeError):
+                self._external_dump_events_enabled = False
+        if not self._external_dump_events_enabled:
+            return 0
+
+        try:
+            if self._available_external_dump_events:
+                handle, event = self._available_external_dump_events.pop()
+            else:
+                # Bound allocation when the store falls behind. Keep the pool
+                # alive for the worker lifetime, as for graph external events.
+                if len(self._external_dump_events) >= 64:
+                    return 0
+                event = torch.npu.ExternalEvent()
+                handle = int(event.npu_event)
+                if handle == 0:
+                    # Legacy ACL events are allocated on record; value-backed
+                    # events already have their device address here.
+                    self._external_dump_events_enabled = False
+                    return 0
+            self._external_dump_events[handle] = event
+            event.record()
+            return handle
+        except Exception:
+            self._external_dump_events_enabled = False
+            logger.exception("Failed to record external NPU dump event")
+            return 0
+
+    def release_external_dump_event_handle(
+        self, handle: int, *, reusable: bool
+    ) -> None:
+        if reusable:
+            event = self._external_dump_events.pop(handle)
+            self._available_external_dump_events.append((handle, event))
+        else:
+            # A failed dump may not have consumed or reset this event.
+            self._external_dump_events_enabled = False
 
     def get_event_handle(self) -> int:
         import acl

@@ -80,4 +80,5 @@ endif()
 target_link_libraries(trans PUBLIC
     fmt
     Ascend::ascendcl
+    ${CMAKE_DL_LIBS}
 )

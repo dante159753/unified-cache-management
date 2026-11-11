@@ -87,6 +87,8 @@ struct TaskDesc : std::vector<Shard> {
     MemoryType memoryType{MemoryType::HBM};
     /** Shared keys requested by every rank may distribute backend fills. */
     bool distributeBackendLoad{false};
+    /** Dump prerequisite is a value-backed torch_npu ExternalEvent. */
+    bool externalPrerequisite{false};
 };
 
 }  // namespace UC::Detail

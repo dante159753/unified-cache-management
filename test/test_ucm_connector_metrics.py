@@ -3270,7 +3270,7 @@ def test_fawa_records_submitted_save_bytes():
     connector._extract_wa_ptr = lambda *args: np.zeros((1, 1), dtype=np.uint64)
     connector._get_dump_event_handle = lambda: 7
     connector._submit_dump_task = (
-        lambda label, store, keys, ptrs, event_handle, block_ids_by_request: (
+        lambda label, store, keys, ptrs, event_handle, block_ids_by_request, **kwargs: (
             FAWADumpTask(label, store, object(), len(keys), event_handle)
         )
     )
@@ -3411,7 +3411,7 @@ def _fawa_pinned_save_worker(num_dump_keys):
     connector._extract_wa_ptr = lambda *args: np.zeros((1, 1), dtype=np.uint64)
     connector._get_dump_event_handle = Mock(return_value=7)
     connector._submit_dump_task = Mock(
-        side_effect=lambda label, store, keys, ptrs, event_handle, blocks: (
+        side_effect=lambda label, store, keys, ptrs, event_handle, blocks, **kwargs: (
             FAWADumpTask(
                 label,
                 SimpleNamespace(check=Mock(return_value=False)),
@@ -3441,6 +3441,80 @@ def test_fawa_wait_for_save_tracks_pinned_batch(num_dump_keys, reported_dump_bat
     assert (
         connector._connector_worker_meta.completed_dump_batches == reported_dump_batches
     )
+
+
+def test_fawa_cache_dumps_record_distinct_external_events_and_recycle_after_wait():
+    from ucm.integration.vllm.rank_consistency import RankConsistencyManager
+
+    connector = _fawa_pinned_save_worker(num_dump_keys=1)
+    del connector._submit_dump_task
+    connector.enable_event_sync = True
+    connector._rank_consistency = RankConsistencyManager(is_scheduler=False)
+    connector.device.get_external_dump_event_handle = Mock(side_effect=[11, 12])
+    connector.device.release_external_dump_event_handle = Mock()
+    for attr in ("fa_store", "wa_store"):
+        setattr(
+            connector,
+            attr,
+            SimpleNamespace(
+                supports_external_dump_event=True,
+                dump_data=Mock(return_value=object()),
+                check=Mock(return_value=False),
+                wait=Mock(),
+            ),
+        )
+
+    connector.wait_for_save()
+    connector._get_dump_event_handle.assert_not_called()
+    for store, handle in ((connector.fa_store, 11), (connector.wa_store, 12)):
+        assert store.dump_data.call_args.args[-1] == handle
+        assert store.dump_data.call_args.kwargs == {"external_event": True}
+        store.wait.assert_not_called()
+
+    connector._reap_dump_batches()
+    connector.device.release_external_dump_event_handle.assert_not_called()
+
+    connector.fa_store.check.return_value = True
+    connector._reap_dump_batches()
+    connector.device.release_external_dump_event_handle.assert_called_once_with(
+        11, reusable=True
+    )
+    assert connector._connector_worker_meta.completed_dump_batches == {}
+
+    connector.wa_store.check.return_value = True
+    connector.wa_store.wait.side_effect = RuntimeError("external wait failed")
+    connector._reap_dump_batches()
+    connector.device.release_external_dump_event_handle.assert_called_with(
+        12, reusable=False
+    )
+    assert connector._connector_worker_meta.completed_dump_batches == {3: 1}
+
+
+def test_npu_dump_external_event_pool_reuses_only_completed_events(monkeypatch):
+    source = Path(__file__).resolve().parents[1] / "ucm/integration/vllm/device.py"
+    spec = importlib.util.spec_from_file_location("ucm_device_test", source)
+    device_module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, device_module)
+    spec.loader.exec_module(device_module)
+
+    event = SimpleNamespace(npu_event=11, record=Mock())
+    create = Mock(return_value=event)
+    monkeypatch.setattr(
+        device_module,
+        "torch",
+        SimpleNamespace(npu=SimpleNamespace(ExternalEvent=create)),
+    )
+    device = device_module.NpuDevice()
+    device._external_dump_events_enabled = True
+
+    assert device.get_external_dump_event_handle() == 11
+    device.release_external_dump_event_handle(11, reusable=True)
+    assert device.get_external_dump_event_handle() == 11
+    create.assert_called_once()
+    assert event.record.call_count == 2
+
+    device.release_external_dump_event_handle(11, reusable=False)
+    assert device.get_external_dump_event_handle() == 0
 
 
 def test_fawa_preempted_request_dumps_are_host_waited():

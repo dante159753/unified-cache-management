@@ -123,7 +123,8 @@ Status DumpQueue::DumpOneTask(CopyStream& stream, TaskPtr task)
     dumpCtx.taskHandle = task->id;
     std::shared_ptr<std::atomic<double>> eventReadyTp;
     if (task->desc.prerequisiteHandle != 0) {
-        auto s = stream.WaitEvent(Trans::Event{task->desc.prerequisiteHandle});
+        const Trans::Event event{task->desc.prerequisiteHandle};
+        auto s = task->desc.externalPrerequisite ? event.WaitExternal() : stream.WaitEvent(event);
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed({}) to wait prerequisite event for dump task({}).", s, task->id);
             UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_d2h_errors_total"), 1.0);

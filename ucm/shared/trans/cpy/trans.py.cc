@@ -229,6 +229,7 @@ PYBIND11_MODULE(ucmtrans, m)
     m.attr("version") = UCM_PROJECT_VERSION;
     m.attr("commit_id") = UCM_COMMIT_ID;
     m.attr("build_type") = UCM_BUILD_TYPE;
+    m.def("SupportsExternalEventWait", &Event::SupportsExternalWait);
 
     auto s = py::class_<Stream, std::unique_ptr<Stream>>(m, "Stream");
     s.def("DeviceToHost", &DeviceToHost);

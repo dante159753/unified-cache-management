@@ -22,9 +22,64 @@
  * SOFTWARE.
  * */
 #include <acl/acl.h>
+#include <dlfcn.h>
 #include "trans/event.h"
 
 namespace UC::Trans {
+namespace {
+
+using ValueOp = aclError (*)(void*, uint64_t, uint32_t, aclrtStream);
+
+struct ExternalEventApi {
+    ValueOp wait{reinterpret_cast<ValueOp>(dlsym(RTLD_DEFAULT, "aclrtValueWait"))};
+    ValueOp write{reinterpret_cast<ValueOp>(dlsym(RTLD_DEFAULT, "aclrtValueWrite"))};
+};
+
+const ExternalEventApi& GetExternalEventApi()
+{
+    static const ExternalEventApi api;
+    return api;
+}
+
+struct ExternalEventWaitStream {
+    aclrtStream stream{nullptr};
+    ~ExternalEventWaitStream()
+    {
+        if (stream != nullptr) { aclrtDestroyStream(stream); }
+    }
+};
+
+}  // namespace
+
+bool Event::SupportsExternalWait() noexcept
+{
+    const auto& api = GetExternalEventApi();
+    return api.wait != nullptr && api.write != nullptr;
+}
+
+Status Event::WaitExternal() const
+{
+    if (!Valid()) { return Status::InvalidParam("missing external event handle"); }
+    if (!SupportsExternalWait()) { return Status::Unsupported(); }
+
+    // A dump dispatcher stays on one device. Consume the event on one stream
+    // before submitting copies, which may be spread across many streams.
+    thread_local ExternalEventWaitStream waitStream;
+    if (waitStream.stream == nullptr) {
+        auto ret = aclrtCreateStream(&waitStream.stream);
+        if (ret != ACL_SUCCESS) { return Status{ret, std::to_string(ret)}; }
+    }
+    const auto& api = GetExternalEventApi();
+    auto* addr = reinterpret_cast<void*>(NativeHandle());
+    constexpr uint32_t waitEqual = 1;
+    auto ret = api.wait(addr, 1, waitEqual, waitStream.stream);
+    if (ret != ACL_SUCCESS) { return Status{ret, std::to_string(ret)}; }
+    const auto reset = api.write(addr, 0, 0, waitStream.stream);
+    ret = aclrtSynchronizeStream(waitStream.stream);
+    if (reset != ACL_SUCCESS) { return Status{reset, std::to_string(reset)}; }
+    if (ret != ACL_SUCCESS) { return Status{ret, std::to_string(ret)}; }
+    return Status::OK();
+}
 
 Status Event::Synchronize() const
 {

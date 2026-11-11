@@ -184,7 +184,8 @@ private:
     Status WaitPrerequisite(StreamT& stream, const TaskPtr& task)
     {
         if (task->desc.prerequisiteHandle == 0) { return Status::OK(); }
-        auto s = stream.WaitEvent(Trans::Event{task->desc.prerequisiteHandle});
+        const Trans::Event event{task->desc.prerequisiteHandle};
+        auto s = task->desc.externalPrerequisite ? event.WaitExternal() : stream.WaitEvent(event);
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed({}) to wait prerequisite event for dump task({}).", s, task->id);
             Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_d2h_errors_total"), 1.0);

@@ -40,6 +40,14 @@ public:
     explicit Event(std::uintptr_t nativeHandle = 0) noexcept : nativeHandle_{nativeHandle} {}
 
     Status Synchronize() const;
+#if UCM_RUNTIME_ASCEND_FAMILY
+    static bool SupportsExternalWait() noexcept;
+    // Consume and reset a torch_npu value-backed ExternalEvent before D2H.
+    Status WaitExternal() const;
+#else
+    static bool SupportsExternalWait() noexcept { return false; }
+    Status WaitExternal() const { return Status::Unsupported(); }
+#endif
     Expected<bool> Query() const;
     bool Valid() const noexcept { return nativeHandle_ != 0; }
     std::uintptr_t NativeHandle() const noexcept { return nativeHandle_; }

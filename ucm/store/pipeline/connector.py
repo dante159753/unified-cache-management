@@ -90,6 +90,15 @@ class UcmPipelineStoreTransTask(Task):
 
 class UcmPipelineStore(UcmKVStoreBaseV1):
     @property
+    def supports_external_dump_event(self) -> bool:
+        supports = getattr(self.store_, "SupportsExternalDumpEvent", None)
+        return (
+            getattr(self.dump_data, "__func__", None) is UcmPipelineStore.dump_data
+            and supports is not None
+            and supports()
+        )
+
+    @property
     def supports_distributed_backend_load(self) -> bool:
         """Custom load overrides keep their original submission interface."""
         return getattr(self.load_data, "__func__", None) is UcmPipelineStore.load_data
@@ -183,6 +192,8 @@ class UcmPipelineStore(UcmKVStoreBaseV1):
         shard_index: List[int],
         src_addr: List[List[int]] | np.ndarray,
         prerequisite_handle: int = 0,
+        *,
+        external_event: bool = False,
     ) -> Task:
         ids = np.frombuffer(b"".join(block_ids), dtype=np.uint8)
         indexes = array.array("Q", shard_index)
@@ -190,7 +201,12 @@ class UcmPipelineStore(UcmKVStoreBaseV1):
             addrs = src_addr
         else:
             addrs = np.array(src_addr, dtype=np.uint64)
-        task_id = self.store_.Dump(ids, indexes, addrs, prerequisite_handle)
+        if external_event:
+            task_id = self.store_.Dump(
+                ids, indexes, addrs, prerequisite_handle, external_event=True
+            )
+        else:
+            task_id = self.store_.Dump(ids, indexes, addrs, prerequisite_handle)
         return UcmPipelineStoreTransTask(task_id)
 
     def wait(self, task: Task) -> None:

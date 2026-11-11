@@ -229,6 +229,8 @@ class RankConsistencyManager:
         shard_indices: list[int],
         ptrs: Any,
         event_handle: int,
+        *,
+        external_event: bool = False,
     ) -> Any:
         """Track submitted blocks and the Store used by each dump task."""
         request_context = (
@@ -244,15 +246,20 @@ class RankConsistencyManager:
                 request_block_ids
             )
         try:
-            task = store.dump_data(block_ids, shard_indices, ptrs, event_handle)
+            if external_event:
+                task = store.dump_data(
+                    block_ids, shard_indices, ptrs, event_handle, external_event=True
+                )
+            else:
+                task = store.dump_data(block_ids, shard_indices, ptrs, event_handle)
         except Exception:
             self._record_dump_failure(request_context)
             raise
         self._dump_task_contexts[id(task)] = (store, request_context)
         return task
 
-    def wait_dump(self, task: Any) -> None:
-        """Wait through the task's Store and record blocks affected by failure."""
+    def wait_dump(self, task: Any) -> bool:
+        """Wait for the dump and report whether it completed successfully."""
         task_key = id(task)
         if task_key not in self._dump_task_contexts:
             raise RuntimeError("Dump task was not submitted through submit_dump().")
@@ -261,10 +268,11 @@ class RankConsistencyManager:
             store.wait(task)
         except StoreUnhealthyError:
             self._record_dump_failure(request_context)
-            return
+            return False
         except Exception:
             self._record_dump_failure(request_context)
             raise
+        return True
 
     def finish_dump(self, request_ids: set[str]) -> None:
         """Queue successful blocks for reporting to scheduler."""

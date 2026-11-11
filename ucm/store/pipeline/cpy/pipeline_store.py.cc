@@ -81,6 +81,7 @@ class PipelineStore {
     std::list<std::shared_ptr<StoreV1>> stores_;
     std::list<std::shared_ptr<HealthBreakerStore>> healthBreakerStores_;
     StoreV1* entry_{nullptr};
+    bool cacheEntry_{false};
 
     StoreV1* StoreBack() const { return entry_; }
     [[noreturn]] static void ThrowError(const Status& s)
@@ -196,7 +197,9 @@ public:
             healthBreakerStores_.push_back(std::move(healthBreakerStore));
             entry_ = healthBreakerStores_.back().get();
         }
+        cacheEntry_ = name == "Cache";
     }
+    bool SupportsExternalDumpEvent() const { return cacheEntry_; }
     uintptr_t Self() const { return (uintptr_t)(void*)StoreBack(); }
     pybind11::bytes Lookup(const pybind11::buffer& ids)
     {
@@ -251,14 +254,21 @@ public:
         ThrowError(res.Error());
     }
     Detail::TaskHandle Dump(const pybind11::buffer& ids, const pybind11::buffer& indexes,
-                            const pybind11::buffer& addrs, uintptr_t prerequisite_handle = 0)
+                            const pybind11::buffer& addrs, uintptr_t prerequisite_handle = 0,
+                            bool external_event = false)
     {
+        if (external_event && (!SupportsExternalDumpEvent() || prerequisite_handle == 0)) {
+            ThrowError(Status::InvalidParam("external dump event requires CacheStore and a handle"));
+        }
         auto desc = MakeTaskDesc(ids, indexes, addrs);
         desc.brief = "Dump";
         desc.prerequisiteHandle = prerequisite_handle;
+        desc.externalPrerequisite = external_event;
         auto res = StoreBack()->Dump(desc);
         if (res) { return res.Value(); }
-        if (res.Error() == Status::StoreUnhealthy()) { return UNHEALTHY_DUMP_TASK; }
+        if (!external_event && res.Error() == Status::StoreUnhealthy()) {
+            return UNHEALTHY_DUMP_TASK;
+        }
         ThrowError(res.Error());
     }
     bool Check(Detail::TaskHandle taskId)
@@ -306,7 +316,9 @@ PYBIND11_MODULE(ucmpipelinestore, m)
           py::arg("addrs").noconvert(), py::arg("prerequisite_handle") = 0,
           py::arg("distribute_backend_load") = false);
     s.def("Dump", &PipelineStore::Dump, py::arg("ids").noconvert(), py::arg("indexes").noconvert(),
-          py::arg("addrs").noconvert(), py::arg("prerequisite_handle") = 0);
+          py::arg("addrs").noconvert(), py::arg("prerequisite_handle") = 0,
+          py::arg("external_event") = false);
+    s.def("SupportsExternalDumpEvent", &PipelineStore::SupportsExternalDumpEvent);
     s.def("Check", &PipelineStore::Check);
     s.def("Wait", &PipelineStore::Wait);
 }
