@@ -21,11 +21,12 @@ enable_metrics: true
 
 | 配置项 | 是否必填 | 取值类型 | 取值范围 | 配置说明 |
 | --- | --- | --- | --- | --- |
-| `use_layerwise` | 选填 | bool | 默认 `true` | 是否启用分层（逐层）加载和保存模式。推荐设置为 `true`，DeepSeek v4 系列模型推荐设置为 `false`。 |
+| `use_layerwise` | 选填 | bool | 默认 `true` | 是否启用分层（逐层）加载和保存模式。推荐设置为 `true`。昇腾上的 DeepSeek V4/V4.1 设置为 `true` 时，按 vllm-ascend 的 layer tuple 逐个加载和保存 FA/WA KV cache，每次传输大小一致，并与前向计算重叠；其文件与 `false` 的布局分开存放，切换后缓存从空开始。需要流水线并行大小为 1，会关闭请求级异步加载，DeepSeek V4.1 还需要设置 `ENABLE_UCM_PATCH=1`，否则 UCM 回退为 `false` 的方式。 |
 | `enable_event_sync` | 选填 | bool | 默认 `true` | 性能优化开关，推荐开启。 |
 | `persist_token_threshold` | 选填 | int | `0` | 当请求长度小于 `persist_token_threshold` 时，UCM 软件不对该请求进行处理。 |
 | `wa_dump_block_wise` | 选填 | bool | `true` | 仅在 FAWA connector 中使用。`true`: 每个 block 的 WA cache 都会被 dump（高频 dump）；`false`: 只 dump 每个 chunk prefill 最后 block 的 WA cache（低频 dump）。 |
 | `load_tokens_threshold` | 选填 | int | `0` | 设置触发 KV cache 加载的最小 token 阈值，仅在 DeepSeek V4 系列模型生效。当外部命中 tokens 数 > `load_tokens_threshold` 时触发 KV Cache 加载。 |
+| `load_prefetch_depth` | 选填 | int | `1` | 仅在 FAWA layerwise connector 中使用。同时处于加载中的 layer tuple 数量；`1` 表示严格按顺序一次只加载一个 tuple，调大后可以提前提交后续 tuple，用更深的流水吸收单个 tuple 的传输抖动。 |
 | `enable_record_traces` | 选填 | bool | `false` | 用来记录请求信息（时间戳，输入长度，输出长度等信息）。 |
 | `enable_metrics` | 选填 | bool | 默认 `true` | 是否开启 metrics 收集。 |
 | `use_lite` | 选填 | bool | `false` | 是否启用 UCM Lite 功能。不对 KV Cache 数据进行保存和加载，仅对元数据进行保存和查询。仅可用于评估 KV Cache 命中率情况，无加速效果。 |

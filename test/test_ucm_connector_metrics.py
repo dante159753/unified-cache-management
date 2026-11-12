@@ -3268,7 +3268,7 @@ def test_fawa_records_submitted_save_bytes():
     connector._extract_wa_ptr = lambda *args: np.zeros((1, 1), dtype=np.uint64)
     connector._get_dump_event_handle = lambda: 7
     connector._submit_dump_task = (
-        lambda label, store, keys, ptrs, event_handle, block_ids_by_request: (
+        lambda label, store, keys, ptrs, event_handle, *_args, **_kwargs: (
             FAWADumpTask(label, store, object(), len(keys), event_handle)
         )
     )

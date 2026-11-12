@@ -3,6 +3,7 @@
 import ast
 import copy
 import ctypes
+import functools
 import hashlib
 import math
 import pickle
@@ -73,6 +74,8 @@ def _load_hma_methods(names):
             "select_transfer_views",
             "FAWALoadTask",
             "FAWAPendingLoad",
+            "FAWAStoreDumpRows",
+            "FAWADumpPlan",
         )
     ]
     module = ast.Module(body=helpers + nodes, type_ignores=[])
@@ -89,6 +92,7 @@ def _load_hma_methods(names):
         "__name__": __name__,
         "dataclass": dataclass,
         "field": field,
+        "cached_property": functools.cached_property,
         "Task": object,
         "Future": Future,
         "math": math,
@@ -1453,8 +1457,15 @@ class UCMV41CompatibilityTest(unittest.TestCase):
         self.assertEqual(result.tolist(), [[101, 64], [102, 64]])
 
     def test_fa_only_prefix_can_be_found_and_saved_without_a_window_store(self):
+        dump_methods = {"_collect_dump_plan", "_submit_store_dump"}
         methods = _load_hma_methods(
-            {"_create_wa_store", "_lookup_external_hit_blocks", "wait_for_save"}
+            {
+                "_create_wa_store",
+                "_lookup_external_hit_blocks",
+                "wait_for_save",
+                "_transfer_bytes_per_key",
+                *dump_methods,
+            }
         )
         methods["UCMFAWAConnectorMetadata"] = types.SimpleNamespace
         methods["ucmmetrics"] = types.SimpleNamespace(update_stats=lambda _stats: None)
@@ -1463,7 +1474,7 @@ class UCMV41CompatibilityTest(unittest.TestCase):
             with self.subTest(tp_size=tp_size, rank=rank):
                 saved = []
 
-                def submit(label, _store, row_keys, *_args):
+                def submit(label, _store, row_keys, *_args, **_kwargs):
                     saved.append((label, row_keys))
                     return types.SimpleNamespace(key_count=len(row_keys))
 
@@ -1498,6 +1509,10 @@ class UCMV41CompatibilityTest(unittest.TestCase):
                     tp_dump_tasks={},
                     file_size={"FA": 4096, "WA": 0},
                 )
+                for name in (*dump_methods, "_transfer_bytes_per_key"):
+                    setattr(
+                        connector, name, functools.partial(methods[name], connector)
+                    )
                 self.assertIsNone(methods["_create_wa_store"](connector, None))
                 self.assertEqual(
                     methods["_lookup_external_hit_blocks"](connector, keys), 8

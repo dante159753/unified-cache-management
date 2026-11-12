@@ -380,6 +380,11 @@ def apply_all_patches() -> None:
         # when the GDN modules exist).
         import ucm.integration.vllm.patch.v0300.mamba_layer_hooks_patch
 
+        # vllm-ascend's DeepSeek V4.1 attention never calls the per-layer KV
+        # hooks; wire them in for the FAWA layerwise connector. @when_imported
+        # only fires when vllm_ascend.attention.dsa_v41 is imported.
+        import ucm.integration.vllm.patch.v0300.vllm_ascend.dsv41_kv_layer_hooks_patch
+
         logger.info("UCM patch initialization completed!")
 
     except Exception as e:

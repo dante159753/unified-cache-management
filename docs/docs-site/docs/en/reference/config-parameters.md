@@ -21,11 +21,12 @@ These fields belong at the YAML root. Descriptions identify model- or engine-spe
 
 | Parameter | Required | Type | Value Range | Description |
 | --- | --- | --- | --- | --- |
-| `use_layerwise` | Optional | bool | Default: `true` | Enable layer-wise (per-layer) load/save mode. Recommended `true`; DeepSeek V4 series recommends `false`. |
+| `use_layerwise` | Optional | bool | Default: `true` | Enable layer-wise (per-layer) load/save mode. Recommended `true`. For DeepSeek V4/V4.1 on Ascend, `true` loads and dumps the FA/WA KV cache one vllm-ascend layer tuple at a time, so every transfer has the same size and overlaps with the forward pass; it is stored apart from the `false` layout, so switching starts from an empty cache. It needs pipeline parallel size 1, disables request-level async load, and DeepSeek V4.1 also needs `ENABLE_UCM_PATCH=1`; otherwise UCM falls back to `false`. |
 | `enable_event_sync` | Optional | bool | Default: `true` | Performance optimization switch. Recommended to enable. |
 | `persist_token_threshold` | Optional | int | `0` | When request length < `persist_token_threshold`, UCM does not process the request. |
 | `wa_dump_block_wise` | Optional | bool | `true` | Only used in FAWA connector. `true`: every block's WA cache is dumped (high frequency); `false`: only dump last block's WA cache of each chunk prefill (low frequency). |
 | `load_tokens_threshold` | Optional | int | `0` | Minimum token threshold for triggering KV cache loading. Only effective for DeepSeek V4 series. When external hit tokens > `load_tokens_threshold`, triggers KV Cache loading. |
+| `load_prefetch_depth` | Optional | int | `1` | Only used in the FAWA layerwise connector. Number of layer tuples that may be loading at once; `1` loads strictly in order, and larger values submit later tuples earlier so a deeper pipeline absorbs per-tuple transfer jitter. |
 | `enable_record_traces` | Optional | bool | `false` | Record request information (timestamps, input length, output length, etc.). |
 | `enable_metrics` | Optional | bool | Default: `true` | Whether to enable metrics collection. |
 | `use_lite` | Optional | bool | `false` | Enable UCM Lite. Does not save/load KV Cache data, only saves and queries metadata. Used to evaluate KV Cache hit rate — no acceleration effect. |

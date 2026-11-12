@@ -3683,7 +3683,10 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
             UCMHybridLinearAttentionLayerWiseConnector,
             is_cuda_blnhc_layout,
         )
-        from ucm.integration.vllm.hma_connector import UCMFAWAConnector
+        from ucm.integration.vllm.hma_connector import (
+            UCMFAWAConnector,
+            UCMFAWALayerWiseConnector,
+        )
 
         # FAWA must win before HLA probing.  New vLLM KVCacheTensor objects
         # describe their layers with ``layers`` and do not have the legacy
@@ -3720,7 +3723,23 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
                 )
                 use_hybrid_linear_attention_layerwise = False
 
-        if is_fawa:
+        use_fawa_layerwise = is_fawa and use_layerwise
+        if use_fawa_layerwise:
+            fawa_layerwise_block_reason = UCMFAWALayerWiseConnector.unsupported_reason(
+                vllm_config, kv_cache_config
+            )
+            if fawa_layerwise_block_reason:
+                logger.warning(
+                    "FAWA layerwise disabled, using whole-row FAWA: %s",
+                    fawa_layerwise_block_reason,
+                )
+                use_fawa_layerwise = False
+
+        if use_fawa_layerwise:
+            self.connector = UCMFAWALayerWiseConnector(
+                vllm_config, role, kv_cache_config
+            )
+        elif is_fawa:
             self.connector = UCMFAWAConnector(vllm_config, role, kv_cache_config)
         elif use_ratio_rate:
             self.connector = UCMMockConnector(vllm_config, role, kv_cache_config)

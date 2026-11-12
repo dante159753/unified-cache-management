@@ -3,7 +3,7 @@ import math
 import os
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from typing import TYPE_CHECKING, Optional, Sequence, Tuple
 
 import numpy as np
@@ -23,6 +23,14 @@ except ImportError:  # Older vLLM versions do not expose this helper.
 
 from ucm.integration.vllm.cache_config import configure_cache_capacity
 from ucm.integration.vllm.device import create_device
+from ucm.integration.vllm.fawa_layer_tuple import (
+    LayerTupleShardPlan,
+    assign_layer_tuple_slots,
+    build_layer_tuple_shard_plan,
+    describe_store_row_columns,
+    is_draft_layer_name,
+    split_layer_name,
+)
 from ucm.integration.vllm.request_hasher import RequestHasher
 from ucm.integration.vllm.ucm_connector import (
     KVConnectorTransferResults,
@@ -42,6 +50,7 @@ from ucm.store.factory_v1 import UcmConnectorFactoryV1
 from ucm.store.ucmstore_v1 import Task, UcmKVStoreBaseV1
 
 if TYPE_CHECKING:
+    from vllm.attention.backends.abstract import AttentionMetadata
     from vllm.config import VllmConfig
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -797,6 +806,36 @@ class FAWADumpTask:
     event_handle: int
 
 
+@dataclass
+class FAWAStoreDumpRows:
+    """Keys and device pointers that one FAWA store dumps in one step."""
+
+    keys: list[bytes] = field(default_factory=list)
+    ptr_rows: list[np.ndarray] = field(default_factory=list)
+    block_ids_by_request: dict[str, set[bytes]] = field(default_factory=dict)
+
+    @cached_property
+    def stacked_ptrs(self) -> np.ndarray:
+        return np.vstack(self.ptr_rows)
+
+
+@dataclass
+class FAWADumpPlan:
+    """Everything the FA and WA stores dump in one step."""
+
+    request_ids: tuple[str, ...] = ()
+    fa_rows: FAWAStoreDumpRows = field(default_factory=FAWAStoreDumpRows)
+    wa_rows: FAWAStoreDumpRows = field(default_factory=FAWAStoreDumpRows)
+
+    def rows_for_store(self, label: str) -> FAWAStoreDumpRows:
+        if label == "FA":
+            return self.fa_rows
+        elif label == "WA":
+            return self.wa_rows
+        else:
+            raise ValueError(f"Unknown FAWA store label: {label}")
+
+
 @dataclass(frozen=True)
 class BlockGeometry:
     logical: int
@@ -838,6 +877,9 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
     DEFAULT_HASH_BLOCK_SIZE = 256
     ASCEND_SUPPORTED_VLLM_BLOCK_SIZES = frozenset({32, 64, 128})
     ASCEND_C4_COMPRESS_RATIO = 4
+    # Appended to the KV hash namespace by subclasses that store rows in a
+    # different file layout, so they never read files written by this class.
+    KV_LAYOUT_HASH_TAG = ""
 
     @classmethod
     def _supports_request_async_load(cls) -> bool:
@@ -938,6 +980,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                     self.group_metas,
                     self.whole_page_sizes,
                 )
+            hash_meta += self.KV_LAYOUT_HASH_TAG
             self.request_hasher = RequestHasher(hash_meta)
             if role == KVConnectorRole.SCHEDULER:
                 self._seed = self.request_hasher.seed
@@ -1568,8 +1611,13 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         store_suffix: str,
         tensor_size_list: Optional[list[int]],
         cpu_affinity_cores: Optional[list[int]] = None,
+        shard_count: int = 1,
     ) -> UcmKVStoreBaseV1:
-        """Instantiate one UCM store with worker tensor layout metadata."""
+        """Instantiate one UCM store with worker tensor layout metadata.
+
+        ``tensor_size_list`` describes one shard; a store block holds
+        ``shard_count`` shards.
+        """
 
         name, module_path, config = self._base_store_config(store_suffix)
         if uses_partitioned_cache():
@@ -1594,8 +1642,9 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             config["tensor_size_list"] = tensor_size_list
             # io_direct requires shard and block sizes to be 4KB aligned.
             aligned_size = 4096
-            padded_size = round_up(sum(tensor_size_list), aligned_size)
-            config["shard_size"] = padded_size
+            padded_shard_size = round_up(sum(tensor_size_list), aligned_size)
+            padded_size = padded_shard_size * shard_count
+            config["shard_size"] = padded_shard_size
             config["block_size"] = padded_size
             if self.file_size[label] != padded_size and self.is_v41_layout:
                 raise ValueError(
@@ -1611,7 +1660,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             gc_size = _get_store_gc_block_size(
                 str(config.get("store_pipeline", "")),
                 tensor_size_list,
-                padded_size,
+                padded_shard_size,
                 padded_size,
             )
             # Count load/save metrics with the same per-record size as GC.
@@ -1742,24 +1791,12 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
     ) -> list[int]:
         """Build the per-tensor byte-size vector expected by UCM stores."""
 
-        tensor_size_list: list[int] = []
-        for group_id in group_ids:
-            layout = group_layouts.get(group_id)
-            if layout is None:
-                continue
-            meta = self.group_metas[group_id]
-
-            if not meta.tail_tokens:
-                continue
-
-            segment_tokens = meta.tail_tokens // meta.tail_blocks
-
-            for _ in range(meta.tail_blocks):
-                segment_sizes = layout.segment_tensor_size_list(
-                    segment_tokens,
-                    meta.token_block_size,
-                )
-                tensor_size_list.extend(segment_sizes)
+        tensor_size_list = [
+            column.size_bytes
+            for column in describe_store_row_columns(
+                group_ids, group_layouts, self.group_metas
+            )
+        ]
         if not tensor_size_list:
             group_label = (
                 "FA"
@@ -2191,10 +2228,11 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         store: UcmKVStoreBaseV1,
         keys: list[bytes],
         ptrs: np.ndarray,
+        shard_index: int = 0,
     ) -> FAWALoadTask:
         """Submit one store load and retain block ids for failure reporting."""
 
-        shard_indices = [0] * len(keys)
+        shard_indices = [shard_index] * len(keys)
         task = self._rank_consistency.submit_load(
             store,
             {request_id: keys},
@@ -2210,6 +2248,10 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             task=task,
             key_count=len(keys),
         )
+
+    def _transfer_bytes_per_key(self, label: str) -> int:
+        """Bytes one load or dump task moves for each key of the FA or WA store."""
+        return self.file_size[label]
 
     def _handle_load_err(self, request_id: str):
         affected_block_ids = self._get_request_all_block_ids(request_id)
@@ -2260,10 +2302,11 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         ptrs: np.ndarray,
         event_handle: int,
         block_ids_by_request: dict[str, set[bytes]],
+        shard_index: int = 0,
     ) -> FAWADumpTask:
         """Submit one store dump for FA or WA rows."""
 
-        shard_indices = [0] * len(keys)
+        shard_indices = [shard_index] * len(keys)
         task = self._rank_consistency.submit_dump(
             store,
             block_ids_by_request,
@@ -2542,14 +2585,33 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
 
         self._poll_completed_dump_tasks()
 
-        fa_dump_keys: list[bytes] = []
-        wa_dump_keys: list[bytes] = []
-        fa_ptr_rows: list[np.ndarray] = []
-        wa_ptr_rows: list[np.ndarray] = []
-        dump_request_ids: tuple[str] = ()
-        fa_dump_blocks_by_request: dict[str, set[bytes]] = {}
-        wa_dump_blocks_by_request: dict[str, set[bytes]] = {}
+        dump_plan = self._collect_dump_plan(metadata)
         save_bytes = 0
+        if dump_plan.fa_rows.keys:
+            save_bytes += self._submit_store_dump(
+                "FA",
+                self.fa_store,
+                dump_plan.fa_rows.keys,
+                dump_plan.fa_rows.stacked_ptrs,
+                dump_plan.fa_rows.block_ids_by_request,
+                dump_plan.request_ids,
+            )
+        if dump_plan.wa_rows.keys:
+            save_bytes += self._submit_store_dump(
+                "WA",
+                self.wa_store,
+                dump_plan.wa_rows.keys,
+                dump_plan.wa_rows.stacked_ptrs,
+                dump_plan.wa_rows.block_ids_by_request,
+                dump_plan.request_ids,
+            )
+        if dump_plan.fa_rows.keys or dump_plan.wa_rows.keys:
+            ucmmetrics.update_stats({"save_bytes_total": save_bytes})
+
+    def _collect_dump_plan(self, metadata: UCMFAWAConnectorMetadata) -> FAWADumpPlan:
+        """Collect the FA and WA rows this rank dumps for the current step."""
+        dump_plan = FAWADumpPlan()
+        fa_rows, wa_rows = dump_plan.fa_rows, dump_plan.wa_rows
         if self.tp_size > 1:
             # Split FA rows by canonical block index. Block-wise WA follows the same
             # TP key slice; chunk-wise WA assigns one final boundary per request.
@@ -2557,11 +2619,11 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             for request_id, request in metadata.request_meta.items():
                 if not request.dump_keys:
                     continue
-                dump_request_ids += (request_id,)
+                dump_plan.request_ids += (request_id,)
                 key_slice = self._get_mla_dump_slice(request.dump_hash_start)
                 tp_dump_keys = request.dump_keys[key_slice]
                 if tp_dump_keys:
-                    fa_dump_blocks_by_request[request_id] = set(tp_dump_keys)
+                    fa_rows.block_ids_by_request[request_id] = set(tp_dump_keys)
                     fa_dump_vllm_block_ids = tuple(
                         (
                             group_block_ids[key_slice]
@@ -2573,8 +2635,8 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                         )
                     )
 
-                    fa_dump_keys.extend(tp_dump_keys)
-                    fa_ptr_rows.append(
+                    fa_rows.keys.extend(tp_dump_keys)
+                    fa_rows.ptr_rows.append(
                         self._extract_fa_ptr(
                             tp_dump_keys,
                             request.dump_hash_start,
@@ -2589,7 +2651,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                     continue
                 if self.wa_dump_block_wise:
                     if tp_dump_keys:
-                        wa_dump_blocks_by_request[request_id] = set(tp_dump_keys)
+                        wa_rows.block_ids_by_request[request_id] = set(tp_dump_keys)
                         wa_dump_vllm_block_ids = tuple(
                             (
                                 np.asarray(group_block_ids)
@@ -2605,8 +2667,8 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                                 request.dump_vllm_block_ids
                             )
                         )
-                        wa_dump_keys.extend(tp_dump_keys)
-                        wa_ptr_rows.append(
+                        wa_rows.keys.extend(tp_dump_keys)
+                        wa_rows.ptr_rows.append(
                             self._extract_wa_ptr(
                                 tp_dump_keys,
                                 wa_dump_vllm_block_ids,
@@ -2614,9 +2676,9 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                         )
                 elif wa_dump_ring_idx % self.tp_size == self.tp_rank:
                     request_wa_dump_keys = request.dump_keys[-1:]
-                    wa_dump_blocks_by_request[request_id] = set(request_wa_dump_keys)
-                    wa_dump_keys.extend(request_wa_dump_keys)
-                    wa_ptr_rows.append(
+                    wa_rows.block_ids_by_request[request_id] = set(request_wa_dump_keys)
+                    wa_rows.keys.extend(request_wa_dump_keys)
+                    wa_rows.ptr_rows.append(
                         self._extract_wa_ptr(
                             request_wa_dump_keys,
                             request.dump_vllm_block_ids,
@@ -2627,10 +2689,10 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             for request_id, request in metadata.request_meta.items():
                 if not request.dump_keys:
                     continue
-                dump_request_ids += (request_id,)
-                fa_dump_blocks_by_request[request_id] = set(request.dump_keys)
-                fa_dump_keys.extend(request.dump_keys)
-                fa_ptr_rows.append(
+                dump_plan.request_ids += (request_id,)
+                fa_rows.block_ids_by_request[request_id] = set(request.dump_keys)
+                fa_rows.keys.extend(request.dump_keys)
+                fa_rows.ptr_rows.append(
                     self._extract_fa_ptr(
                         request.dump_keys,
                         request.dump_hash_start,
@@ -2641,9 +2703,9 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 if not self.window_group_ids:
                     continue
                 if self.wa_dump_block_wise:
-                    wa_dump_blocks_by_request[request_id] = set(request.dump_keys)
-                    wa_dump_keys.extend(request.dump_keys)
-                    wa_ptr_rows.append(
+                    wa_rows.block_ids_by_request[request_id] = set(request.dump_keys)
+                    wa_rows.keys.extend(request.dump_keys)
+                    wa_rows.ptr_rows.append(
                         self._extract_wa_ptr(
                             request.dump_keys,
                             request.dump_vllm_block_ids,
@@ -2651,53 +2713,50 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                     )
                 else:
                     request_wa_dump_keys = request.dump_keys[-1:]
-                    wa_dump_blocks_by_request[request_id] = set(request_wa_dump_keys)
-                    wa_dump_keys.extend(request_wa_dump_keys)
-                    wa_ptr_rows.append(
+                    wa_rows.block_ids_by_request[request_id] = set(request_wa_dump_keys)
+                    wa_rows.keys.extend(request_wa_dump_keys)
+                    wa_rows.ptr_rows.append(
                         self._extract_wa_ptr(
                             request_wa_dump_keys,
                             request.dump_vllm_block_ids,
                         )
                     )
+        return dump_plan
 
-        if fa_dump_keys:
-            event_handle = self._get_dump_event_handle()
-            fa_ptrs = np.vstack(fa_ptr_rows)
-            try:
-                fa_dump_task = self._submit_dump_task(
-                    "FA",
-                    self.fa_store,
-                    fa_dump_keys,
-                    fa_ptrs,
-                    event_handle,
-                    fa_dump_blocks_by_request,
-                )
-                self.tp_dump_tasks.setdefault(dump_request_ids, []).append(fa_dump_task)
-                save_bytes += fa_dump_task.key_count * self.file_size["FA"]
-            except Exception as e:
-                self.device.destroy_event_handle(event_handle)
-                logger.error(f"dump FAWA kv cache failed. {type(e).__name__}: {e}")
-                self._record_counter("connector_dump_submit_errors_total")
-        if wa_dump_keys:
-            event_handle = self._get_dump_event_handle()
-            window_ptrs = np.vstack(wa_ptr_rows)
-            try:
-                wa_dump_task = self._submit_dump_task(
-                    "WA",
-                    self.wa_store,
-                    wa_dump_keys,
-                    window_ptrs,
-                    event_handle,
-                    wa_dump_blocks_by_request,
-                )
-                self.tp_dump_tasks.setdefault(dump_request_ids, []).append(wa_dump_task)
-                save_bytes += wa_dump_task.key_count * self.file_size["WA"]
-            except Exception as e:
-                self.device.destroy_event_handle(event_handle)
-                logger.error(f"dump FAWA WA kv cache failed. {type(e).__name__}: {e}")
-                self._record_counter("connector_dump_submit_errors_total")
-        if fa_dump_keys or wa_dump_keys:
-            ucmmetrics.update_stats({"save_bytes_total": save_bytes})
+    def _submit_store_dump(
+        self,
+        label: str,
+        store: UcmKVStoreBaseV1,
+        keys: list[bytes],
+        ptrs: np.ndarray,
+        block_ids_by_request: dict[str, set[bytes]],
+        request_ids: tuple[str, ...],
+        shard_index: int = 0,
+    ) -> int:
+        """Submit one FA or WA dump and return the bytes it will write.
+
+        A failed submit is logged and returns 0; a missed dump only costs a
+        later cache miss.
+        """
+        event_handle = self._get_dump_event_handle()
+        try:
+            dump_task = self._submit_dump_task(
+                label,
+                store,
+                keys,
+                ptrs,
+                event_handle,
+                block_ids_by_request,
+                shard_index=shard_index,
+            )
+        except Exception as e:
+            self.device.destroy_event_handle(event_handle)
+            logger.error(f"dump FAWA {label} kv cache failed. {type(e).__name__}: {e}")
+            self._record_counter("connector_dump_submit_errors_total")
+            return 0
+        else:
+            self.tp_dump_tasks.setdefault(request_ids, []).append(dump_task)
+            return dump_task.key_count * self._transfer_bytes_per_key(label)
 
     def _poll_completed_dump_tasks(self) -> None:
         """Reap completed FAWA dump tasks without waiting for in-flight tasks."""
@@ -2830,6 +2889,488 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
     ) -> tuple[bool, dict[str, object] | None]:
         # Scheduler side method
         return True, None
+
+
+class UCMFAWALayerWiseConnector(UCMFAWAConnector):
+    """FAWA connector that loads and dumps one layer tuple at a time.
+
+    vllm-ascend groups the DeepSeek V4 and V4.1 KV caches into layer tuples.
+    This connector splits each FA and WA store row into one shard per tuple
+    (see ``ucm.integration.vllm.fawa_layer_tuple``), so all shards of a store
+    have the same size.
+
+    - Load: layer tuples in order, with up to ``load_prefetch_depth`` tuples
+      loading at once. ``start_load_kv`` submits the first tuples. Each
+      attention layer waits until the tuples that hold its caches have
+      arrived, then tops the pipeline back up.
+    - Dump: a shard is dumped as soon as every layer in it has run.
+      ``wait_for_save`` dumps the shards that are left, for example draft
+      model layers, or decode steps that replay an ACL graph and never call
+      the attention hooks.
+    """
+
+    KV_LAYOUT_HASH_TAG = ":kv_shards=layer_tuple_v1"
+
+    @classmethod
+    def unsupported_reason(
+        cls,
+        vllm_config: "VllmConfig",
+        kv_cache_config: Optional["KVCacheConfig"],
+    ) -> Optional[str]:
+        """Return why this connector cannot serve the model, or None.
+
+        Only use facts that the scheduler and the workers both see, so that
+        both roles pick the same connector and the same store files.
+        """
+        from ucm.integration.vllm.patch.apply_patch import ENABLE_UCM_PATCH
+
+        if not cls.can_handle_ascend_kv_cache_config(kv_cache_config):
+            return "it supports only the Ascend DeepSeek V4/V4.1 KV cache layout"
+        elif not ENABLE_UCM_PATCH and any(
+            getattr(spec, "model_version", None) == "deepseek_v41"
+            for group in kv_cache_config.kv_cache_groups
+            for spec in cls._specs_for_group(group)
+        ):
+            return (
+                "DeepSeek V4.1 attention calls the layer hooks only with "
+                "ENABLE_UCM_PATCH=1"
+            )
+        elif vllm_config.parallel_config.pipeline_parallel_size > 1:
+            return "it does not support pipeline parallelism"
+        else:
+            return None
+
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        role: KVConnectorRole,
+        kv_cache_config: "KVCacheConfig",
+    ):
+        super().__init__(vllm_config, role, kv_cache_config)
+        self.tuple_slot_by_layer: dict[str, int] = {}
+        self.shard_plans: dict[str, LayerTupleShardPlan] = {}
+        self.shard_bytes: dict[str, int] = {}
+        self.shard_index_by_layer: dict[str, dict[str, int]] = {}
+        self.shard_keys_by_tuple_slot: dict[int, list[tuple[str, int]]] = {}
+        self.kv_layer_names_by_decoder_layer: dict[str, frozenset[str]] = {}
+        # Deeper pipelines keep the store busier at the cost of reading further
+        # ahead of the layers that need the data.
+        self.load_prefetch_depth = max(
+            1, int(self.launch_config.get("load_prefetch_depth", 1))
+        )
+        self._reset_step_state()
+        logger.info(
+            f"Init UCM FAWA layerwise connector. "
+            f"load_prefetch_depth={self.load_prefetch_depth}"
+        )
+
+    def _reset_step_state(self) -> None:
+        self._load_requests: dict[str, FAWARequestDispatchMeta] = {}
+        self._load_row_ptrs_by_request: dict[str, dict[str, np.ndarray]] = {}
+        self._step_load_tuple_slots: frozenset[int] = frozenset()
+        self._tuple_slots_to_load: list[int] = []
+        self._in_flight_loads: list[tuple[int, list[FAWALoadTask]]] = []
+        self._loaded_tuple_slots: set[int] = set()
+        self._tuple_slots_waited_by_layers: set[int] = set()
+        self._load_request_ids_by_tuple_slot: dict[int, set[str]] = {}
+        self._failed_load_request_ids: set[str] = set()
+        self._step_dump_plan: Optional[FAWADumpPlan] = None
+        self._saved_kv_layer_names: set[str] = set()
+        self._dumped_shard_keys: set[tuple[str, int]] = set()
+        self._step_load_bytes = 0
+        self._step_save_bytes = 0
+
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        if all(
+            hasattr(tensor, "layers")
+            for tensor in self._kv_cache_config.kv_cache_tensors
+        ):
+            self.tuple_slot_by_layer = assign_layer_tuple_slots(
+                self._kv_cache_config.kv_cache_tensors
+            )
+            kv_layer_names_by_decoder_layer: dict[str, set[str]] = {}
+            for layer_name in self.tuple_slot_by_layer:
+                decoder_layer = split_layer_name(layer_name)[0]
+                kv_layer_names_by_decoder_layer.setdefault(decoder_layer, set()).add(
+                    layer_name
+                )
+            self.kv_layer_names_by_decoder_layer = {
+                decoder_layer: frozenset(layer_names)
+                for decoder_layer, layer_names in kv_layer_names_by_decoder_layer.items()
+            }
+        else:
+            raise ValueError(
+                "FAWA layerwise needs KVCacheTensor.layers to find the layer tuples."
+            )
+        # The parent builds the group layouts and then calls the store
+        # factories below, which fill shard_plans.
+        super().register_kv_caches(kv_caches)
+        shards_sorted_by_tuple_slot = sorted(
+            (plan.tuple_slots[shard_index], label, shard_index)
+            for label, plan in self.shard_plans.items()
+            for shard_index in range(plan.num_shards)
+        )
+        self.shard_keys_by_tuple_slot = {}
+        for tuple_slot, label, shard_index in shards_sorted_by_tuple_slot:
+            self.shard_keys_by_tuple_slot.setdefault(tuple_slot, []).append(
+                (label, shard_index)
+            )
+
+    def _create_fa_store(
+        self,
+        group_layouts: Optional[dict[int, KVCacheGroupLayout]],
+        cpu_affinity_cores: Optional[list[int]] = None,
+    ) -> UcmKVStoreBaseV1:
+        return self._create_layer_tuple_store(
+            "FA", self.fa_group_ids, group_layouts, cpu_affinity_cores
+        )
+
+    def _create_wa_store(
+        self,
+        group_layouts: Optional[dict[int, KVCacheGroupLayout]],
+        cpu_affinity_cores: Optional[list[int]] = None,
+    ) -> Optional[UcmKVStoreBaseV1]:
+        if self.window_group_ids:
+            return self._create_layer_tuple_store(
+                "WA", self.window_group_ids, group_layouts, cpu_affinity_cores
+            )
+        else:
+            return None
+
+    def _create_layer_tuple_store(
+        self,
+        label: str,
+        group_ids: list[int],
+        group_layouts: Optional[dict[int, KVCacheGroupLayout]],
+        cpu_affinity_cores: Optional[list[int]],
+    ) -> UcmKVStoreBaseV1:
+        """Create the FA or WA store with one shard per layer tuple.
+
+        The files use their own directory, so they never mix with the
+        whole-row files that UCMFAWAConnector writes.
+        """
+        store_suffix = f"{label.lower()}_layer_tuple"
+        if self._role == KVConnectorRole.WORKER:
+            row_columns = describe_store_row_columns(
+                group_ids, group_layouts, self.group_metas
+            )
+            plan = build_layer_tuple_shard_plan(row_columns, self.tuple_slot_by_layer)
+            self.shard_plans[label] = plan
+            self.shard_index_by_layer[label] = {
+                layer_name: shard_index
+                for shard_index, layer_names in enumerate(plan.shard_layer_names)
+                for layer_name in layer_names
+            }
+            store = self._create_store(
+                label=label,
+                store_suffix=store_suffix,
+                tensor_size_list=list(plan.shard_tensor_sizes),
+                cpu_affinity_cores=cpu_affinity_cores,
+                shard_count=plan.num_shards,
+            )
+            self.shard_bytes[label] = self.file_size[label] // plan.num_shards
+            padding_segments = int((plan.shard_columns < 0).sum())
+            logger.info(
+                f"FAWA layerwise {label} store: shards={plan.num_shards}, "
+                f"tuple_slots={list(plan.tuple_slots)}, "
+                f"segments_per_shard={len(plan.shard_tensor_sizes)}, "
+                f"shard_payload_bytes={plan.shard_payload_bytes}, "
+                f"shard_bytes={self.shard_bytes[label]}, "
+                f"padding_segments={padding_segments}."
+            )
+            return store
+        else:
+            return self._create_store(
+                label=label, store_suffix=store_suffix, tensor_size_list=None
+            )
+
+    def _transfer_bytes_per_key(self, label: str) -> int:
+        return self.shard_bytes[label]
+
+    def _store_for_label(self, label: str) -> UcmKVStoreBaseV1:
+        if label == "FA":
+            return self.fa_store
+        elif label == "WA":
+            return self.wa_store
+        else:
+            raise ValueError(f"Unknown FAWA store label: {label}")
+
+    def _kv_layer_names_of(self, attention_layer_name: str) -> frozenset[str]:
+        """Return the KV cache layers of the decoder layer that calls a hook.
+
+        The hooks pass the attention module name, which is not a cache name:
+        ``model.layers.3.self_attn.attn`` on V4 and
+        ``model.layers.3.self_attn.v41_attn`` on V4.1. Match by decoder layer
+        instead, so the hook also covers ``model.layers.3.self_attn.swa_cache``
+        and the indexer caches of that layer.
+        """
+        decoder_layer = split_layer_name(attention_layer_name)[0]
+        return self.kv_layer_names_by_decoder_layer.get(decoder_layer, frozenset())
+
+    def _shard_keys_of(self, kv_layer_names: frozenset[str]) -> list[tuple[str, int]]:
+        shard_keys = {
+            (label, shard_index_by_layer[layer_name])
+            for label, shard_index_by_layer in self.shard_index_by_layer.items()
+            for layer_name in kv_layer_names
+            if layer_name in shard_index_by_layer
+        }
+        return sorted(shard_keys)
+
+    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
+        # In-flight loads write into vLLM blocks. Finish them in case the
+        # previous step ended without wait_for_save.
+        while self._in_flight_loads:
+            self._finish_loading_tuple()
+        super().bind_connector_metadata(connector_metadata)
+        self._reset_step_state()
+
+    def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+        metadata = self._get_connector_metadata()
+        if not isinstance(metadata, UCMFAWAConnectorMetadata):
+            raise RuntimeError(f"Unexpected FAWA metadata type: {type(metadata)}")
+
+        for request_id, request in metadata.request_meta.items():
+            if request.load_keys:
+                try:
+                    row_ptrs = self._extract_load_row_ptrs(request)
+                except Exception as e:
+                    logger.error(
+                        f"request {request_id} build FAWA layerwise load rows "
+                        f"error. {type(e).__name__}: {e}"
+                    )
+                    self._handle_load_err(request_id)
+                else:
+                    self._load_requests[request_id] = request
+                    self._load_row_ptrs_by_request[request_id] = row_ptrs
+
+        if self._load_requests:
+            if self.is_v41_layout:
+                # V4.1 pages are shared by several KV groups. Finish pending KV
+                # page writes before the store starts its H2D copies.
+                self.device.synchronize()
+            self._step_load_tuple_slots = frozenset(self.shard_keys_by_tuple_slot)
+            self._tuple_slots_to_load = sorted(self._step_load_tuple_slots)
+            self._fill_load_pipeline()
+
+    @staticmethod
+    def _load_keys_for_store(
+        request: FAWARequestDispatchMeta, label: str
+    ) -> list[bytes]:
+        if label == "FA":
+            return request.load_keys
+        else:
+            # WA rows only exist for the final matched boundary.
+            return request.load_keys[-1:]
+
+    def _extract_load_row_ptrs(
+        self, request: FAWARequestDispatchMeta
+    ) -> dict[str, np.ndarray]:
+        """Build the full FA and WA store rows that one request loads."""
+        row_ptrs = {
+            "FA": self._extract_fa_ptr(
+                request.load_keys,
+                request.load_hash_start,
+                request.load_hash_end,
+                request.load_vllm_block_ids,
+            )
+        }
+        if self.window_group_ids:
+            row_ptrs["WA"] = self._extract_wa_ptr(
+                self._load_keys_for_store(request, "WA"),
+                request.load_vllm_block_ids,
+            )
+        return row_ptrs
+
+    def _submit_next_tuple_load(self) -> None:
+        """Submit the FA and WA loads of the next layer tuple for every request."""
+        tuple_slot = self._tuple_slots_to_load.pop(0)
+        loading_tasks = []
+        for label, shard_index in self.shard_keys_by_tuple_slot[tuple_slot]:
+            plan = self.shard_plans[label]
+            for request_id, row_ptrs in self._load_row_ptrs_by_request.items():
+                if (
+                    request_id not in self._failed_load_request_ids
+                    and label in row_ptrs
+                ):
+                    try:
+                        load_task = self._submit_load_task(
+                            request_id,
+                            label,
+                            self._store_for_label(label),
+                            self._load_keys_for_store(
+                                self._load_requests[request_id], label
+                            ),
+                            plan.gather_shard_ptrs(row_ptrs[label], shard_index),
+                            shard_index=shard_index,
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"request {request_id} submit FAWA layerwise "
+                            f"{label} shard {shard_index} load error. "
+                            f"{type(e).__name__}: {e}"
+                        )
+                        self._failed_load_request_ids.add(request_id)
+                        self._handle_load_err(request_id)
+                    else:
+                        loading_tasks.append(load_task)
+                        self._load_request_ids_by_tuple_slot.setdefault(
+                            tuple_slot, set()
+                        ).add(request_id)
+        self._in_flight_loads.append((tuple_slot, loading_tasks))
+
+    def _fill_load_pipeline(self) -> None:
+        """Keep ``load_prefetch_depth`` layer tuples loading at once."""
+        while (
+            len(self._in_flight_loads) < self.load_prefetch_depth
+            and self._tuple_slots_to_load
+        ):
+            self._submit_next_tuple_load()
+
+    def _finish_loading_tuple(self) -> None:
+        """Block until the oldest in-flight layer tuple has arrived."""
+        tuple_slot, load_tasks = self._in_flight_loads.pop(0)
+        for load_task in load_tasks:
+            if self._wait_load_task(load_task):
+                self._step_load_bytes += (
+                    load_task.key_count * self._transfer_bytes_per_key(load_task.label)
+                )
+        self._loaded_tuple_slots.add(tuple_slot)
+        self._fill_load_pipeline()
+
+    def _loading_tuple_has_arrived(self) -> bool:
+        """Check without blocking whether the oldest in-flight tuple is done."""
+        if not self._in_flight_loads:
+            return True
+        tuple_slot, load_tasks = self._in_flight_loads[0]
+        try:
+            return all(
+                self._rank_consistency.check_load(load_task.task)
+                for load_task in load_tasks
+            )
+        except Exception as e:
+            # The blocking wait that follows reports the failed load.
+            logger.error(
+                f"check FAWA layerwise load of layer tuple "
+                f"{tuple_slot} failed. {type(e).__name__}: {e}"
+            )
+            return True
+
+    def _load_tuples_until(self, tuple_slot: int) -> None:
+        """Load layer tuples in order until ``tuple_slot`` arrives."""
+        while tuple_slot not in self._loaded_tuple_slots:
+            if self._in_flight_loads:
+                self._finish_loading_tuple()
+            elif self._tuple_slots_to_load:
+                self._submit_next_tuple_load()
+            else:
+                raise RuntimeError(
+                    f"Layer tuple {tuple_slot} is not loaded in this step."
+                )
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        if self._step_load_tuple_slots:
+            needed_tuple_slots = self._step_load_tuple_slots.intersection(
+                self.tuple_slot_by_layer[kv_layer_name]
+                for kv_layer_name in self._kv_layer_names_of(layer_name)
+            )
+            for tuple_slot in sorted(needed_tuple_slots):
+                self._tuple_slots_waited_by_layers.add(tuple_slot)
+                self._load_tuples_until(tuple_slot)
+
+            # Release the tuples that arrived while this layer was waiting, so
+            # their pipeline slots can start loading further tuples.
+            while self._in_flight_loads and self._loading_tuple_has_arrived():
+                self._finish_loading_tuple()
+
+    def _finish_step_loads(self) -> None:
+        """Load the layer tuples that are left and recompute what read them early.
+
+        A draft layer may skip the hooks; it then reads an old cache, which
+        only lowers the draft acceptance rate. A target layer that skipped the
+        hook may have read its cache before the load arrived, so its requests
+        are marked as failed and vLLM recomputes them.
+        """
+        for tuple_slot in sorted(self._step_load_tuple_slots):
+            self._load_tuples_until(tuple_slot)
+
+        missed_request_ids: set[str] = set()
+        for tuple_slot in sorted(
+            self._step_load_tuple_slots - self._tuple_slots_waited_by_layers
+        ):
+            tuple_layer_names = {
+                layer_name
+                for label, shard_index in self.shard_keys_by_tuple_slot[tuple_slot]
+                for layer_name in self.shard_plans[label].shard_layer_names[shard_index]
+            }
+            if any(not is_draft_layer_name(name) for name in tuple_layer_names):
+                logger.error(
+                    f"No attention layer waited for layer tuple {tuple_slot} "
+                    f"(layers {sorted(tuple_layer_names)}); recompute its requests."
+                )
+                missed_request_ids |= self._load_request_ids_by_tuple_slot.get(
+                    tuple_slot, set()
+                )
+        for request_id in sorted(missed_request_ids - self._failed_load_request_ids):
+            self._handle_load_err(request_id)
+
+    def save_kv_layer(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: "AttentionMetadata",
+        **kwargs,
+    ) -> None:
+        if self._connector_metadata is not None:
+            kv_layer_names = self._kv_layer_names_of(layer_name)
+            self._saved_kv_layer_names.update(kv_layer_names)
+            for shard_key in self._shard_keys_of(kv_layer_names):
+                label, shard_index = shard_key
+                shard_layer_names = self.shard_plans[label].shard_layer_names[
+                    shard_index
+                ]
+                if (
+                    shard_key not in self._dumped_shard_keys
+                    and shard_layer_names <= self._saved_kv_layer_names
+                ):
+                    self._dump_shard(shard_key)
+
+    def _dump_shard(self, shard_key: tuple[str, int]) -> None:
+        if self._step_dump_plan is None:
+            self._step_dump_plan = self._collect_dump_plan(
+                self._get_connector_metadata()
+            )
+        label, shard_index = shard_key
+        dump_rows = self._step_dump_plan.rows_for_store(label)
+        if dump_rows.keys:
+            self._step_save_bytes += self._submit_store_dump(
+                label,
+                self._store_for_label(label),
+                dump_rows.keys,
+                self.shard_plans[label].gather_shard_ptrs(
+                    dump_rows.stacked_ptrs, shard_index
+                ),
+                dump_rows.block_ids_by_request,
+                self._step_dump_plan.request_ids,
+                shard_index=shard_index,
+            )
+        self._dumped_shard_keys.add(shard_key)
+
+    def wait_for_save(self) -> None:
+        metadata = self._get_connector_metadata()
+        if not isinstance(metadata, UCMFAWAConnectorMetadata):
+            raise RuntimeError(f"Unexpected FAWA metadata type: {type(metadata)}")
+
+        self._poll_completed_dump_tasks()
+        self._finish_step_loads()
+        for tuple_slot in sorted(self.shard_keys_by_tuple_slot):
+            for shard_key in self.shard_keys_by_tuple_slot[tuple_slot]:
+                if shard_key not in self._dumped_shard_keys:
+                    self._dump_shard(shard_key)
+        if self._step_load_bytes:
+            ucmmetrics.update_stats({"load_bytes_total": self._step_load_bytes})
+        if self._step_save_bytes:
+            ucmmetrics.update_stats({"save_bytes_total": self._step_save_bytes})
+        self._reset_step_state()
 
 
 class UCMFAWALiteConnector(UCMLiteConnector):

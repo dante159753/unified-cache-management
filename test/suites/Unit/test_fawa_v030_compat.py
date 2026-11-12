@@ -82,6 +82,7 @@ def test_scheduler_worker_keys_follow_layout_not_package_version(
         )
         config = _hash_config(ratios=(4, 128), block_size=128)
     worker.tp_rank, worker.tp_size, worker.is_mla = tp_rank, 8, True
+    worker.KV_LAYOUT_HASH_TAG = ""
 
     def seeds():
         # Match the real scheduler's deepcopy and representative-spec selection.
