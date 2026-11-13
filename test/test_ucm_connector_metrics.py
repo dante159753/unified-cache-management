@@ -1763,6 +1763,104 @@ def test_request_async_reschedule_does_not_dispatch_duplicate_load():
     assert dispatch.load_async is False
 
 
+def _decode_offload_connector(use_decode_offload):
+    connector = object.__new__(UCMDirectConnector)
+    connector.use_decode_offload = use_decode_offload
+    connector.block_size = 16
+    connector.cp_world_size = 1
+    connector.requests_meta = {}
+    connector._pending_async_load_dispatches = {}
+    connector._async_load_req_ids = set()
+    connector._async_dump_req_ids = set()
+    connector.request_block_hasher = lambda request, prev_block_hashes=None: [
+        b"u%d" % block
+        for block in range(
+            len(prev_block_hashes or []), len(request.all_token_ids) // 16
+        )
+    ]
+    return connector
+
+
+def _decode_step(connector, new_block_ids=None):
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=["req"],
+            new_block_ids=[new_block_ids],
+            resumed_from_preemption=[False],
+        ),
+        num_scheduled_tokens={"req": 1},
+        finished_req_ids=set(),
+        preempted_req_ids=None,
+    )
+    metadata = connector.build_connector_meta(scheduler_output)
+    return metadata.request_meta["req"].dump_block_ids
+
+
+@pytest.mark.parametrize("use_decode_offload", [True, False])
+def test_decode_offload_dumps_blocks_filled_by_output_tokens(use_decode_offload):
+    connector = _decode_offload_connector(use_decode_offload)
+    request = SimpleNamespace(request_id="req", all_token_ids=list(range(24)))
+    connector.requests_meta["req"] = RequestMeta(
+        ucm_block_ids=[b"u0"],
+        num_token_ids=24,
+        request=request,
+    )
+
+    prefill = connector.build_connector_meta(
+        SimpleNamespace(
+            scheduled_new_reqs=[SimpleNamespace(req_id="req", block_ids=([10, 11],))],
+            scheduled_cached_reqs=[],
+            num_scheduled_tokens={"req": 24},
+            finished_req_ids=set(),
+            preempted_req_ids=None,
+        )
+    )
+    assert prefill.request_meta["req"].dump_block_ids == ([b"u0"], [10])
+
+    # Async scheduling: each step computes a token the scheduler cannot see
+    # yet. Tokens 24..31 are computed by steps 0..7 and visible one step later.
+    decode_dumps = []
+    for step in range(10):
+        decode_dumps.append(_decode_step(connector, ([12],) if step == 8 else None))
+        request.all_token_ids.append(24 + step)
+
+    expected_dumps = [([], [])] * 10
+    if use_decode_offload:
+        expected_dumps[8] = ([b"u1"], [11])
+    assert decode_dumps == expected_dumps
+
+
+def test_decode_offload_tracks_request_without_prompt_blocks():
+    connector = _decode_offload_connector(True)
+    connector.enable_record_traces = False
+    connector.persist_token_threshold = 0
+    connector._prefetch_direct_hit_key_hotness = Mock()
+    request = SimpleNamespace(
+        request_id="req",
+        status=None,
+        all_token_ids=list(range(10)),
+        num_tokens=10,
+    )
+
+    assert connector.get_num_new_matched_tokens(request, 0) == (0, False)
+
+    connector.build_connector_meta(
+        SimpleNamespace(
+            scheduled_new_reqs=[SimpleNamespace(req_id="req", block_ids=([10],))],
+            scheduled_cached_reqs=[],
+            num_scheduled_tokens={"req": 10},
+            finished_req_ids=set(),
+            preempted_req_ids=None,
+        )
+    )
+    request.all_token_ids.extend(range(10, 17))
+    decode_dumps = [_decode_step(connector) for _ in range(6)]
+    decode_dumps.append(_decode_step(connector, ([11],)))
+
+    assert decode_dumps == [([], [])] * 5 + [([b"u0"], [10])] + [([], [])]
+
+
 def test_request_async_poll_reports_only_completed_loads():
     class RankConsistency:
         def __init__(self):
@@ -2662,6 +2760,40 @@ def test_layerwise_deferred_start_preserves_saves_and_resets_each_batch(
         {"save_bytes_total": 128},
         {"save_bytes_total": 128},
     ]
+
+
+@pytest.mark.parametrize("use_decode_offload", [True, False])
+def test_layerwise_decode_offload_dumps_layers_skipped_by_hooks(
+    layerwise_connector, use_decode_offload
+):
+    connector = layerwise_connector
+    connector.use_decode_offload = use_decode_offload
+    connector._submit_layerwise_dump_task = Mock(return_value=True)
+    connector.bind_connector_metadata(
+        SimpleNamespace(
+            request_meta={
+                "decode": RequestDispatchMeta(
+                    load_block_ids=([], []), dump_block_ids=([b"a"], [1])
+                ),
+                "idle": RequestDispatchMeta(
+                    load_block_ids=([], []), dump_block_ids=([], [])
+                ),
+            }
+        )
+    )
+    first, second = connector.layer_name_to_id
+
+    # Only the first layer runs its hook; the second one is skipped.
+    connector.save_kv_layer(first, None, None)
+    connector.wait_for_save()
+
+    dumped_layer_ids = [
+        call.args[0] for call in connector._submit_layerwise_dump_task.call_args_list
+    ]
+    expected_layer_ids = [connector.layer_name_to_id[first]]
+    if use_decode_offload:
+        expected_layer_ids.append(connector.layer_name_to_id[second])
+    assert dumped_layer_ids == expected_layer_ids
 
 
 def test_layerwise_records_per_layer_load_duration_and_batch_sum():

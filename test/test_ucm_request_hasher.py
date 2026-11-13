@@ -238,6 +238,21 @@ def test_partial_tail_is_not_hashed_and_new_tuple_breaks_old_keys():
     assert hashes[0] != legacy_first_hash
 
 
+def test_prev_block_hashes_continue_the_chain():
+    block_hasher = RequestHasher(_META).make_request_block_hasher(4)
+    # The image crosses the block where hashing resumes.
+    request = _request(range(6), mm_features=[_mm_feature("image", offset=5, length=4)])
+    prefix_hashes = block_hasher(request)
+    request.all_token_ids.extend(range(6, 14))
+
+    full_hashes = block_hasher(request)
+
+    assert len(prefix_hashes) == 1
+    assert len(full_hashes) == 3
+    assert prefix_hashes + block_hasher(request, prefix_hashes) == full_hashes
+    assert block_hasher(request, full_hashes) == []
+
+
 def test_helper_unavailable_allows_only_token_only_requests(monkeypatch):
     monkeypatch.setattr(request_hasher_module, "generate_block_hash_extra_keys", None)
     block_hasher = RequestHasher(_META).make_request_block_hasher(4)

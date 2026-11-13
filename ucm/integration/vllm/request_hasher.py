@@ -132,14 +132,26 @@ class RequestHasher:
 
         root = self.seed if initial_hash is None else initial_hash
 
-        def hash_request(request: "Request") -> list[bytes]:
+        def hash_request(
+            request: "Request",
+            prev_block_hashes: list[bytes] | None = None,
+        ) -> list[bytes]:
+            """Hash the full blocks of a request.
+
+            With ``prev_block_hashes``, continue that chain and return only
+            the hashes of the full blocks after it.
+            """
             _validate_request_hash_semantics(request)
             token_ids = request.all_token_ids
             parent = root
+            first_start = 0
+            if prev_block_hashes:
+                parent = prev_block_hashes[-1]
+                first_start = len(prev_block_hashes) * block_size
             curr_mm_idx = 0
             block_hashes: list[bytes] = []
 
-            for start in range(0, len(token_ids), block_size):
+            for start in range(first_start, len(token_ids), block_size):
                 end = start + block_size
                 if end > len(token_ids):
                     break

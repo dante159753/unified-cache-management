@@ -412,6 +412,10 @@ class RequestMeta:
     num_token_ids: int = 0
     vllm_block_ids: list[int] = field(default_factory=list)
     token_processed: int = 0
+    # Decode offload only: the live request, to hash blocks filled by output tokens.
+    request: Optional["Request"] = None
+    # Decode offload only: the first block that has not been sent to dump yet.
+    next_dump_block: int = 0
 
 
 @dataclass
@@ -1649,9 +1653,15 @@ class UCMDirectConnector(KVConnectorBase_V1):
     cross-rank consistency metadata.
     """
 
+    use_decode_offload = False
+
     @classmethod
     def _supports_request_async_load(cls) -> bool:
         return cls is UCMDirectConnector
+
+    @classmethod
+    def _supports_decode_offload(cls) -> bool:
+        return cls in (UCMDirectConnector, UCMLayerWiseConnector)
 
     @staticmethod
     def _consistency_manager_enabled(launch_config: dict, is_mla: bool) -> bool:
@@ -1776,6 +1786,17 @@ class UCMDirectConnector(KVConnectorBase_V1):
         if request_async_configured and not self.use_request_async_load:
             logger.warning(
                 "Request-async loading is not supported by %s; disabling it.",
+                type(self).__name__,
+            )
+        decode_offload_configured = bool(
+            self.launch_config.get("use_decode_offload", False)
+        )
+        self.use_decode_offload = (
+            decode_offload_configured and self._supports_decode_offload()
+        )
+        if decode_offload_configured and not self.use_decode_offload:
+            logger.warning(
+                "Decode offload is not supported by %s; disabling it.",
                 type(self).__name__,
             )
         # Scheduler-side plans waiting to be included in connector metadata.
@@ -2232,6 +2253,18 @@ class UCMDirectConnector(KVConnectorBase_V1):
         )
 
         if not external_block_ids:
+            if self.use_decode_offload:
+                # The prompt has no block to look up, but decode can still
+                # fill blocks that need to be dumped.
+                self.requests_meta[request.request_id] = RequestMeta(
+                    ucm_block_ids=ucm_block_ids,
+                    hbm_hit_block_num=hbm_hit_block_num,
+                    total_hit_block_num=hbm_hit_block_num,
+                    num_token_ids=len(request.all_token_ids),
+                    token_processed=hbm_hit_block_num * self.block_size,
+                    request=request,
+                    next_dump_block=hbm_hit_block_num,
+                )
             return 0, False
 
         ucmmetrics.update_stats(
@@ -2271,6 +2304,8 @@ class UCMDirectConnector(KVConnectorBase_V1):
             total_hit_block_num=total_hit_block_num,
             num_token_ids=len(request.all_token_ids),
             token_processed=hbm_hit_block_num * self.block_size + external_hit_tokens,
+            request=request,
+            next_dump_block=hbm_hit_block_num + external_hit_tokens // self.block_size,
         )
 
         load_async = self.use_request_async_load and external_hit_tokens > 0
@@ -2360,7 +2395,34 @@ class UCMDirectConnector(KVConnectorBase_V1):
             ]
             load_vllm_block_ids = vllm_block_ids[hbm_hit_block_num:total_hit_block_num]
 
-        if req_meta.token_processed < req_meta.num_token_ids:
+        if self.use_decode_offload and req_meta.request is not None:
+            try:
+                ucm_block_ids.extend(
+                    self.request_block_hasher(req_meta.request, ucm_block_ids)
+                )
+            except Exception as e:
+                logger.error(
+                    f"request {req_meta.request.request_id} hash error, stop "
+                    f"offloading its decode blocks. {type(e).__name__}: {e}"
+                )
+                req_meta.request = None
+            req_meta.token_processed += new_tokens
+            # A block is dumped once it is both computed and hashed. With
+            # async scheduling the newest output token is not visible here
+            # yet, so hashing can be a step behind the computed tokens.
+            start_idx = req_meta.next_dump_block
+            end_idx = min(
+                req_meta.token_processed // self.block_size,
+                len(ucm_block_ids) // self.cp_world_size,
+            )
+            if end_idx > start_idx:
+                dump_block_start = start_idx
+                dump_ucm_block_ids = ucm_block_ids[
+                    start_idx * self.cp_world_size : end_idx * self.cp_world_size
+                ]
+                dump_vllm_block_ids = req_meta.vllm_block_ids[start_idx:end_idx]
+                req_meta.next_dump_block = end_idx
+        elif req_meta.token_processed < req_meta.num_token_ids:
             start_idx = req_meta.token_processed // self.block_size
             dump_block_start = start_idx
             end_idx = (req_meta.token_processed + new_tokens) // self.block_size
@@ -2796,6 +2858,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 req_meta.token_processed = (
                     req_meta.hbm_hit_block_num * self.get_block_size()
                 )
+                req_meta.next_dump_block = req_meta.hbm_hit_block_num
             else:
                 # for other failure, pop metadata so won't dump for the request
                 logger.info(f"Request {req_id} failed to load, skip caching.")
@@ -3177,6 +3240,19 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 self._dumped_layer_ids.add(layer_id)
 
     def wait_for_save(self) -> None:
+        if self.use_decode_offload and self._connector_metadata:
+            metadata = self._get_connector_metadata()
+            has_dump = any(
+                len(request.dump_block_ids[0]) > 0
+                for request in metadata.request_meta.values()
+            )
+            if has_dump:
+                # A decode-only step replays a captured graph and skips the
+                # per-layer hooks. Dump the layers that no hook has handled.
+                for layer_name, layer_id in self.layer_name_to_id.items():
+                    if layer_id not in self._dumped_layer_ids:
+                        self.save_kv_layer(layer_name, None, None)
+
         wait_for_save_start_ms = time.perf_counter() * 1000
         for pending_dump_task in self._pending_dump_tasks:
             if pending_dump_task.wait_for_save_start_ms <= 0:
