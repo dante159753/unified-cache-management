@@ -22,8 +22,21 @@
  * SOFTWARE.
  * */
 #include "trans_manager.h"
+#include <cstdlib>
+#include <unistd.h>
+#include "logger/logger.h"
 
 namespace UC::PosixStore {
+
+namespace {
+
+bool ShouldInjectLoadFailure(const char*& flagPath)
+{
+    flagPath = std::getenv("UCM_POSIX_LOAD_FAIL_FILE");
+    return flagPath != nullptr && flagPath[0] != '\0' && ::access(flagPath, F_OK) == 0;
+}
+
+}  // namespace
 
 TransManager::~TransManager()
 {
@@ -129,6 +142,20 @@ void TransManager::TryNextBackend(const std::shared_ptr<Request>& request, Shard
         // Once a backend has been tried, keep its failure instead of "no backend left".
         if (shardTask.attempted.empty()) { shardTask.result = attempt.Error(); }
         request->waiter.Done();
+        return;
+    }
+    const char* flagPath = nullptr;
+    if (request->task.type == TransTask::Type::LOAD && ShouldInjectLoadFailure(flagPath)) {
+        auto status =
+            Status::Error(fmt::format("fault injected POSIX load failure ({})", flagPath));
+        UC_ERROR("Fault injected POSIX load failure for task({}, brief={}, backend={}, flag={}).",
+                 request->task.id, request->task.desc.brief, shardTask.attempt.index, flagPath);
+        shardTask.result = status;
+        if (backendMgr_->ShouldRetry(shardTask.attempt, status)) {
+            TryNextBackend(request, shardTask);
+        } else {
+            request->waiter.Done();
+        }
         return;
     }
     Detail::TaskDesc desc{shardTask.shard};

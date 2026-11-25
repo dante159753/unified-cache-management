@@ -25,7 +25,9 @@
 
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -35,6 +37,7 @@
 #include "ctrl_strategy.h"
 #include "data_strategy.h"
 #include "global_config.h"
+#include "logger/logger.h"
 #include "status/status.h"
 #include "type/types.h"
 
@@ -197,11 +200,32 @@ public:
         auto attempts = usable > std::numeric_limits<size_t>::max() / 2
                             ? std::numeric_limits<size_t>::max()
                             : 2 * usable;
+        using Clock = std::chrono::steady_clock;
+        constexpr auto kStallLogInterval = std::chrono::seconds(1);
+        bool timingStarted = false;
+        Clock::time_point waitStart{};
+        Clock::time_point nextLogAt{};
         for (;;) {
             bool owner = false;
             auto slot =
                 TryAcquireSlot(blockId, offset, allowReserved, attempts, owner, preferredRank);
             if (slot != kInvalid) { return Handle{this, slot, owner}; }
+            const auto now = Clock::now();
+            if (!timingStarted) {
+                timingStarted = true;
+                waitStart = now;
+                nextLogAt = now + kStallLogInterval;
+            } else if (now >= nextLogAt) {
+                const auto elapsedMs =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(now - waitStart).count();
+                UC_WARN_UNLIMITED(
+                    "Cache2 Buffer::Get stalled for {}ms (block={}, offset={}, myRank={}, "
+                    "preferredRank={}, allowReserved={}, mayOwn={}).",
+                    elapsedMs, fmt::format("{:02x}", fmt::join(blockId, "")), offset, myRank_,
+                    preferredRank == kInvalid ? int64_t{-1} : static_cast<int64_t>(preferredRank),
+                    allowReserved, preferredRank == kInvalid || myRank_ == preferredRank);
+                nextLogAt = now + kStallLogInterval;
+            }
             std::this_thread::yield();
         }
     }
